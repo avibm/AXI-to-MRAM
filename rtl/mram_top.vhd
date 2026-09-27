@@ -17,14 +17,22 @@
 -- mechanisms address different problems and both are needed.
 --
 -- Wiring: mram_boot_copy and axi4_slave_wrapper both feed a boot_done-
--- selected mux (not an arbiter -- the CPU issues no AXI traffic while
--- held in reset, so there is never a cycle where both have a real request
--- at once), whose output passes through mram_write_guard before reaching
+-- selected mux (not an arbiter), whose output passes through
+-- mram_write_guard before reaching
 -- mram_qspi_backend. mram_boot_copy's own traffic is never actually
 -- affected by the guard: its reads (from the protected master copy) are
 -- always allowed, and its writes (to the unprotected working-copy region)
 -- are always allowed -- the guard exists for AXI-side writes to the
 -- protected region, which mram_boot_copy never attempts.
+--
+-- The CPU is held in reset during the copy, but the PCI master is not, so
+-- AXI traffic can arrive while mram_boot_copy owns the backend. To keep
+-- that traffic from seeing boot-copy responses, axi4_slave_wrapper is held
+-- in reset until boot_done: AWREADY/ARREADY stay low and AXI requests
+-- simply stall at the interconnect for the whole copy (roughly 9 s, or up
+-- to roughly 35 s with retries -- see mram_boot_copy.vhd). Any PCI-side
+-- completion timeout, and whether the host should instead wait for
+-- boot_done before touching this window, must be handled at system level.
 --
 -- key_ok is a plain input here; the comparison that produces it (password
 -- check or otherwise) is handled entirely outside this file.
@@ -38,7 +46,20 @@ use work.mram_pkg.all;
 
 entity mram_top is
     generic (
-        G_ID_WIDTH : integer := C_AXI_ID_WIDTH
+        G_ID_WIDTH         : integer := C_AXI_ID_WIDTH;
+        -- Boot copy (defaults: 32MB image at 0x6000000 copied to 0x0)
+        G_BOOT_SRC_BASE    : natural := 100663296;
+        G_BOOT_DST_BASE    : natural := 0;
+        G_BOOT_COPY_SIZE   : natural := 33554432;
+        G_BOOT_MAX_RETRIES : natural := 3;
+        G_BOOT_WATCHDOG    : natural := 1_000_000;
+        -- Write guard (defaults: protect 0x6000000..0x7FFFFFF)
+        G_PROTECT_BASE     : natural := 100663296;
+        G_PROTECT_SIZE     : natural := 33554432;
+        G_SYNC_KEY_OK      : boolean := true;
+        -- QSPI backend
+        G_DUMMY_CYCLES     : integer := 8;
+        G_SCLK_HALF_PERIOD : integer := 2
     );
     port (
         aclk    : in  std_logic;
@@ -77,6 +98,7 @@ entity mram_top is
         s_axi_rready   : in  std_logic;
 
         key_ok : in std_logic; -- protected-region write unlock; comparison done externally
+                               -- (synchronized inside mram_write_guard unless G_SYNC_KEY_OK = false)
 
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
@@ -94,6 +116,7 @@ architecture rtl of mram_top is
     signal guard_resp                                  : core_resp_t; -- final, to boot_copy & wrapper
     signal backend_resp                                 : core_resp_t; -- raw, from mram_qspi_backend
     signal boot_done_i                                  : std_logic;
+    signal axi_resetn                                   : std_logic;
 
     signal backend_io_o, backend_io_oe, backend_io_i : std_logic_vector(3 downto 0);
 
@@ -101,7 +124,17 @@ begin
 
     boot_done <= boot_done_i;
 
+    -- The AXI side stays in reset until the boot copy has finished.
+    axi_resetn <= aresetn and boot_done_i;
+
     u_boot_copy : entity work.mram_boot_copy
+        generic map (
+            G_SRC_BASE       => G_BOOT_SRC_BASE,
+            G_DST_BASE       => G_BOOT_DST_BASE,
+            G_COPY_SIZE      => G_BOOT_COPY_SIZE,
+            G_MAX_RETRIES    => G_BOOT_MAX_RETRIES,
+            G_WATCHDOG_LIMIT => G_BOOT_WATCHDOG
+        )
         port map (
             aclk        => aclk,
             aresetn     => aresetn,
@@ -118,7 +151,7 @@ begin
         )
         port map (
             aclk           => aclk,
-            aresetn        => aresetn,
+            aresetn        => axi_resetn,
             s_axi_awid     => s_axi_awid,
             s_axi_awaddr   => s_axi_awaddr,
             s_axi_awlen    => s_axi_awlen,
@@ -152,11 +185,16 @@ begin
             core_resp      => guard_resp
         );
 
-    -- Plain mux, not an arbiter -- the CPU (and therefore all normal AXI
-    -- traffic) is held in reset for the entire time mram_boot_copy runs.
+    -- Plain mux, not an arbiter -- the CPU is held in reset and the AXI
+    -- wrapper is held in reset for the entire time mram_boot_copy runs.
     muxed_req <= boot_req when boot_done_i = '0' else axi_req;
 
     u_write_guard : entity work.mram_write_guard
+        generic map (
+            G_PROTECT_BASE => G_PROTECT_BASE,
+            G_PROTECT_SIZE => G_PROTECT_SIZE,
+            G_SYNC_KEY_OK  => G_SYNC_KEY_OK
+        )
         port map (
             aclk           => aclk,
             aresetn        => aresetn,
@@ -168,6 +206,10 @@ begin
         );
 
     u_backend : entity work.mram_qspi_backend
+        generic map (
+            G_DUMMY_CYCLES     => G_DUMMY_CYCLES,
+            G_SCLK_HALF_PERIOD => G_SCLK_HALF_PERIOD
+        )
         port map (
             aclk       => aclk,
             aresetn    => aresetn,

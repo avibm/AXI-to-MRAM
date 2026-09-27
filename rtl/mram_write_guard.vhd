@@ -14,7 +14,11 @@
 --
 -- key_ok is a plain, continuously-presented level (not a one-shot pulse):
 -- as long as it is held high, writes to the protected range succeed;
--- dropping it re-locks the region immediately, on the next write. The
+-- dropping it re-locks the region on the next write. With G_SYNC_KEY_OK
+-- (default true) key_ok passes through a two-flop synchronizer first, so
+-- it may come from another clock domain; a change then takes effect two
+-- aclk cycles later. Set G_SYNC_KEY_OK = false only if key_ok is already
+-- synchronous to aclk. The
 -- comparison behind key_ok (password check or otherwise) is performed
 -- entirely outside this file -- this guard trusts key_ok completely and
 -- has no visibility into how it was derived. Its correctness (timing,
@@ -26,6 +30,16 @@
 -- enforcement regardless of key_ok is required, that needs the requesting
 -- master's AXI ID threaded through from axi4_slave_wrapper, which this
 -- revision does not do.
+--
+-- Region check: only the request's start address is compared. That is
+-- sufficient because every core request lies inside one 64-byte aligned
+-- window (see mram_pkg) and G_PROTECT_BASE / G_PROTECT_SIZE are multiples
+-- of 64, so a request is either entirely inside or entirely outside.
+--
+-- Blocked writes are accepted at once and answered with bvalid + error on
+-- a later cycle. That answer is held back while the backend is itself
+-- delivering an rvalid/bvalid, so no backend completion is ever masked,
+-- and no new request is passed to the backend while it is pending.
 --
 -- Placement: sits between axi4_slave_wrapper and mram_qspi_backend --
 --   axi4_slave_wrapper.core_req  -> core_req_in
@@ -44,7 +58,8 @@ use work.mram_pkg.all;
 entity mram_write_guard is
     generic (
         G_PROTECT_BASE : natural := 100663296; -- 0x6000000: pristine master copy (top 32MB)
-        G_PROTECT_SIZE : natural := 33554432   -- 32MB
+        G_PROTECT_SIZE : natural := 33554432;  -- 32MB
+        G_SYNC_KEY_OK  : boolean := true       -- two-flop synchronize key_ok into aclk
     );
     port (
         aclk    : in  std_logic;
@@ -65,38 +80,61 @@ architecture rtl of mram_write_guard is
     signal is_protected_write : std_logic;
     signal blocked            : std_logic;
 
-    signal deliver_error : std_logic := '0';
+    signal key_ok_meta, key_ok_sync : std_logic := '0';
+    signal key_ok_i                 : std_logic;
+
+    signal deliver_error : std_logic := '0'; -- a blocked write awaits its error response
+    signal error_slot    : std_logic;        -- the error response goes out this cycle
 
 begin
+
+    gen_sync : if G_SYNC_KEY_OK generate
+        process (aclk)
+        begin
+            if rising_edge(aclk) then
+                if aresetn = '0' then
+                    key_ok_meta <= '0';
+                    key_ok_sync <= '0';
+                else
+                    key_ok_meta <= key_ok;
+                    key_ok_sync <= key_ok_meta;
+                end if;
+            end if;
+        end process;
+        key_ok_i <= key_ok_sync;
+    end generate;
+
+    gen_nosync : if not G_SYNC_KEY_OK generate
+        key_ok_i <= key_ok;
+    end generate;
 
     is_protected_write <= '1' when (core_req_in.we = '1' and
                                      unsigned(core_req_in.addr) >= G_PROTECT_BASE and
                                      unsigned(core_req_in.addr) < G_PROTECT_BASE + G_PROTECT_SIZE)
                            else '0';
 
-    blocked <= '1' when (is_protected_write = '1' and key_ok = '0') else '0';
+    blocked <= '1' when (is_protected_write = '1' and key_ok_i = '0') else '0';
 
-    -- Never let a blocked write reach the real backend. Reads and unlocked
-    -- or out-of-range writes pass straight through.
-    core_req_out <= CORE_REQ_IDLE when (core_req_in.valid = '1' and blocked = '1')
+    error_slot <= deliver_error and not core_resp_in.rvalid and not core_resp_in.bvalid;
+
+    -- Never let a blocked write reach the real backend, and hold everything
+    -- back while a blocked write's error response is still pending. Reads
+    -- and unlocked or out-of-range writes otherwise pass straight through.
+    core_req_out <= CORE_REQ_IDLE when (deliver_error = '1' or
+                                        (core_req_in.valid = '1' and blocked = '1'))
                     else core_req_in;
 
-    process (core_req_in, blocked, deliver_error, core_resp_in)
+    process (core_req_in, blocked, deliver_error, error_slot, core_resp_in)
     begin
+        core_resp_out <= core_resp_in;
         if deliver_error = '1' then
-            core_resp_out.ready  <= '0';
-            core_resp_out.rvalid <= '0';
-            core_resp_out.bvalid <= '1'; -- blocked requests are always writes here
-            core_resp_out.error  <= '1';
-            core_resp_out.rdata  <= (others => '0');
+            core_resp_out.ready <= '0';
+            if error_slot = '1' then
+                core_resp_out.bvalid <= '1'; -- blocked requests are always writes
+                core_resp_out.error  <= '1';
+            end if;
         elsif core_req_in.valid = '1' and blocked = '1' then
-            core_resp_out.ready  <= '1'; -- accept immediately, never stall the wrapper
-            core_resp_out.rvalid <= '0';
-            core_resp_out.bvalid <= '0';
-            core_resp_out.error  <= '0';
-            core_resp_out.rdata  <= (others => '0');
-        else
-            core_resp_out <= core_resp_in;
+            core_resp_out.ready <= '1'; -- accept immediately, never stall the wrapper
         end if;
     end process;
 
@@ -106,7 +144,7 @@ begin
             if aresetn = '0' then
                 deliver_error <= '0';
             else
-                if deliver_error = '1' then
+                if error_slot = '1' then
                     deliver_error <= '0';
                 elsif core_req_in.valid = '1' and blocked = '1' then
                     deliver_error <= '1';
