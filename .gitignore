@@ -1,0 +1,4 @@
+sim/build/
+*.ghw
+*.o
+*.cf

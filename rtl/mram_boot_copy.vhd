@@ -8,8 +8,12 @@
 -- lives elsewhere in MRAM, protected from ordinary AXI writes by
 -- mram_write_guard.vhd, and is refreshed into the working copy here.
 --
--- Robustness features, given a one-minute boot budget with only ~1.3-1.5s
--- actually needed for the copy itself:
+-- Robustness features, given a one-minute boot budget. One copy+verify
+-- pass moves 4 x 32MB over the QSPI bus (read src, write dst, re-read src,
+-- re-read dst) in 64-byte transactions; at 37.5MHz SCLK (150MHz aclk,
+-- G_SCLK_HALF_PERIOD = 2) that is roughly 9 s per pass and roughly 35-36 s
+-- if all G_MAX_RETRIES retries are used (4 passes). These are hand
+-- estimates from the transaction framing, not measurements:
 --   1. Read-back verification: every chunk is read back from both source
 --      and destination and compared before the CPU is released. A
 --      mismatch retries the whole copy, up to G_MAX_RETRIES times, rather
@@ -53,6 +57,19 @@
 --   for this FSM, and applying TMR if that is standard practice elsewhere
 --   in this design.
 --
+-- Known limitations:
+--   * Verification compares destination against source only. A corrupted
+--     master copy is copied and "verified" faithfully; there is no CRC or
+--     signature check of the image itself.
+--   * A watchdog-forced retry does not wait for a request that is still in
+--     flight in mram_qspi_backend. If the backend is merely slow (not hung)
+--     its late rvalid/bvalid could be taken as the answer to the retry's
+--     first request. G_WATCHDOG_LIMIT is far above a normal request's
+--     duration (~650 aclk cycles for 64 bytes at the default divider), so
+--     this only matters after a real fault.
+--   * The copy runs on aresetn only. A CPU-only reset that does not also
+--     assert aresetn does not refresh the working copy.
+--
 -- Language: VHDL-2008
 --------------------------------------------------------------------------------
 
@@ -66,7 +83,8 @@ entity mram_boot_copy is
         G_SRC_BASE      : natural := 100663296; -- 0x6000000: pristine master copy (top 32MB)
         G_DST_BASE      : natural := 0;         -- 0x0: working copy, matches NOEL-V's fixed reset vector
         G_COPY_SIZE     : natural := 33554432;  -- 32MB
-        G_CHUNK_BYTES   : natural := 64;         -- one AXI-beat-sized transaction per chunk
+        G_CHUNK_BYTES   : natural := 64;         -- bytes per request, 1..64; must divide the
+                                                 -- bases and G_COPY_SIZE (64-byte window rule)
         G_MAX_RETRIES   : natural := 3;
         G_WATCHDOG_LIMIT: natural := 1_000_000   -- aclk cycles with no state change = hang
     );
@@ -124,8 +142,7 @@ begin
                 watchdog_cnt <= 0;
                 core_req     <= CORE_REQ_IDLE;
             else
-                core_req.valid <= '0';
-                prev_state     <= state;
+                prev_state <= state;
 
                 -- Watchdog: reset on any state change (progress); force a
                 -- retry attempt if nothing has moved for G_WATCHDOG_LIMIT
@@ -137,21 +154,22 @@ begin
                 end if;
 
                 if watchdog_trip = '1' and state /= S_DONE and state /= S_FAIL then
-                    state <= S_RETRY_CHECK;
+                    core_req.valid <= '0';
+                    state          <= S_RETRY_CHECK;
                 else
 
                 case state is
 
                     when S_COPY_READ_ISSUE =>
-                        if core_req.valid = '0' then
-                            core_req.valid <= '1';
-                            core_req.addr  <= std_logic_vector(
-                                                  resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
-                            core_req.we    <= '0';
-                            core_req.size  <= SIZE_64B;
-                        end if;
                         if core_req.valid = '1' and core_resp.ready = '1' then
-                            state <= S_COPY_READ_WAIT;
+                            core_req.valid <= '0'; -- accepted
+                            state          <= S_COPY_READ_WAIT;
+                        else
+                            core_req.valid  <= '1'; -- hold until accepted
+                            core_req.addr   <= std_logic_vector(
+                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
+                            core_req.we     <= '0';
+                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;
 
                     when S_COPY_READ_WAIT =>
@@ -161,17 +179,16 @@ begin
                         end if;
 
                     when S_COPY_WRITE_ISSUE =>
-                        if core_req.valid = '0' then
-                            core_req.valid <= '1';
-                            core_req.addr  <= std_logic_vector(
-                                                  resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
-                            core_req.we    <= '1';
-                            core_req.size  <= SIZE_64B;
-                            core_req.wdata <= hold_data;
-                            core_req.wstrb <= (others => '1');
-                        end if;
                         if core_req.valid = '1' and core_resp.ready = '1' then
-                            state <= S_COPY_WRITE_WAIT;
+                            core_req.valid <= '0'; -- accepted
+                            state          <= S_COPY_WRITE_WAIT;
+                        else
+                            core_req.valid  <= '1'; -- hold until accepted
+                            core_req.addr   <= std_logic_vector(
+                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
+                            core_req.we     <= '1';
+                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
+                            core_req.wdata  <= hold_data;
                         end if;
 
                     when S_COPY_WRITE_WAIT =>
@@ -190,15 +207,15 @@ begin
                     -- compare before trusting the copy.
                     ------------------------------------------------------------
                     when S_VERIFY_SRC_ISSUE =>
-                        if core_req.valid = '0' then
-                            core_req.valid <= '1';
-                            core_req.addr  <= std_logic_vector(
-                                                  resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
-                            core_req.we    <= '0';
-                            core_req.size  <= SIZE_64B;
-                        end if;
                         if core_req.valid = '1' and core_resp.ready = '1' then
-                            state <= S_VERIFY_SRC_WAIT;
+                            core_req.valid <= '0'; -- accepted
+                            state          <= S_VERIFY_SRC_WAIT;
+                        else
+                            core_req.valid  <= '1'; -- hold until accepted
+                            core_req.addr   <= std_logic_vector(
+                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
+                            core_req.we     <= '0';
+                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;
 
                     when S_VERIFY_SRC_WAIT =>
@@ -208,15 +225,15 @@ begin
                         end if;
 
                     when S_VERIFY_DST_ISSUE =>
-                        if core_req.valid = '0' then
-                            core_req.valid <= '1';
-                            core_req.addr  <= std_logic_vector(
-                                                  resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
-                            core_req.we    <= '0';
-                            core_req.size  <= SIZE_64B;
-                        end if;
                         if core_req.valid = '1' and core_resp.ready = '1' then
-                            state <= S_VERIFY_DST_WAIT;
+                            core_req.valid <= '0'; -- accepted
+                            state          <= S_VERIFY_DST_WAIT;
+                        else
+                            core_req.valid  <= '1'; -- hold until accepted
+                            core_req.addr   <= std_logic_vector(
+                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
+                            core_req.we     <= '0';
+                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;
 
                     when S_VERIFY_DST_WAIT =>
@@ -264,7 +281,8 @@ begin
                         -- Defensive default for an unreachable/SEU-corrupted
                         -- state encoding: treat as a hang, not a silent
                         -- continuation from garbage state.
-                        state <= S_RETRY_CHECK;
+                        core_req.valid <= '0';
+                        state          <= S_RETRY_CHECK;
 
                 end case;
                 end if;
