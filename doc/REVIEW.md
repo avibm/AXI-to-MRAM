@@ -103,6 +103,27 @@ rev. 1 RTL it reports the missing mode byte and the timing violations below.
 | D6 | Read latency: CR2 default is 8 cycles, valid for (1-4-4) SDR up to 54 MHz (Tables 25, 26) | `G_DUMMY_CYCLES` = 8 confirmed; closes O1 as long as CR2 is left at its default. |
 | D7 | Output valid tCO ≤ 9 ns after the falling edge (Table 43). Sampling half a period later leaves ~4 ns at 37.5 MHz for FPGA and board delays | Documented. Use `G_SCLK_HALF_PERIOD` = 3 (25 MHz) if the I/O timing does not close. The model now uses tCO = 9 ns. |
 
+### Rev. 3 – register commands for bring-up
+
+`mram_cmd_ctrl` adds PCI-driven WREN, WRDI, RDSR, WRSR and RDID commands, a
+`boot_hold` input and the pci_clk ↔ aclk synchronizers. The README describes
+the ports and handshake. Timing constraints are needed for these crossings:
+treat the paths into the first synchronizer stages, and the
+`cmd_wrsr_data` / `cmd_rdsr_data` / `cmd_rdid_data` buses, as false paths
+or give them a max-delay constraint.
+
+Things these commands can reveal when "writes don't apply":
+
+* **RDID** should read back as the manufacturer ID `E6h` in bits 31:24
+  (Table 22). If it doesn't, basic SPI communication is broken: check pins,
+  RESET# and the clock.
+* **RDSR** shows the write-protection state:
+  * BPSEL[2:0] ≠ 0 means part of the array is software write-protected.
+  * WP#EN only matters together with the WP# pin.
+  * After WREN, bit 1 should read 1. If it doesn't, WREN is not reaching
+    the device.
+* The hardware protect pins **HBP0–2 / HTBSEL** do not show up in RDSR.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

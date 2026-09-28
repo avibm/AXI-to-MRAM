@@ -99,6 +99,18 @@ package mram_pkg is
     );
 
     ----------------------------------------------------------------------------
+    -- MRAM register commands (single-bit SPI, datasheet Table 29), issued by
+    -- mram_cmd_ctrl and executed by mram_qspi_backend between memory
+    -- accesses.
+    ----------------------------------------------------------------------------
+    subtype reg_cmd_t is std_logic_vector(2 downto 0);
+    constant REG_CMD_WREN : reg_cmd_t := "000"; -- 06h Write Enable        (1-0-0)
+    constant REG_CMD_WRDI : reg_cmd_t := "001"; -- 04h Write Disable       (1-0-0)
+    constant REG_CMD_RDSR : reg_cmd_t := "010"; -- 05h Read Status Reg     (1-0-1), 1 byte out
+    constant REG_CMD_WRSR : reg_cmd_t := "011"; -- 01h Write Status Reg    (1-0-1), 1 byte in, needs WREN
+    constant REG_CMD_RDID : reg_cmd_t := "100"; -- 9Fh Read Device ID      (1-0-1), 4 bytes out
+
+    ----------------------------------------------------------------------------
     -- AXI4 response encodings (RRESP/BRESP)
     ----------------------------------------------------------------------------
     constant AXI_RESP_OKAY   : std_logic_vector(1 downto 0) := "00";

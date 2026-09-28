@@ -13,6 +13,13 @@
 -- BREADY/RREADY back-pressure, exactly one B / RLAST per transaction, and
 -- AXI addresses with upper (window base) bits set.
 --
+-- MRAM register commands from a 33MHz "PCI" clock domain: RDID, RDSR,
+-- WREN, WRDI, WRSR with the four-phase cmd_*/cmd_done handshake, while
+-- boot_hold keeps the boot copy waiting, and again later concurrently with
+-- AXI traffic. Also reproduces "a write does not apply": with the status
+-- register block-protect bits set, an AXI write gets OKAY but the MRAM
+-- content does not change.
+--
 -- Run: see sim/run_ghdl.sh
 --------------------------------------------------------------------------------
 
@@ -65,6 +72,26 @@ architecture sim of tb_mram_top is
     signal rready  : std_logic := '0';
 
     signal key_ok      : std_logic := '0';
+
+    constant T_PCI      : time := 30 ns;  -- 33MHz
+    constant DEVICE_ID  : std_logic_vector(31 downto 0) := x"E6212801";
+    constant I_WREN : natural := 0;
+    constant I_WRDI : natural := 1;
+    constant I_RDSR : natural := 2;
+    constant I_WRSR : natural := 3;
+    constant I_RDID : natural := 4;
+    signal pci_clk       : std_logic := '0';
+    signal cmd_req       : std_logic_vector(4 downto 0) := (others => '0');
+    signal cmd_wrsr_data : std_logic_vector(7 downto 0) := (others => '0');
+    signal cmd_rdsr_data : std_logic_vector(7 downto 0);
+    signal cmd_rdid_data : std_logic_vector(31 downto 0);
+    signal cmd_done      : std_logic;
+    signal boot_hold     : std_logic := '1';
+    signal pci_step      : natural := 0;
+    signal wr_paused     : boolean := false; -- writer idle, PCI may change WREN/SR
+    signal wr_t14_done   : boolean := false;
+    signal pci_finish    : boolean := false;
+    signal tb_errs_p     : natural := 0;
     signal cpu_reset_n : std_logic;
     signal boot_done   : std_logic;
     signal boot_fail   : std_logic;
@@ -116,6 +143,7 @@ architecture sim of tb_mram_top is
 begin
 
     aclk    <= not aclk after T_CLK / 2;
+    pci_clk <= not pci_clk after T_PCI / 2;
     aresetn <= '1' after 20 * T_CLK;
     io      <= (others => 'H'); -- board pull-ups
 
@@ -138,13 +166,19 @@ begin
             s_axi_arvalid => arvalid, s_axi_arready => arready,
             s_axi_rid => rid, s_axi_rdata => rdata, s_axi_rresp => rresp,
             s_axi_rlast => rlast, s_axi_rvalid => rvalid, s_axi_rready => rready,
+            pci_clk => pci_clk,
+            cmd_wren => cmd_req(I_WREN), cmd_wrdi => cmd_req(I_WRDI),
+            cmd_rdsr => cmd_req(I_RDSR), cmd_wrsr => cmd_req(I_WRSR),
+            cmd_rdid => cmd_req(I_RDID), cmd_wrsr_data => cmd_wrsr_data,
+            cmd_rdsr_data => cmd_rdsr_data, cmd_rdid_data => cmd_rdid_data,
+            cmd_done => cmd_done, boot_hold => boot_hold,
             key_ok => key_ok, cpu_reset_n => cpu_reset_n, boot_done => boot_done,
             boot_fail => boot_fail,
             mram_cs_n => cs_n, mram_sclk => sclk, mram_io => io
         );
 
     mdl : entity work.qspi_mram_model
-        generic map (G_TPU => 10 us)
+        generic map (G_TPU => 10 us, G_DEVICE_ID => DEVICE_ID)
         port map (cs_n => cs_n, sclk => sclk, io => io,
                   errors => model_errs, n_rd => model_rd, n_wr => model_wr);
 
@@ -362,6 +396,18 @@ begin
         -- T13: upper AXI address bits (window base) must be ignored
         beats(0) := mk_beat(55); strbs(0) := (others => '1');
         axi_write(16#2000_1200#, 0, 6, "01", beats, strbs, "00", true);
+
+        -- T14: block-protect bits set over PCI -> write is accepted (OKAY)
+        -- by AXI but does not change the MRAM ("write doesn't apply")
+        -- AXI writes clear the device's WREN bit, so the PCI WREN -> WRSR
+        -- sequence must run while no AXI write is in flight.
+        wr_paused <= true;
+        if pci_step < 1 then wait until pci_step >= 1; end if;
+        wr_paused <= false;
+        beats(0) := mk_beat(56); strbs(0) := (others => '1');
+        axi_write(16#3900#, 0, 6, "01", beats, strbs, "00", false);
+        wr_t14_done <= true;
+        if pci_step < 2 then wait until pci_step >= 2; end if; -- unprotected again
         wr_step <= 3;
 
         -- T10: writes while the reader is streaming reads elsewhere
@@ -499,20 +545,110 @@ begin
     end process;
 
     ----------------------------------------------------------------------------
+    -- "PCI": register commands in the pci_clk domain
+    ----------------------------------------------------------------------------
+    p_pci : process
+        variable errs : natural := 0;
+
+        procedure check(cond : boolean; msg : string) is
+        begin
+            if not cond then
+                errs := errs + 1;
+                tb_errs_p <= errs;
+                report "PCI: " & msg severity error;
+            end if;
+        end procedure;
+
+        procedure do_cmd(i : natural; wr_data : std_logic_vector(7 downto 0) := x"00") is
+            variable n : natural := 0;
+        begin
+            wait until rising_edge(pci_clk);
+            check(cmd_done = '0', "cmd_done high before a request");
+            cmd_wrsr_data <= wr_data;       -- same PCI write as the request
+            cmd_req(i)    <= '1';
+            loop
+                wait until rising_edge(pci_clk);
+                n := n + 1;
+                exit when cmd_done = '1' or n > 5000;
+            end loop;
+            check(cmd_done = '1', "no cmd_done for command " & integer'image(i));
+            cmd_req(i) <= '0';
+            n := 0;
+            loop
+                wait until rising_edge(pci_clk);
+                n := n + 1;
+                exit when cmd_done = '0' or n > 100;
+            end loop;
+            check(cmd_done = '0', "cmd_done did not clear");
+        end procedure;
+
+        procedure expect_sr(v : std_logic_vector(7 downto 0); what : string) is
+        begin
+            do_cmd(I_RDSR);
+            check(cmd_rdsr_data = v, what & ": status " & to_hstring(cmd_rdsr_data)
+                  & ", expected " & to_hstring(v));
+        end procedure;
+    begin
+        -- boot_hold is '1' from time 0: the copy must not start
+        do_cmd(I_RDID);
+        check(cmd_rdid_data = DEVICE_ID, "RDID " & to_hstring(cmd_rdid_data));
+        check(boot_done = '0' and model_rd = 0, "boot copy ran despite boot_hold");
+        expect_sr(x"00", "after reset");
+        do_cmd(I_WREN);
+        expect_sr(x"02", "after WREN");
+        do_cmd(I_WRDI);
+        expect_sr(x"00", "after WRDI");
+        do_cmd(I_WRSR, x"14");                     -- no WREN: must be ignored
+        expect_sr(x"00", "WRSR without WREN");
+        do_cmd(I_WREN);
+        do_cmd(I_WRSR, x"14");                     -- BP=101 TBPSEL=0: top 1/4
+        expect_sr(x"14", "after WRSR 14h");         -- WREN cleared by WRSR
+        do_cmd(I_WREN);
+        do_cmd(I_WRSR, x"00");
+        expect_sr(x"00", "after WRSR 00h");
+        check(model_rd = 0 and model_wr = 0, "memory traffic while boot_hold");
+        report "PCI: register commands OK, releasing boot_hold at " & time'image(now);
+        boot_hold <= '0';
+
+        -- T14: protect everything, let the writer try, then unprotect
+        if not wr_paused then wait until wr_paused; end if;
+        do_cmd(I_WREN);
+        do_cmd(I_WRSR, x"1C");                     -- BP=111: whole array protected
+        expect_sr(x"1C", "all protected");
+        pci_step <= 1;
+        if not wr_t14_done then wait until wr_t14_done; end if;
+        do_cmd(I_WREN);
+        do_cmd(I_WRSR, x"00");
+        expect_sr(x"00", "unprotected again");
+        pci_step <= 2;
+
+        -- commands interleaved with AXI traffic
+        for i in 1 to 6 loop
+            do_cmd(I_RDID);
+            check(cmd_rdid_data = DEVICE_ID, "RDID under traffic " & to_hstring(cmd_rdid_data));
+            expect_sr(x"00", "RDSR under traffic");
+        end loop;
+
+        report "PCI done, errors=" & integer'image(errs);
+        pci_finish <= true;
+        wait;
+    end process;
+
+    ----------------------------------------------------------------------------
     -- End of test
     ----------------------------------------------------------------------------
     process
     begin
-        wait until (wr_finish and rd_finish) or boot_fail = '1' for 20 ms;
+        wait until (wr_finish and rd_finish and pci_finish) or boot_fail = '1' for 20 ms;
         for i in 1 to 10 loop wait until rising_edge(aclk); end loop;
         report "model: " & integer'image(model_rd) & " RDQI, " & integer'image(model_wr)
                & " 4WQIO, " & integer'image(model_errs) & " protocol errors";
-        if not (wr_finish and rd_finish) then
+        if not (wr_finish and rd_finish and pci_finish) then
             report "TEST FAILED: timeout / boot_fail=" & std_logic'image(boot_fail) severity failure;
-        elsif tb_errs_w + tb_errs_r + model_errs = 0 then
+        elsif tb_errs_w + tb_errs_r + tb_errs_p + model_errs = 0 then
             report "TEST PASSED";
         else
-            report "TEST FAILED: " & integer'image(tb_errs_w + tb_errs_r + model_errs)
+            report "TEST FAILED: " & integer'image(tb_errs_w + tb_errs_r + tb_errs_p + model_errs)
                    & " errors" severity failure;
         end if;
         std.env.finish;

@@ -7,7 +7,7 @@ WORK="$ROOT/sim/build"
 mkdir -p "$WORK"
 cd "$WORK"
 FLAGS="--std=08 --workdir=$WORK"
-for f in rtl/mram_pkg rtl/mram_write_guard rtl/mram_qspi_backend rtl/mram_boot_copy \
+for f in rtl/mram_pkg rtl/mram_write_guard rtl/mram_cmd_ctrl rtl/mram_qspi_backend rtl/mram_boot_copy \
          rtl/axi4_slave_wrapper rtl/mram_top sim/qspi_mram_model sim/tb_mram_top; do
     ghdl -a $FLAGS "$ROOT/$f.vhd"
 done

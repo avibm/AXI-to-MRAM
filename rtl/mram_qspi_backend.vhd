@@ -66,8 +66,17 @@
 -- Byte lanes: the byte at address A is carried in lane A(5:0) of wdata /
 -- rdata (see mram_pkg). The lowest-address byte is sent / received first.
 --
+-- Register commands (reg_cmd_* ports, driven by mram_cmd_ctrl): WREN 06h,
+-- WRDI 04h, RDSR 05h, WRSR 01h, RDID 9Fh, all single-bit SPI (Table 29):
+-- opcode on IO0, write data on IO0, read data from the device on IO1
+-- (SO), MSB first. IO2 (WP#) and IO3 are driven high throughout. They run
+-- between memory accesses and take priority over a waiting core_req.
+-- RDSR and RDID are limited to 40MHz (Table 29); see the assertion below.
+-- WRSR is followed by the array-write CS# high time, the others by the
+-- read one.
+--
 -- Not implemented (documented scope):
---   * Register access (RDSR/RDAR/WRAR, CR1/CR2 configuration, RDID).
+--   * RDFSR, RDAR/WRAR (CR1/CR2 access).
 --   * Driving the device RESET# pin (not on this entity's ports).
 --   * Burst aggregation / prefetch across consecutive core_req calls.
 --   * XIP mode (deliberately never entered: the mode byte is always Fxh).
@@ -92,7 +101,12 @@ entity mram_qspi_backend is
         G_XIP_BYTE          : std_logic_vector(7 downto 0) := x"FF"; -- XIP mode byte, Fxh = no XIP
         G_OPCODE_QUAD_READ  : std_logic_vector(7 downto 0) := x"EB"; -- RDQI,  Table 29 #19
         G_OPCODE_QUAD_WRITE : std_logic_vector(7 downto 0) := x"D2"; -- 4WQIO, Table 29 #24
-        G_OPCODE_WREN       : std_logic_vector(7 downto 0) := x"06"  -- WREN,  Table 29 #2
+        G_OPCODE_WREN       : std_logic_vector(7 downto 0) := x"06"; -- WREN,  Table 29 #2
+        G_OPCODE_WRDI       : std_logic_vector(7 downto 0) := x"04"; -- WRDI,  Table 29 #3
+        G_OPCODE_RDSR       : std_logic_vector(7 downto 0) := x"05"; -- RDSR,  Table 29 #6
+        G_OPCODE_RDID       : std_logic_vector(7 downto 0) := x"9F"; -- RDID,  Table 29 #8
+        G_OPCODE_WRSR       : std_logic_vector(7 downto 0) := x"01"; -- WRSR,  Table 29 #10
+        G_ACLK_FREQ_HZ      : natural := 150_000_000   -- only used by the SCLK limit checks
     );
     port (
         aclk    : in  std_logic;
@@ -100,6 +114,15 @@ entity mram_qspi_backend is
 
         core_req  : in  core_req_t;
         core_resp : out core_resp_t;
+
+        -- Register command request (same valid/accept rule as core_req:
+        -- hold valid and the fields until accept = '1' in the same cycle).
+        reg_cmd_valid  : in  std_logic := '0';
+        reg_cmd_op     : in  reg_cmd_t := REG_CMD_RDSR;
+        reg_cmd_wdata  : in  std_logic_vector(7 downto 0) := (others => '0'); -- WRSR data
+        reg_cmd_accept : out std_logic;
+        reg_cmd_done   : out std_logic;                     -- one-cycle pulse
+        reg_cmd_rdata  : out std_logic_vector(31 downto 0); -- RDSR: bits 7:0; RDID: all 32
 
         mram_cs_n  : out std_logic;
         mram_sclk  : out std_logic;
@@ -118,7 +141,8 @@ architecture rtl of mram_qspi_backend is
     type state_t is (
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
-        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE, S_CS_HIGH
+        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE, S_CS_HIGH,
+        S_REG_SETUP, S_REG_CMD, S_REG_WDATA, S_REG_RDATA
     );
     signal state : state_t := S_IDLE;
 
@@ -179,6 +203,13 @@ architecture rtl of mram_qspi_backend is
     signal io_drive : std_logic_vector(3 downto 0);
     signal io_oe    : std_logic_vector(3 downto 0); -- '1' per bit = drive that line
 
+    -- Register command in progress
+    signal req_is_reg   : std_logic := '0';
+    signal reg_wr_bits  : integer range 0 to 8;   -- data bits sent after the opcode
+    signal reg_rd_bits  : integer range 0 to 32;  -- data bits received after the opcode
+    signal reg_rx       : std_logic_vector(31 downto 0);
+    signal reg_done_i   : std_logic := '0';
+
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
     signal resp_rdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
@@ -215,8 +246,18 @@ begin
     mram_io_o  <= io_drive;
     mram_io_oe <= io_oe;
 
+    assert G_ACLK_FREQ_HZ / (2 * G_SCLK_HALF_PERIOD) <= 40_000_000
+        report "SCLK above 40MHz: too fast for RDSR/RDID (datasheet Table 29)" severity failure;
+    assert G_ACLK_FREQ_HZ / (2 * G_SCLK_HALF_PERIOD) <= 54_000_000
+        report "SCLK above 54MHz SDR maximum (datasheet Table 39)" severity failure;
+
+    -- Register commands win over a waiting memory request.
+    reg_cmd_accept <= reg_cmd_valid when state = S_IDLE else '0';
+    reg_cmd_done   <= reg_done_i;
+    reg_cmd_rdata  <= reg_rx;
+
     -- Accept combinationally whenever idle (see the mram_pkg contract).
-    core_resp.ready  <= core_req.valid when state = S_IDLE else '0';
+    core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else '0';
     core_resp.rvalid <= resp_rvalid;
     core_resp.bvalid <= resp_bvalid;
     core_resp.rdata  <= resp_rdata;
@@ -233,9 +274,12 @@ begin
                 io_oe       <= (others => '0');
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
+                reg_done_i  <= '0';
+                req_is_reg  <= '0';
             else
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
+                reg_done_i  <= '0';
 
                 case state is
 
@@ -246,7 +290,34 @@ begin
                         mram_cs_n <= '1';
                         sclk_run  <= false;
                         io_oe     <= (others => '0');
-                        if core_req.valid = '1' then
+                        if reg_cmd_valid = '1' then
+                            -- opcode, then (WRSR only) the data byte, MSB first
+                            req_is_reg  <= '1';
+                            reg_wr_bits <= 0;
+                            reg_rd_bits <= 0;
+                            req_we      <= '0'; -- selects the CS# high time afterwards
+                            case reg_cmd_op is
+                                when REG_CMD_WREN =>
+                                    shreg(511 downto 504) <= G_OPCODE_WREN;
+                                when REG_CMD_WRDI =>
+                                    shreg(511 downto 504) <= G_OPCODE_WRDI;
+                                when REG_CMD_RDSR =>
+                                    shreg(511 downto 504) <= G_OPCODE_RDSR;
+                                    reg_rd_bits <= 8;
+                                when REG_CMD_WRSR =>
+                                    shreg(511 downto 496) <= G_OPCODE_WRSR & reg_cmd_wdata;
+                                    reg_wr_bits <= 8;
+                                    req_we      <= '1';
+                                when others => -- REG_CMD_RDID
+                                    shreg(511 downto 504) <= G_OPCODE_RDID;
+                                    reg_rd_bits <= 32;
+                            end case;
+                            reg_rx    <= (others => '0');
+                            setup_cnt <= 0;
+                            mram_cs_n <= '0';
+                            state     <= S_REG_SETUP;
+                        elsif core_req.valid = '1' then
+                            req_is_reg  <= '0';
                             req_we      <= core_req.we;
                             req_nbytes  <= core_req.nbytes;
                             lane_offset <= unsigned(core_req.addr(5 downto 0));
@@ -416,7 +487,12 @@ begin
                         end if;
 
                     when S_CS_HOLD =>
-                        io_oe <= (others => '0');
+                        -- Register commands keep IO0/IO2 (WP#)/IO3 driven until
+                        -- CS# has been high for a while (tWPHD 20ns, Table 45);
+                        -- the device never drives those lines in (1-0-x) mode.
+                        if req_is_reg = '0' then
+                            io_oe <= (others => '0');
+                        end if;
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
                             mram_cs_n <= '1';
                             state     <= S_DONE;
@@ -426,7 +502,9 @@ begin
                         end if;
 
                     when S_DONE =>
-                        if req_we = '1' then
+                        if req_is_reg = '1' then
+                            reg_done_i <= '1';
+                        elsif req_we = '1' then
                             resp_bvalid <= '1';
                         else
                             -- Received bytes sit in shreg(8*n-1:0), first byte
@@ -446,9 +524,74 @@ begin
                     when S_CS_HIGH =>
                         if (req_we = '1' and high_cnt >= C_HIGH_WAIT_WR) or
                            (req_we = '0' and high_cnt >= C_HIGH_WAIT_RD) then
+                            io_oe <= (others => '0');
                             state <= S_IDLE;
                         else
                             high_cnt <= high_cnt + 1;
+                        end if;
+
+                    ------------------------------------------------------------
+                    -- Register commands: single-bit SPI (1-0-0 / 1-0-1).
+                    ------------------------------------------------------------
+                    when S_REG_SETUP =>
+                        if setup_cnt = G_CS_SETUP_CYCLES - 1 then
+                            io_drive  <= "11" & '0' & shreg(511);
+                            shreg     <= shreg(510 downto 0) & '0';
+                            clks_left <= 8;
+                            io_oe     <= "1101"; -- IO1 is the device's SO
+                            sclk_run  <= true;
+                            state     <= S_REG_CMD;
+                        else
+                            setup_cnt <= setup_cnt + 1;
+                        end if;
+
+                    when S_REG_CMD =>
+                        if sclk_rise then
+                            clks_left <= clks_left - 1;
+                        elsif sclk_fall then
+                            if clks_left = 0 then
+                                if reg_wr_bits /= 0 then
+                                    io_drive(0) <= shreg(511);
+                                    shreg       <= shreg(510 downto 0) & '0';
+                                    clks_left   <= reg_wr_bits;
+                                    state       <= S_REG_WDATA;
+                                elsif reg_rd_bits /= 0 then
+                                    -- device shifts out on IO1 from this edge on
+                                    clks_left <= reg_rd_bits;
+                                    state     <= S_REG_RDATA;
+                                else
+                                    sclk_run  <= false;
+                                    setup_cnt <= 0;
+                                    state     <= S_CS_HOLD;
+                                end if;
+                            else
+                                io_drive(0) <= shreg(511);
+                                shreg       <= shreg(510 downto 0) & '0';
+                            end if;
+                        end if;
+
+                    when S_REG_WDATA =>
+                        if sclk_rise then
+                            clks_left <= clks_left - 1;
+                        elsif sclk_fall then
+                            if clks_left = 0 then
+                                sclk_run  <= false;
+                                setup_cnt <= 0;
+                                state     <= S_CS_HOLD;
+                            else
+                                io_drive(0) <= shreg(511);
+                                shreg       <= shreg(510 downto 0) & '0';
+                            end if;
+                        end if;
+
+                    when S_REG_RDATA =>
+                        if sclk_rise then
+                            clks_left <= clks_left - 1;
+                            reg_rx    <= reg_rx(30 downto 0) & mram_io_i(1);
+                        elsif sclk_fall and clks_left = 0 then
+                            sclk_run  <= false;
+                            setup_cnt <= 0;
+                            state     <= S_CS_HOLD;
                         end if;
 
                     when others =>
