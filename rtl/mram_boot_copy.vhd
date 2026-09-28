@@ -27,7 +27,7 @@
 --      indication (LED, telemetry bit, external watchdog that forces a
 --      power-cycle) the system has; none is assumed here.
 --   4. The default SCLK divider is deliberately conservative rather than
---      pushed toward the datasheet's 108MHz ceiling, trading unused boot
+--      pushed toward the datasheet's 54MHz SDR ceiling, trading unused boot
 --      time budget for timing margin.
 --   5. An explicit "when others" default on the state case, alongside
 --      whatever "safe FSM" / illegal-state-recovery option the synthesis
@@ -86,7 +86,9 @@ entity mram_boot_copy is
         G_CHUNK_BYTES   : natural := 64;         -- bytes per request, 1..64; must divide the
                                                  -- bases and G_COPY_SIZE (64-byte window rule)
         G_MAX_RETRIES   : natural := 3;
-        G_WATCHDOG_LIMIT: natural := 1_000_000   -- aclk cycles with no state change = hang
+        G_WATCHDOG_LIMIT: natural := 1_000_000;  -- aclk cycles with no state change = hang
+        G_POWERUP_CYCLES: natural := 3_750_000   -- MRAM tPU (25ms at 150MHz) before the first
+                                                 -- command; the -A variant needs only 1ms
     );
     port (
         aclk    : in  std_logic;
@@ -104,14 +106,16 @@ end entity mram_boot_copy;
 architecture rtl of mram_boot_copy is
 
     type state_t is (
+        S_POWERUP,
         S_COPY_READ_ISSUE, S_COPY_READ_WAIT, S_COPY_WRITE_ISSUE, S_COPY_WRITE_WAIT,
         S_VERIFY_SRC_ISSUE, S_VERIFY_SRC_WAIT, S_VERIFY_DST_ISSUE, S_VERIFY_DST_WAIT,
         S_VERIFY_COMPARE,
         S_RETRY_CHECK,
         S_DONE, S_FAIL
     );
-    signal state      : state_t := S_COPY_READ_ISSUE;
-    signal prev_state : state_t := S_COPY_READ_ISSUE;
+    signal state      : state_t := S_POWERUP;
+    signal prev_state : state_t := S_POWERUP;
+    signal powerup_cnt : natural range 0 to G_POWERUP_CYCLES := 0;
 
     -- 26 bits comfortably covers a 32MB (2**25) offset with headroom.
     signal byte_off   : unsigned(25 downto 0) := (others => '0');
@@ -131,8 +135,9 @@ begin
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
-                state        <= S_COPY_READ_ISSUE;
-                prev_state   <= S_COPY_READ_ISSUE;
+                state        <= S_POWERUP;
+                prev_state   <= S_POWERUP;
+                powerup_cnt  <= 0;
                 byte_off     <= (others => '0');
                 retry_count  <= 0;
                 cpu_reset_n  <= '0';
@@ -147,18 +152,29 @@ begin
                 -- Watchdog: reset on any state change (progress); force a
                 -- retry attempt if nothing has moved for G_WATCHDOG_LIMIT
                 -- cycles, rather than hanging forever.
-                if state /= prev_state then
+                if state /= prev_state or state = S_POWERUP then
                     watchdog_cnt <= 0;
                 elsif watchdog_cnt < G_WATCHDOG_LIMIT then
                     watchdog_cnt <= watchdog_cnt + 1;
                 end if;
 
-                if watchdog_trip = '1' and state /= S_DONE and state /= S_FAIL then
+                if watchdog_trip = '1' and state /= S_DONE and state /= S_FAIL
+                   and state /= S_POWERUP then
                     core_req.valid <= '0';
                     state          <= S_RETRY_CHECK;
                 else
 
                 case state is
+
+                    -- Datasheet tPU: no instruction to the MRAM until it has
+                    -- powered up. Assumes aresetn is released no earlier than
+                    -- MRAM power-up; if not, lengthen G_POWERUP_CYCLES.
+                    when S_POWERUP =>
+                        if powerup_cnt >= G_POWERUP_CYCLES then
+                            state <= S_COPY_READ_ISSUE;
+                        else
+                            powerup_cnt <= powerup_cnt + 1;
+                        end if;
 
                     when S_COPY_READ_ISSUE =>
                         if core_req.valid = '1' and core_resp.ready = '1' then

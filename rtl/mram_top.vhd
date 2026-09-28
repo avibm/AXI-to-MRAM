@@ -53,13 +53,15 @@ entity mram_top is
         G_BOOT_COPY_SIZE   : natural := 33554432;
         G_BOOT_MAX_RETRIES : natural := 3;
         G_BOOT_WATCHDOG    : natural := 1_000_000;
+        G_POWERUP_CYCLES   : natural := 3_750_000;  -- MRAM tPU 25ms at 150MHz
         -- Write guard (defaults: protect 0x6000000..0x7FFFFFF)
         G_PROTECT_BASE     : natural := 100663296;
         G_PROTECT_SIZE     : natural := 33554432;
         G_SYNC_KEY_OK      : boolean := true;
         -- QSPI backend
-        G_DUMMY_CYCLES     : integer := 8;
-        G_SCLK_HALF_PERIOD : integer := 2
+        G_DUMMY_CYCLES         : integer := 8;   -- = MRAM CR2 latency (default 8)
+        G_SCLK_HALF_PERIOD     : integer := 2;   -- SCLK = aclk / (2*N); datasheet max 54MHz
+        G_CS_HIGH_WRITE_CYCLES : integer := 92   -- tCS3 600ns at 150MHz
     );
     port (
         aclk    : in  std_logic;
@@ -133,7 +135,8 @@ begin
             G_DST_BASE       => G_BOOT_DST_BASE,
             G_COPY_SIZE      => G_BOOT_COPY_SIZE,
             G_MAX_RETRIES    => G_BOOT_MAX_RETRIES,
-            G_WATCHDOG_LIMIT => G_BOOT_WATCHDOG
+            G_WATCHDOG_LIMIT => G_BOOT_WATCHDOG,
+            G_POWERUP_CYCLES => G_POWERUP_CYCLES
         )
         port map (
             aclk        => aclk,
@@ -207,8 +210,9 @@ begin
 
     u_backend : entity work.mram_qspi_backend
         generic map (
-            G_DUMMY_CYCLES     => G_DUMMY_CYCLES,
-            G_SCLK_HALF_PERIOD => G_SCLK_HALF_PERIOD
+            G_DUMMY_CYCLES         => G_DUMMY_CYCLES,
+            G_SCLK_HALF_PERIOD     => G_SCLK_HALF_PERIOD,
+            G_CS_HIGH_WRITE_CYCLES => G_CS_HIGH_WRITE_CYCLES
         )
         port map (
             aclk       => aclk,

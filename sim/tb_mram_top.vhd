@@ -121,7 +121,8 @@ begin
     dut : entity work.mram_top
         generic map (
             G_BOOT_COPY_SIZE => BOOT_BYTES,
-            G_BOOT_WATCHDOG  => 100_000
+            G_BOOT_WATCHDOG  => 100_000,
+            G_POWERUP_CYCLES => 1500      -- 10us instead of 25ms, to keep the run short
         )
         port map (
             aclk => aclk, aresetn => aresetn,
@@ -142,6 +143,7 @@ begin
         );
 
     mdl : entity work.qspi_mram_model
+        generic map (G_TPU => 10 us)
         port map (cs_n => cs_n, sclk => sclk, io => io,
                   errors => model_errs, n_rd => model_rd, n_wr => model_wr);
 

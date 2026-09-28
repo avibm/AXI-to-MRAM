@@ -10,56 +10,67 @@
 -- file -- this backend has no protection logic of its own and moves
 -- whatever address it is given.
 --
--- Opcodes and framing, per the AS302G208 datasheet's instruction table:
---   Write Enable   (WREN)  06h, framing (1-0-0), 0 address/data bytes.
---     Issued as its own complete CS# low->high transaction immediately
---     before every write (S_WREN_* states).
---   Read Quad I/O  (RDQI)  EBh, framing (1-4-4): opcode on IO0 only
---     (single-bit), address AND data on all four IOs. SDR, 108MHz max,
---     4 address bytes, latency/dummy cycles required, supports XIP.
---   Write Quad I/O (4WQIO) D2h, framing (1-4-4), SDR, 108MHz max,
---     4 address bytes, requires WREN immediately before it.
--- (DDR variants DRQI/EDh and 4DWQO/D1h exist at 54MHz but are not used
---  here; this design is SDR-only.)
+-- Datasheet: Avalanche "1Gbit - 8Gbit Dual Quad SPI P-SRAM Memory"
+-- (AS301G208/AS302G208/AS304G208/AS308G208), Rev. J.5. Table and figure
+-- numbers below refer to that revision.
 --
--- Not yet confirmed against the datasheet:
---   G_DUMMY_CYCLES: latency/dummy cycles for Quad I/O reads are
---   configurable via Configuration Register 2 (CR2[3:0]) and frequency-
---   dependent, not a single fixed constant. This design assumes CR2 is
---   already configured elsewhere to match G_DUMMY_CYCLES at the chosen
---   SCLK frequency; configuring CR2 itself (via Write Any Register,
---   WRAR, 71h) is not implemented here.
---   Clock polarity/phase (mode 0) and wire byte-order (lowest-address
---   byte first, MSB-first per byte) are assumed, not confirmed.
---   Whether RDQI carries "mode"/XIP-continuation bits in its first dummy
---   clocks is not confirmed. This design releases IO0-3 for the whole
---   dummy phase; if the device samples mode bits there, floating lines
---   could select continuous-read (XIP) mode -- check the datasheet and, if
---   needed, drive a non-XIP mode value during those clocks.
+-- The AS302G208 package holds two independent 1Gb (128MB) quad-SPI dies,
+-- each with its own CS#/CLK and IO[3:0] / IO[7:4]. This backend drives one
+-- die (CS1#, CLK1, IO[3:0]); die 2 is unused and its CS2# must be held
+-- high on the board.
 --
--- Address width note: core_req.addr is 27 bits (128MB usable), zero-
--- extended to the 4 address bytes (32 bits) RDQI/4WQIO require.
+-- Opcodes and framing (Table 29, Figure 19):
+--   Write Enable   (WREN)  06h, (1-0-0), no address/data. Issued as its own
+--     CS# transaction before every array write (CR1 default "Normal" WREN
+--     mode: WREN clears when CS# rises after a write).
+--   Read Quad I/O  (RDQI)  EBh, (1-4-4) SDR, 54MHz max: opcode on IO0,
+--     4 address bytes on IO[3:0], 1 XIP mode byte, G_DUMMY_CYCLES latency
+--     clocks, then data on IO[3:0].
+--   Write Quad I/O (4WQIO) D2h, (1-4-4) SDR, 54MHz max: opcode on IO0,
+--     4 address bytes, 1 XIP mode byte, then data.
+--   The XIP mode byte is part of both instructions (Table 29 "XIP" column,
+--   Figure 19): Axh would enter XIP (no opcode on later accesses), Fxh
+--   keeps normal mode. This design always sends G_XIP_BYTE = FFh.
 --
--- SPI timing (mode 0): every phase is counted in SCLK rising edges. The
--- first bit/nibble of a transaction is driven before the first rising
--- edge; each later bit/nibble is driven on the falling edge that follows
--- the rising edge which consumed the previous one. Read data is sampled on
--- the aclk edge that raises SCLK, i.e. half an SCLK period after the device
--- launched it on the preceding falling edge. At G_SCLK_HALF_PERIOD = 1
--- (75MHz from a 150MHz aclk) that leaves ~6.7ns for FPGA clock-to-out +
--- board round trip + device output-valid + input setup, which is unlikely
--- to close; the default of 2 (37.5MHz) leaves ~13.3ns. Close it with real
--- I/O constraints in timing analysis.
+-- Latency: CR2[3:0] defaults to 8 cycles (Table 25), which is valid for
+-- (1-4-4) SDR up to 54MHz (Table 26). G_DUMMY_CYCLES must equal CR2; CR2
+-- is never written by this design.
+--
+-- Mode 0 (CPOL=0, CPHA=0), inputs latched on rising CLK, outputs change on
+-- falling CLK, MSB first (Table 4, Table 7, "Instruction Description").
+--
+-- Device timing honoured here (Tables 10, 39, 41, 43), in aclk cycles, so
+-- the defaults assume a 150MHz aclk -- rescale for another clock:
+--   fCLK <= 54MHz SDR      -> G_SCLK_HALF_PERIOD >= 2 (37.5MHz at 150MHz)
+--   tPU  >= 25ms           -> enforced by mram_boot_copy (G_POWERUP_CYCLES),
+--                             which always issues the first request
+--   tCSS >= 5ns, tCSH >= 4ns -> G_CS_SETUP_CYCLES (setup and hold)
+--   tCS1 >= 20ns after read -> G_CS_HIGH_READ_CYCLES
+--   tCS3 >= 600ns after array write -> G_CS_HIGH_WRITE_CYCLES
+--   CS# high between WREN and the write -> G_CS_GAP_CYCLES
+--
+-- Address width note: core_req.addr is 27 bits (128MB = one 1Gb die),
+-- zero-extended to the 4 address bytes RDQI/4WQIO require (Table 12).
+--
+-- SPI timing: every phase is counted in SCLK rising edges. The first
+-- bit/nibble of a transaction is driven before the first rising edge; each
+-- later one is driven on the falling edge after the rising edge that
+-- consumed the previous one. Read data is sampled on the aclk edge that
+-- raises SCLK, half an SCLK period after the device launched it on the
+-- preceding falling edge. The device's output valid time is tCO <= 9ns
+-- (Table 43); at 37.5MHz the half period is 13.3ns, leaving ~4ns for FPGA
+-- clock-to-out, board delay both ways and input setup. That is tight:
+-- constrain the I/O in timing analysis, or use G_SCLK_HALF_PERIOD = 3
+-- (25MHz, 20ns half period) for more margin.
 --
 -- Byte lanes: the byte at address A is carried in lane A(5:0) of wdata /
 -- rdata (see mram_pkg). The lowest-address byte is sent / received first.
 --
 -- Not implemented (documented scope):
---   * CR2 (latency) configuration / any register-write initialization.
---   * Device power-up delay before the first command (datasheet tPU) --
---     aresetn must be held until the device is ready.
+--   * Register access (RDSR/RDAR/WRAR, CR1/CR2 configuration, RDID).
+--   * Driving the device RESET# pin (not on this entity's ports).
 --   * Burst aggregation / prefetch across consecutive core_req calls.
---   * XIP mode (RDQI supports it per the datasheet; unused here).
+--   * XIP mode (deliberately never entered: the mode byte is always Fxh).
 --   * Error/status reporting beyond core_resp.error tied low ('0').
 --
 -- Language: VHDL-2008
@@ -72,13 +83,16 @@ use work.mram_pkg.all;
 
 entity mram_qspi_backend is
     generic (
-        G_DUMMY_CYCLES      : integer := 8;              -- STILL PLACEHOLDER, see header
-        G_SCLK_HALF_PERIOD  : integer := 2;               -- aclk cycles per SCLK half-period
-        G_CS_SETUP_CYCLES   : integer := 4;               -- aclk cycles CS# low before first edge
-        G_CS_GAP_CYCLES     : integer := 4;               -- aclk cycles CS# high between WREN and write
-        G_OPCODE_QUAD_READ  : std_logic_vector(7 downto 0) := x"EB"; -- RDQI, confirmed, Table 32 #18
-        G_OPCODE_QUAD_WRITE : std_logic_vector(7 downto 0) := x"D2"; -- 4WQIO, confirmed, Table 32 #23
-        G_OPCODE_WREN       : std_logic_vector(7 downto 0) := x"06"  -- WREN, confirmed, Table 32 #2
+        G_DUMMY_CYCLES         : integer := 8;          -- must equal CR2[3:0] (default 8, Table 25)
+        G_SCLK_HALF_PERIOD     : integer := 2;          -- aclk cycles per SCLK half-period (>= 2 at 150MHz)
+        G_CS_SETUP_CYCLES      : integer := 4;          -- aclk cycles CS# low before first edge / after last
+        G_CS_GAP_CYCLES        : integer := 4;          -- aclk cycles CS# high between WREN and write
+        G_CS_HIGH_READ_CYCLES  : integer := 4;          -- min CS# high after a read  (tCS1 20ns  -> 27ns)
+        G_CS_HIGH_WRITE_CYCLES : integer := 92;         -- min CS# high after a write (tCS3 600ns -> 613ns)
+        G_XIP_BYTE          : std_logic_vector(7 downto 0) := x"FF"; -- XIP mode byte, Fxh = no XIP
+        G_OPCODE_QUAD_READ  : std_logic_vector(7 downto 0) := x"EB"; -- RDQI,  Table 29 #19
+        G_OPCODE_QUAD_WRITE : std_logic_vector(7 downto 0) := x"D2"; -- 4WQIO, Table 29 #24
+        G_OPCODE_WREN       : std_logic_vector(7 downto 0) := x"06"  -- WREN,  Table 29 #2
     );
     port (
         aclk    : in  std_logic;
@@ -104,9 +118,24 @@ architecture rtl of mram_qspi_backend is
     type state_t is (
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
-        S_CS_SETUP, S_CMD, S_ADDR, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE
+        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE, S_CS_HIGH
     );
     signal state : state_t := S_IDLE;
+
+    function max(a, b : integer) return integer is
+    begin
+        if a > b then
+            return a;
+        end if;
+        return b;
+    end function;
+
+    -- S_DONE and the accepting S_IDLE cycle also keep CS# high, so the
+    -- S_CS_HIGH wait is two cycles shorter than the required high time.
+    constant C_HIGH_WAIT_RD : natural := max(G_CS_HIGH_READ_CYCLES - 2, 0);
+    constant C_HIGH_WAIT_WR : natural := max(G_CS_HIGH_WRITE_CYCLES - 2, 0);
+
+    signal high_cnt    : natural range 0 to max(C_HIGH_WAIT_RD, C_HIGH_WAIT_WR) := 0;
 
     -- Byte-order reversal of a 512-bit word: byte k <-> byte 63-k. Pure
     -- wiring, no logic.
@@ -323,6 +352,22 @@ begin
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
+                                -- XIP mode byte, 2 quad clocks (Figure 19)
+                                io_drive  <= G_XIP_BYTE(7 downto 4);
+                                shreg(511 downto 508) <= G_XIP_BYTE(3 downto 0);
+                                clks_left <= 2;
+                                state     <= S_XIP;
+                            else
+                                io_drive <= shreg(511 downto 508);
+                                shreg    <= shreg(507 downto 0) & "0000";
+                            end if;
+                        end if;
+
+                    when S_XIP =>
+                        if sclk_rise then
+                            clks_left <= clks_left - 1;
+                        elsif sclk_fall then
+                            if clks_left = 0 then
                                 if req_we = '1' then
                                     io_drive  <= tx_build(511 downto 508);
                                     shreg     <= tx_build(507 downto 0) & "0000";
@@ -393,7 +438,18 @@ begin
                                                        - to_integer(lane_offset))));
                             resp_rvalid <= '1';
                         end if;
-                        state <= S_IDLE;
+                        high_cnt <= 0;
+                        state    <= S_CS_HIGH;
+
+                    -- Minimum CS# high time before the next instruction:
+                    -- tCS3 after an array write, tCS1 after a read.
+                    when S_CS_HIGH =>
+                        if (req_we = '1' and high_cnt >= C_HIGH_WAIT_WR) or
+                           (req_we = '0' and high_cnt >= C_HIGH_WAIT_RD) then
+                            state <= S_IDLE;
+                        else
+                            high_cnt <= high_cnt + 1;
+                        end if;
 
                     when others =>
                         -- Defensive default for an unreachable/SEU-corrupted
