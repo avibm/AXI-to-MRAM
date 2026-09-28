@@ -27,7 +27,9 @@ sim/run_ghdl.sh --wave   # also writes sim/build/tb_mram_top.ghw
 
 ## Status
 
-Functionally simulated only. The design has not been synthesized or
-timing-closed, and it has not been checked against the AS302G208 datasheet
-(dummy cycles/CR2, mode bits, power-up timing). See `doc/REVIEW.md`, "Open
-items".
+Functionally simulated against a behavioural model written from the
+AS302G208 datasheet (Rev. J.5): instruction framing including the XIP mode
+byte, CS# high times, power-up time, and the 54 MHz clock limit. Not yet
+timing-closed or re-verified on hardware after the rev. 2 fixes. Before
+testing a new bitstream, power-cycle the MRAM or pulse RESET#. See
+`doc/REVIEW.md`, "Rev. 2" and "Board checks".

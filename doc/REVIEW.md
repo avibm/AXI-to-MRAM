@@ -1,4 +1,4 @@
-# MRAM Subsystem – Design Review (rev. 1)
+# MRAM Subsystem – Design Review (rev. 2)
 
 Scope: `doc/MRAM_Subsystem_IP_Specification.pdf` (Sep 24, 2026) and the six
 VHDL files in `rtl/` as first committed (commit "Add MRAM subsystem RTL and IP
@@ -70,15 +70,67 @@ margin, robustness, or portability.
 | M5 | Boot copy `when others` did not drop `core_req.valid`. | Fixed. |
 | M6 | Boot-copy header claimed "~1.3–1.5 s" for the copy. The spec says 8.64 s. Simulation gives ≈16.6 µs per 64-byte chunk, i.e. ≈8.7 s per 32 MB pass. | Comment corrected (≈9 s per pass, ≈35 s with 3 retries). |
 
+## Rev. 2 – hardware failure and datasheet check
+
+**Symptom on hardware.** Identify showed `mram_boot_copy` in `S_FAIL` after
+all retries. The verify pass failed at a random chunk, and during the read
+data phase the IO bus sat at `F` (pull-ups): the MRAM was not driving it.
+
+**Root cause.** The device was checked against the Avalanche datasheet "1Gbit – 8Gbit
+Dual Quad SPI P-SRAM", Rev. J.5 (Table 29, Figure 19). RDQI `EBh` and 4WQIO
+`D2h` both carry an **XIP mode byte** after the 4 address bytes: 2 quad clocks,
+`Axh` = enter XIP, `Fxh` = normal. The RTL did not send it. Two things followed:
+
+* **Writes:** the first data byte was taken as the mode byte. The rest of the
+  data landed one byte low. Any chunk whose first byte was `Ax` switched the
+  die into XIP mode, where it no longer expects an opcode. From then on it no
+  longer responded to normal commands, which matches the floating bus seen on
+  hardware.
+* **Reads:** data was sampled 2 clocks early, one byte off.
+
+The behavioural MRAM model in rev. 1 used the same wrong framing. It was
+written from generic SPI conventions without the datasheet, so the simulation
+could not catch this. The model now follows the datasheet. Run against the
+rev. 1 RTL it reports the missing mode byte and the timing violations below.
+
+| # | Finding (datasheet reference) | Fix |
+|---|------------------------------|-----|
+| D1 | Missing XIP mode byte in EBh/D2h (Table 29 "XIP" column, Figure 19) | `S_XIP` state sends `G_XIP_BYTE` = `FFh` after the address, for reads and writes. |
+| D2 | CS# high time after a memory-array write must be ≥ 600 ns (tCS3, Table 39); the design gave ~13–80 ns | `S_CS_HIGH` wait: `G_CS_HIGH_WRITE_CYCLES` = 92 (613 ns @150 MHz). |
+| D3 | CS# high time after a read must be ≥ 20 ns (tCS1); the design gave 13.3 ns | `G_CS_HIGH_READ_CYCLES` = 4 (26.7 ns). |
+| D4 | No instruction before tPU = 25 ms after power-up/RESET (1 ms for the -A variant) (Tables 10/11) | Boot copy waits `G_POWERUP_CYCLES` = 3,750,000 (25 ms) before its first request. The watchdog is held off during that wait. |
+| D5 | Max SCLK is **54 MHz** SDR, not 108 MHz (Tables 29, 39) | Comments corrected. `G_SCLK_HALF_PERIOD` must be ≥ 2 at 150 MHz; the default is 37.5 MHz. |
+| D6 | Read latency: CR2 default is 8 cycles, valid for (1-4-4) SDR up to 54 MHz (Tables 25, 26) | `G_DUMMY_CYCLES` = 8 confirmed; closes O1 as long as CR2 is left at its default. |
+| D7 | Output valid tCO ≤ 9 ns after the falling edge (Table 43). Sampling half a period later leaves ~4 ns at 37.5 MHz for FPGA and board delays | Documented. Use `G_SCLK_HALF_PERIOD` = 3 (25 MHz) if the I/O timing does not close. The model now uses tCO = 9 ns. |
+
+### Board checks (from the datasheet – cannot be fixed in RTL)
+
+* **Recover a die left in XIP mode.** Before testing the new bitstream,
+  **power-cycle the MRAM or pulse RESET#** (ball J9). XIP mode is not
+  necessarily cleared by reloading the FPGA.
+* **RESET# (J9)** must be high in normal operation. The datasheet gives no
+  minimum pulse width in the pages reviewed.
+* **Unused die:** the AS302G208 is two 1 Gb dies with separate CS1#/CLK1/IO[3:0]
+  and CS2#/CLK2/IO[7:4]. This design uses die 1 only (128 MB, as in the spec).
+  CS2# needs a pull-up (the datasheet recommends 10 kΩ on CS#).
+* **CS1#:** 10 kΩ pull-up recommended so the die is deselected during power-up.
+* **WP1#/IO2** has no internal pull-up and "cannot be left floating". IO3
+  also needs a defined level. The design releases IO0–3 between
+  transactions, so external pull-ups are required.
+* **HBP0–2 / HTBSEL** hardware block protection. These have internal
+  pull-downs, so no protection if unconnected. If the board straps them,
+  writes to the protected range are silently ignored. For example, HBP =
+  H-L-H with HTBSEL = L protects 0x6000000–0x7FFFFFF on a 1 Gb die.
+
 ## Open items (not fixed – need the datasheet or a system decision)
 
 | # | Item |
 |---|------|
-| O1 | `G_DUMMY_CYCLES` = 8 is still a placeholder, and CR2 is never configured. *Verify against datasheet.* |
-| O2 | RDQI "mode"/XIP bits. Many quad-SPI memories treat the first dummy clocks after the address of an EBh read as mode bits. The design floats IO0–3 there. If the AS302G208 does this, a random value could put it into continuous-read (XIP) mode. *Verify against datasheet.* |
-| O3 | No device power-up delay (tPU) before the first command. `aresetn` must be held long enough by the system. |
-| O4 | IO2/IO3 (WP#/HOLD#, possibly RESET#) float between transactions. Board pull-ups are recommended; check which functions are active in quad mode. The spec also lists WP# as a separate pin, but in quad mode it is IO2. |
-| O5 | I/O timing. Read data is sampled at the aclk edge that raises SCLK: ~13.3 ns budget at the default 37.5 MHz, ~6.7 ns at 75 MHz. Needs I/O constraints and timing analysis. 150 MHz / (2·N) can never reach the 100/108 MHz in the spec; the maximum is 75 MHz. |
+| O1 | ~~Dummy cycles~~ – resolved by D6. CR2 is still never written, so it must stay at its default of 8. |
+| O2 | ~~XIP mode bits~~ – resolved by D1. |
+| O3 | ~~Power-up delay~~ – resolved by D4. It assumes `aresetn` is not released before the MRAM supply is up. |
+| O4 | IO2/IO3 float between transactions and need board pull-ups (see "Board checks"). |
+| O5 | I/O timing: see D7. Needs I/O constraints and timing analysis. `G_SCLK_HALF_PERIOD` = 1 (75 MHz) exceeds the device maximum of 54 MHz and must not be used. |
 | O6 | Boot verify compares the copy with the source only. A corrupted master image is copied and "verified". Consider a CRC or signature over the image. |
 | O7 | A watchdog-forced retry does not wait for a request still in flight in the backend. This only matters after a real fault; documented in `mram_boot_copy.vhd`. |
 | O8 | During the ~9 s (up to ~35 s) boot copy, PCI accesses to this window stall. A PCIe completion timeout will fire long before that. The system must make PCI wait for `boot_done`, or the design needs a "respond SLVERR while booting" mode. |
@@ -98,7 +150,9 @@ margin, robustness, or portability.
 | 4 | Wrapper state diagrams | Outdated after the fixes. Write side: `WR_IDLE → WR_WDATA → WR_BEAT ⇄ WR_WAIT_BVALID → WR_RESP`, plus `WR_ERR_DRAIN → WR_RESP`. |
 | 2, 3 | "Mux … the CPU issues no AXI traffic while held in reset" | The PCI master can issue traffic during the copy (C7). |
 | 6 | "both mram_boot_copy and mram_qspi_backend force the bus released and CS# deasserted" on an illegal state | Only the backend owns the pins. The boot copy retries and drops its request. |
-| 7 | "a 4-byte request costs ~16 overhead cycles + 8 data cycles — about 0.24 µs at 100 MHz"; 64-byte "~1.44 µs" | Overhead is 8 opcode + 8 address + 8 dummy = **24** SCLK cycles (plus a WREN transaction for writes). That gives 32 cycles = 0.32 µs and 152 cycles = 1.52 µs at 100 MHz. The design cannot run at 100 MHz (O5). At the default 37.5 MHz, a 4-byte read takes ≈0.9 µs and a 64-byte read ≈4.1 µs. |
+| 1, 6 | "108MHz" SDR / "~50-54MB/s" peak | This datasheet (Rev. J.5) gives 54 MHz SDR / 40 MHz DDR for the quad modes, so the raw peak is 27 MB/s per die. |
+| 6 | Framing "(1-4-4) … address and data on all four IOs" | Omits the XIP mode byte between address and data (D1). |
+| 7 | "a 4-byte request costs ~16 overhead cycles + 8 data cycles — about 0.24 µs at 100 MHz"; 64-byte "~1.44 µs" | Overhead is 8 opcode + 8 address + 2 XIP + 8 latency = **26** SCLK cycles for reads, 18 for writes plus a WREN transaction and 600 ns of CS# high time. That gives 32 cycles = 0.32 µs and 152 cycles = 1.52 µs at 100 MHz. The design cannot run at 100 MHz (O5). At the default 37.5 MHz, a 4-byte read takes ≈0.9 µs and a 64-byte read ≈4.1 µs. |
 | 7 | "~32KB sequential … ~1 ms at ~40 MB/s", "consistent with the channel bandwidth" | Each 64-byte beat is a separate SPI transaction. The limit is ≈15 MB/s at 37.5 MHz (≈30 MB/s at 75 MHz if timing closes), so 32 KB takes ≈2.1 ms. 40 MB/s needs burst aggregation (not implemented). Hand calculation; confirm on hardware. |
 | 2 | "gates writes to the protected region on a password match" | The hardware gates on `key_ok`; the password logic is external. |
 | 1 | MRAM interface "CS#, SCLK, IO0-3, WP#" | WP# is IO2 in quad mode. It is not a separate pin in this RTL. |

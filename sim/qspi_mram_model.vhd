@@ -1,15 +1,19 @@
 --------------------------------------------------------------------------------
 -- qspi_mram_model.vhd  (simulation only)
 --
--- Behavioural model of a Quad-SPI MRAM, just detailed enough to check the
--- mram_qspi_backend framing. It is NOT a vendor model of the AS302G208; it
--- encodes the standard SPI-memory conventions the RTL assumes (mode 0, MSB
--- first, data bytes stored at incrementing addresses starting at the
--- transmitted address, WREN required before each write). Confirm those
--- conventions against the AS302G208 datasheet before relying on this model.
+-- Behavioural model of one die of the Avalanche AS302G208 (Dual Quad SPI
+-- P-SRAM datasheet Rev. J.5), just detailed enough to check the
+-- mram_qspi_backend framing and timing. It is NOT a vendor model.
 --
--- Supported: 06h WREN (1-0-0), EBh RDQI (1-4-4, G_DUMMY dummy clocks),
--- D2h 4WQIO (1-4-4). Anything else is reported as an error.
+-- Supported: 06h WREN (1-0-0); EBh RDQI and D2h 4WQIO in (1-4-4) SDR with
+-- the XIP mode byte after the address (Table 29, Figure 19). The mode byte
+-- must be Fxh; Axh (XIP entry) is reported as an error because the RTL must
+-- never enter XIP. Anything else is reported as an error.
+--
+-- Timing checks (Tables 10, 39, 41, 43): fCLK <= 54MHz, tPU before the
+-- first CS# fall, CS# high >= tCS1 (20ns) after a read and >= tCS3 (600ns)
+-- after an array write, tCSS >= 5ns, tCSH >= 4ns. Read data is driven
+-- G_TCO after each falling SCLK edge (datasheet maximum 9ns).
 --
 -- Storage is folded to keep the model small: 4 x 16KB windows selected by
 -- address bits 26:25 (so 0x0000000 and 0x6000000 are different windows),
@@ -58,8 +62,9 @@ use work.qspi_mram_mem_pkg.all;
 
 entity qspi_mram_model is
     generic (
-        G_DUMMY : natural := 8;
-        G_TCO   : time    := 4 ns  -- output valid after SCLK falling edge
+        G_DUMMY : natural := 8;       -- CR2 latency (default 8)
+        G_TCO   : time    := 9 ns;    -- output valid after SCLK falling edge (max)
+        G_TPU   : time    := 25 ms    -- power-up to first instruction
     );
     port (
         cs_n   : in    std_logic;
@@ -72,7 +77,57 @@ entity qspi_mram_model is
 end entity qspi_mram_model;
 
 architecture sim of qspi_mram_model is
+    signal last_was_write : boolean := false;
+    signal timing_errs    : natural := 0;
+    signal proto_errs     : natural := 0;
 begin
+
+    errors <= proto_errs + timing_errs;
+
+    -- Timing monitor
+    process
+        variable t_cs_rise, t_cs_fall, t_sclk_rise : time := 0 ns;
+        variable first : boolean := true;
+        variable err   : natural := 0;
+        procedure fail(msg : string) is
+        begin
+            err := err + 1;
+            timing_errs <= err;
+            report "MRAM model timing: " & msg severity error;
+        end procedure;
+    begin
+        wait until falling_edge(cs_n);
+        t_cs_fall := now;
+        if now < G_TPU then
+            fail("instruction before tPU (" & time'image(now) & ")");
+        end if;
+        if not first then
+            if now - t_cs_rise < 20 ns then
+                fail("CS# high " & time'image(now - t_cs_rise) & " < tCS1 20ns");
+            end if;
+            if last_was_write and now - t_cs_rise < 600 ns then
+                fail("CS# high " & time'image(now - t_cs_rise) & " after array write < tCS3 600ns");
+            end if;
+        end if;
+        first := false;
+        t_sclk_rise := 0 ns;
+        loop
+            wait until rising_edge(sclk) or rising_edge(cs_n);
+            exit when cs_n = '1';
+            if t_sclk_rise = 0 ns then
+                if now - t_cs_fall < 5 ns then
+                    fail("tCSS < 5ns");
+                end if;
+            elsif now - t_sclk_rise < 18.5 ns then
+                fail("SCLK period " & time'image(now - t_sclk_rise) & " above 54MHz");
+            end if;
+            t_sclk_rise := now;
+        end loop;
+        t_cs_rise := now;
+        if t_sclk_rise /= 0 ns and now - t_sclk_rise < 4 ns then
+            fail("tCSH < 4ns");
+        end if;
+    end process;
 
     process
         variable op      : std_logic_vector(7 downto 0);
@@ -88,7 +143,7 @@ begin
         procedure fail(msg : string) is
         begin
             err := err + 1;
-            errors <= err;
+            proto_errs <= err;
             report "MRAM model: " & msg severity error;
         end procedure;
 
@@ -108,7 +163,8 @@ begin
     begin
         io <= (others => 'Z');
         wait until cs_n = '0';
-        aborted := false;
+        aborted        := false;
+        last_was_write <= false;
 
         -- opcode, single bit on IO0, MSB first, sampled on rising SCLK
         for i in 7 downto 0 loop
@@ -133,8 +189,25 @@ begin
                 check_bits(io, "address nibble");
                 addr(4 * i + 3 downto 4 * i) := unsigned(io);
             end loop;
+            -- XIP mode byte (Figure 19): Fxh = stay in normal mode
+            if not aborted then
+                for i in 1 downto 0 loop
+                    next_rise;
+                    exit when aborted;
+                    -- to_X01: a pulled-up ('H') line counts as '1'
+                    byte_v(4 * i + 3 downto 4 * i) := to_X01(io);
+                    check_bits(byte_v(4 * i + 3 downto 4 * i), "XIP mode nibble");
+                end loop;
+                if not aborted then
+                    if byte_v(7 downto 4) = x"A" then
+                        fail("XIP mode byte " & to_hstring(byte_v) & " enters XIP mode");
+                    elsif byte_v(7 downto 4) /= x"F" then
+                        fail("XIP mode byte " & to_hstring(byte_v) & " is not Fxh");
+                    end if;
+                end if;
+            end if;
             if aborted then
-                fail("CS# deasserted during address");
+                fail("CS# deasserted during address / XIP byte");
             elsif op = x"EB" then
                 for i in 1 to G_DUMMY loop
                     next_rise;
@@ -184,6 +257,7 @@ begin
                     fail("write ended on a half byte");
                 end if;
                 wel    := false;
+                last_was_write <= true;
                 wr_cnt := wr_cnt + 1;
                 n_wr   <= wr_cnt;
             end if;
