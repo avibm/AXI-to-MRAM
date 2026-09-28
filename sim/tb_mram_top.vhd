@@ -86,6 +86,7 @@ architecture sim of tb_mram_top is
     signal cmd_rdsr_data : std_logic_vector(7 downto 0);
     signal cmd_rdid_data : std_logic_vector(31 downto 0);
     signal cmd_done      : std_logic;
+    signal done_p1, done_pci : std_logic := '0'; -- PCI-side synchronizer
     signal boot_hold     : std_logic := '1';
     signal pci_step      : natural := 0;
     signal wr_paused     : boolean := false; -- writer idle, PCI may change WREN/SR
@@ -144,6 +145,15 @@ begin
 
     aclk    <= not aclk after T_CLK / 2;
     pci_clk <= not pci_clk after T_PCI / 2;
+
+    -- cmd_done is an aclk register; the PCI side synchronizes it
+    process (pci_clk)
+    begin
+        if rising_edge(pci_clk) then
+            done_p1  <= cmd_done;
+            done_pci <= done_p1;
+        end if;
+    end process;
     aresetn <= '1' after 20 * T_CLK;
     io      <= (others => 'H'); -- board pull-ups
 
@@ -166,7 +176,6 @@ begin
             s_axi_arvalid => arvalid, s_axi_arready => arready,
             s_axi_rid => rid, s_axi_rdata => rdata, s_axi_rresp => rresp,
             s_axi_rlast => rlast, s_axi_rvalid => rvalid, s_axi_rready => rready,
-            pci_clk => pci_clk,
             cmd_wren => cmd_req(I_WREN), cmd_wrdi => cmd_req(I_WRDI),
             cmd_rdsr => cmd_req(I_RDSR), cmd_wrsr => cmd_req(I_WRSR),
             cmd_rdid => cmd_req(I_RDID), cmd_wrsr_data => cmd_wrsr_data,
@@ -563,23 +572,23 @@ begin
             variable n : natural := 0;
         begin
             wait until rising_edge(pci_clk);
-            check(cmd_done = '0', "cmd_done high before a request");
+            check(done_pci = '0', "cmd_done high before a request");
             cmd_wrsr_data <= wr_data;       -- same PCI write as the request
             cmd_req(i)    <= '1';
             loop
                 wait until rising_edge(pci_clk);
                 n := n + 1;
-                exit when cmd_done = '1' or n > 5000;
+                exit when done_pci = '1' or n > 5000;
             end loop;
-            check(cmd_done = '1', "no cmd_done for command " & integer'image(i));
+            check(done_pci = '1', "no cmd_done for command " & integer'image(i));
             cmd_req(i) <= '0';
             n := 0;
             loop
                 wait until rising_edge(pci_clk);
                 n := n + 1;
-                exit when cmd_done = '0' or n > 100;
+                exit when done_pci = '0' or n > 100;
             end loop;
-            check(cmd_done = '0', "cmd_done did not clear");
+            check(done_pci = '0', "cmd_done did not clear");
         end procedure;
 
         procedure expect_sr(v : std_logic_vector(7 downto 0); what : string) is

@@ -21,19 +21,20 @@ guard for the protected region.
 
 ## MRAM register commands (bring-up / debug)
 
-Ports on `mram_top`, driven from PCI registers (33 MHz `pci_clk`):
+Ports on `mram_top`, driven from PCI registers (the requests, `cmd_wrsr_data`
+and `boot_hold` are synchronized into `aclk` inside):
 
 | Port | Dir | Meaning |
 |------|-----|---------|
 | `cmd_wren`, `cmd_wrdi`, `cmd_rdsr`, `cmd_wrsr`, `cmd_rdid` | in | One request per command (06h, 04h, 05h, 01h, 9Fh) |
 | `cmd_wrsr_data[7:0]` | in | Status register value for WRSR; set it with or before the request and keep it stable while the request is high |
 | `cmd_rdsr_data[7:0]`, `cmd_rdid_data[31:0]` | out | Results; valid once `cmd_done` = 1, held until the same command runs again |
-| `cmd_done` | out | Synchronous to `pci_clk` |
+| `cmd_done` | out | `aclk` register, not synchronized: the PCI side must synchronize it |
 | `boot_hold` | in | 1 = the boot copy waits after the 25 ms power-up time, so the device can be inspected first |
 
 Handshake for each command:
 1. Raise one request and hold it.
-2. Wait for `cmd_done` = 1, then read the result.
+2. Wait for (the synchronized) `cmd_done` = 1, then read the result.
 3. Lower the request.
 4. Wait for `cmd_done` = 0 before the next command.
 
