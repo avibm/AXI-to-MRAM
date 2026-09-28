@@ -99,7 +99,10 @@ entity mram_boot_copy is
 
         cpu_reset_n : out std_logic; -- held low until copy AND verify succeed
         boot_done   : out std_logic; -- also used as the core_req mux select in mram_top
-        boot_fail   : out std_logic  -- asserted, and stays asserted, after G_MAX_RETRIES failures
+        boot_fail   : out std_logic; -- asserted, and stays asserted, after G_MAX_RETRIES failures
+
+        boot_hold    : in  std_logic := '0'; -- '1' = do not start the copy yet (aclk-synchronous)
+        powerup_done : out std_logic         -- tPU has elapsed; MRAM may be accessed
     );
 end entity mram_boot_copy;
 
@@ -116,6 +119,7 @@ architecture rtl of mram_boot_copy is
     signal state      : state_t := S_POWERUP;
     signal prev_state : state_t := S_POWERUP;
     signal powerup_cnt : natural range 0 to G_POWERUP_CYCLES := 0;
+    signal powerup_ok  : std_logic := '0';
 
     -- 26 bits comfortably covers a 32MB (2**25) offset with headroom.
     signal byte_off   : unsigned(25 downto 0) := (others => '0');
@@ -128,6 +132,8 @@ architecture rtl of mram_boot_copy is
     signal watchdog_trip : std_logic;
 
 begin
+
+    powerup_done <= powerup_ok;
 
     watchdog_trip <= '1' when watchdog_cnt = G_WATCHDOG_LIMIT else '0';
 
@@ -142,6 +148,7 @@ begin
                 retry_count  <= 0;
                 cpu_reset_n  <= '0';
                 boot_done    <= '0';
+                powerup_ok   <= '0';
                 boot_fail    <= '0';
                 mismatch     <= '0';
                 watchdog_cnt <= 0;
@@ -169,9 +176,14 @@ begin
                     -- Datasheet tPU: no instruction to the MRAM until it has
                     -- powered up. Assumes aresetn is released no earlier than
                     -- MRAM power-up; if not, lengthen G_POWERUP_CYCLES.
+                    -- Also waits here while boot_hold = '1', so register
+                    -- commands can be issued before the copy touches the MRAM.
                     when S_POWERUP =>
                         if powerup_cnt >= G_POWERUP_CYCLES then
-                            state <= S_COPY_READ_ISSUE;
+                            powerup_ok <= '1';
+                            if boot_hold = '0' then
+                                state <= S_COPY_READ_ISSUE;
+                            end if;
                         else
                             powerup_cnt <= powerup_cnt + 1;
                         end if;

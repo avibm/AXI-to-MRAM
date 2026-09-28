@@ -5,7 +5,8 @@
 -- P-SRAM datasheet Rev. J.5), just detailed enough to check the
 -- mram_qspi_backend framing and timing. It is NOT a vendor model.
 --
--- Supported: 06h WREN (1-0-0); EBh RDQI and D2h 4WQIO in (1-4-4) SDR with
+-- Supported: 06h WREN, 04h WRDI (1-0-0); 05h RDSR, 01h WRSR, 9Fh RDID
+-- (1-0-1, data out on IO1 / in on IO0); EBh RDQI and D2h 4WQIO in (1-4-4) SDR with
 -- the XIP mode byte after the address (Table 29, Figure 19). The mode byte
 -- must be Fxh; Axh (XIP entry) is reported as an error because the RTL must
 -- never enter XIP. Anything else is reported as an error.
@@ -13,7 +14,15 @@
 -- Timing checks (Tables 10, 39, 41, 43): fCLK <= 54MHz, tPU before the
 -- first CS# fall, CS# high >= tCS1 (20ns) after a read and >= tCS3 (600ns)
 -- after an array write, tCSS >= 5ns, tCSH >= 4ns. Read data is driven
--- G_TCO after each falling SCLK edge (datasheet maximum 9ns).
+-- G_TCO after each falling SCLK edge (datasheet maximum 9ns). RDSR/RDID
+-- must run at <= 40MHz.
+--
+-- Status register (Table 16): WP#EN (7), TBPSEL (5), BPSEL[2:0] (4:2) are
+-- writable with WRSR (needs WREN; WREN clears afterwards); WREN (1) is set
+-- by WREN and cleared by WRDI or a completed write. Array writes into the
+-- software-protected range (Tables 17/18, 1Gb die) are silently ignored,
+-- like the real device. WP# pin protection of the status register is
+-- modelled (WP#EN = 1 and IO2 low blocks WRSR).
 --
 -- Storage is folded to keep the model small: 4 x 16KB windows selected by
 -- address bits 26:25 (so 0x0000000 and 0x6000000 are different windows),
@@ -64,7 +73,8 @@ entity qspi_mram_model is
     generic (
         G_DUMMY : natural := 8;       -- CR2 latency (default 8)
         G_TCO   : time    := 9 ns;    -- output valid after SCLK falling edge (max)
-        G_TPU   : time    := 25 ms    -- power-up to first instruction
+        G_TPU   : time    := 25 ms;   -- power-up to first instruction
+        G_DEVICE_ID : std_logic_vector(31 downto 0) := x"E6212801" -- illustrative, per Table 22 fields
     );
     port (
         cs_n   : in    std_logic;
@@ -78,6 +88,7 @@ end entity qspi_mram_model;
 
 architecture sim of qspi_mram_model is
     signal last_was_write : boolean := false;
+    signal slow_cmd       : boolean := false; -- RDSR / RDID: 40MHz limit
     signal timing_errs    : natural := 0;
     signal proto_errs     : natural := 0;
 begin
@@ -87,6 +98,7 @@ begin
     -- Timing monitor
     process
         variable t_cs_rise, t_cs_fall, t_sclk_rise : time := 0 ns;
+        variable min_period : time := 1 sec;
         variable first : boolean := true;
         variable err   : natural := 0;
         procedure fail(msg : string) is
@@ -111,6 +123,7 @@ begin
         end if;
         first := false;
         t_sclk_rise := 0 ns;
+        min_period  := 1 sec;
         loop
             wait until rising_edge(sclk) or rising_edge(cs_n);
             exit when cs_n = '1';
@@ -118,12 +131,20 @@ begin
                 if now - t_cs_fall < 5 ns then
                     fail("tCSS < 5ns");
                 end if;
-            elsif now - t_sclk_rise < 18.5 ns then
-                fail("SCLK period " & time'image(now - t_sclk_rise) & " above 54MHz");
+            else
+                if now - t_sclk_rise < 18.5 ns then
+                    fail("SCLK period " & time'image(now - t_sclk_rise) & " above 54MHz");
+                end if;
+                if now - t_sclk_rise < min_period then
+                    min_period := now - t_sclk_rise;
+                end if;
             end if;
             t_sclk_rise := now;
         end loop;
         t_cs_rise := now;
+        if slow_cmd and min_period < 25 ns then
+            fail("RDSR/RDID SCLK period " & time'image(min_period) & " above 40MHz");
+        end if;
         if t_sclk_rise /= 0 ns and now - t_sclk_rise < 4 ns then
             fail("tCSH < 4ns");
         end if;
@@ -139,6 +160,28 @@ begin
         variable aborted : boolean;
         variable err     : natural := 0;
         variable rd_cnt, wr_cnt : natural := 0;
+        variable sr      : std_logic_vector(7 downto 0) := x"00"; -- WREN bit kept in wel
+        variable out_v   : std_logic_vector(31 downto 0);
+        variable nbits   : natural;
+        variable bp      : natural;
+        variable a_prot  : boolean;
+
+        -- Software block protection for a 1Gb die (Tables 17/18)
+        impure function sw_protected(a : natural) return boolean is
+            constant C_SIZE : natural := 2 ** 27;
+            variable portion : natural;
+        begin
+            bp := to_integer(unsigned(sr(4 downto 2)));
+            if bp = 0 then
+                return false;
+            end if;
+            portion := C_SIZE / 2 ** (7 - bp); -- 1/64 .. all
+            if sr(5) = '0' then
+                return a >= C_SIZE - portion;  -- top
+            else
+                return a < portion;            -- bottom
+            end if;
+        end function;
 
         procedure fail(msg : string) is
         begin
@@ -165,6 +208,7 @@ begin
         wait until cs_n = '0';
         aborted        := false;
         last_was_write <= false;
+        slow_cmd       <= false;
 
         -- opcode, single bit on IO0, MSB first, sampled on rising SCLK
         for i in 7 downto 0 loop
@@ -176,12 +220,56 @@ begin
 
         if aborted then
             fail("CS# deasserted mid-opcode");
-        elsif op = x"06" then
+        elsif op = x"06" or op = x"04" then
             next_rise;
             if not aborted then
-                fail("extra SCLK after WREN opcode");
+                fail("extra SCLK after WREN/WRDI opcode");
             end if;
-            wel := true;
+            wel := (op = x"06");
+        elsif op = x"05" or op = x"9F" then
+            -- RDSR / RDID: shift out on IO1 after each falling edge
+            slow_cmd <= true;
+            if op = x"05" then
+                out_v  := (others => '0');
+                out_v(31 downto 24) := sr(7 downto 2) & '1' & '0' when wel
+                                       else sr(7 downto 2) & '0' & '0';
+                nbits  := 8;
+            else
+                out_v := G_DEVICE_ID;
+                nbits := 32;
+            end if;
+            nnib := 0;
+            loop
+                wait until falling_edge(sclk) or cs_n = '1';
+                exit when cs_n = '1';
+                io <= "ZZ" & out_v(31 - (nnib mod nbits)) & 'Z' after G_TCO;
+                nnib := nnib + 1;
+            end loop;
+        elsif op = x"01" then
+            -- WRSR: 8 bits on IO0
+            for i in 7 downto 0 loop
+                next_rise;
+                exit when aborted;
+                check_bits(io(0 downto 0), "WRSR data bit");
+                byte_v(i) := io(0);
+            end loop;
+            if aborted then
+                fail("CS# deasserted during WRSR data");
+            else
+                next_rise;
+                if not aborted then
+                    fail("extra SCLK after WRSR data");
+                end if;
+                if not wel then
+                    report "MRAM model: WRSR without WREN ignored" severity note;
+                elsif sr(7) = '1' and to_X01(io(2)) = '0' then
+                    report "MRAM model: WRSR blocked by WP#" severity note;
+                else
+                    sr(7) := byte_v(7);
+                    sr(5 downto 2) := byte_v(5 downto 2);
+                end if;
+            end if;
+            wel := false;
         elsif op = x"EB" or op = x"D2" then
             for i in 7 downto 0 loop
                 next_rise;
@@ -246,7 +334,7 @@ begin
                         byte_v(7 downto 4) := io;
                     else
                         byte_v(3 downto 0) := io;
-                        if wel then
+                        if wel and not sw_protected(to_integer(addr(26 downto 0))) then
                             mem.write(to_integer(addr(26 downto 0)), byte_v);
                         end if;
                         addr := addr + 1;

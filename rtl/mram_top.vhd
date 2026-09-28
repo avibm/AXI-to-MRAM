@@ -34,6 +34,12 @@
 -- completion timeout, and whether the host should instead wait for
 -- boot_done before touching this window, must be handled at system level.
 --
+-- MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID) for bring-up and
+-- debug are driven from PCI registers through mram_cmd_ctrl, which handles
+-- the pci_clk / aclk crossing and the four-phase cmd_* / cmd_done
+-- handshake (see that file). boot_hold = '1' keeps the boot copy from
+-- starting after the power-up wait, so the device can be inspected first.
+--
 -- key_ok is a plain input here; the comparison that produces it (password
 -- check or otherwise) is handled entirely outside this file.
 --
@@ -102,6 +108,21 @@ entity mram_top is
         key_ok : in std_logic; -- protected-region write unlock; comparison done externally
                                -- (synchronized inside mram_write_guard unless G_SYNC_KEY_OK = false)
 
+        -- MRAM register commands from PCI registers (see mram_cmd_ctrl.vhd).
+        -- Requests, cmd_wrsr_data and boot_hold are asynchronous to aclk;
+        -- cmd_done is synchronous to pci_clk.
+        pci_clk       : in  std_logic;
+        cmd_wren      : in  std_logic;
+        cmd_wrdi      : in  std_logic;
+        cmd_rdsr      : in  std_logic;
+        cmd_wrsr      : in  std_logic;
+        cmd_rdid      : in  std_logic;
+        cmd_wrsr_data : in  std_logic_vector(7 downto 0);
+        cmd_rdsr_data : out std_logic_vector(7 downto 0);
+        cmd_rdid_data : out std_logic_vector(31 downto 0);
+        cmd_done      : out std_logic;
+        boot_hold     : in  std_logic; -- '1' = do not start the boot copy yet
+
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
         boot_fail   : out std_logic; -- wire to a fault indicator; stays low unless retries exhausted
@@ -119,6 +140,12 @@ architecture rtl of mram_top is
     signal backend_resp                                 : core_resp_t; -- raw, from mram_qspi_backend
     signal boot_done_i                                  : std_logic;
     signal axi_resetn                                   : std_logic;
+
+    signal boot_hold_sync, powerup_done               : std_logic;
+    signal reg_cmd_valid, reg_cmd_accept, reg_cmd_done : std_logic;
+    signal reg_cmd_op                                  : reg_cmd_t;
+    signal reg_cmd_wdata                               : std_logic_vector(7 downto 0);
+    signal reg_cmd_rdata                               : std_logic_vector(31 downto 0);
 
     signal backend_io_o, backend_io_oe, backend_io_i : std_logic_vector(3 downto 0);
 
@@ -144,8 +171,35 @@ begin
             core_req    => boot_req,
             core_resp   => guard_resp,
             cpu_reset_n => cpu_reset_n,
-            boot_done   => boot_done_i,
-            boot_fail   => boot_fail
+            boot_done    => boot_done_i,
+            boot_fail    => boot_fail,
+            boot_hold    => boot_hold_sync,
+            powerup_done => powerup_done
+        );
+
+    u_cmd_ctrl : entity work.mram_cmd_ctrl
+        port map (
+            aclk           => aclk,
+            aresetn        => aresetn,
+            pci_clk        => pci_clk,
+            cmd_wren       => cmd_wren,
+            cmd_wrdi       => cmd_wrdi,
+            cmd_rdsr       => cmd_rdsr,
+            cmd_wrsr       => cmd_wrsr,
+            cmd_rdid       => cmd_rdid,
+            cmd_wrsr_data  => cmd_wrsr_data,
+            cmd_rdsr_data  => cmd_rdsr_data,
+            cmd_rdid_data  => cmd_rdid_data,
+            cmd_done       => cmd_done,
+            boot_hold      => boot_hold,
+            boot_hold_sync => boot_hold_sync,
+            mem_ready      => powerup_done,
+            reg_cmd_valid  => reg_cmd_valid,
+            reg_cmd_op     => reg_cmd_op,
+            reg_cmd_wdata  => reg_cmd_wdata,
+            reg_cmd_accept => reg_cmd_accept,
+            reg_cmd_done   => reg_cmd_done,
+            reg_cmd_rdata  => reg_cmd_rdata
         );
 
     u_axi_wrapper : entity work.axi4_slave_wrapper
@@ -219,6 +273,12 @@ begin
             aresetn    => aresetn,
             core_req   => guarded_req,
             core_resp  => backend_resp,
+            reg_cmd_valid  => reg_cmd_valid,
+            reg_cmd_op     => reg_cmd_op,
+            reg_cmd_wdata  => reg_cmd_wdata,
+            reg_cmd_accept => reg_cmd_accept,
+            reg_cmd_done   => reg_cmd_done,
+            reg_cmd_rdata  => reg_cmd_rdata,
             mram_cs_n  => mram_cs_n,
             mram_sclk  => mram_sclk,
             mram_io_o  => backend_io_o,
