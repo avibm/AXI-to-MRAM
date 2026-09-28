@@ -106,7 +106,8 @@ rev. 1 RTL it reports the missing mode byte and the timing violations below.
 ### Rev. 3 – register commands for bring-up
 
 `mram_cmd_ctrl` adds PCI-driven WREN, WRDI, RDSR, WRSR and RDID commands, a
-`boot_hold` input and the pci_clk ↔ aclk synchronizers. The README describes
+`boot_hold` input and the PCI → aclk synchronizers. `cmd_done` is an aclk
+register that the PCI side synchronizes. The README describes
 the ports and handshake. Timing constraints are needed for these crossings:
 treat the paths into the first synchronizer stages, and the
 `cmd_wrsr_data` / `cmd_rdsr_data` / `cmd_rdid_data` buses, as false paths

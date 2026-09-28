@@ -22,18 +22,19 @@
 --   cmd_done only falls once all of them are low.
 --
 -- Clock domains: the cmd_* requests, cmd_wrsr_data and boot_hold come from
--- the PCI clock domain (33MHz) and are asynchronous to aclk.
+-- the PCI clock domain (33MHz) and are asynchronous to aclk. Everything in
+-- this block runs on aclk.
 --   * Each request and boot_hold goes through a G_SYNC_STAGES flop
 --     synchronizer into aclk.
 --   * cmd_wrsr_data is not synchronized bit by bit: it is sampled only
 --     after the synchronized request is seen, i.e. at least G_SYNC_STAGES
 --     aclk cycles after it was last allowed to change (rule 1 above).
---   * cmd_done is a register in aclk, passed through a G_SYNC_STAGES flop
---     synchronizer clocked by pci_clk, so the cmd_done port is synchronous
---     to pci_clk.
+--   * cmd_done is driven directly by an aclk register (glitch-free). It is
+--     NOT synchronized here: the PCI side must synchronize it into its own
+--     clock domain.
 --   * cmd_rdsr_data / cmd_rdid_data are aclk registers that only change
---     while cmd_done is low; PCI must read them only after seeing
---     cmd_done = '1' (rule 2), which makes them stable in the PCI domain.
+--     while cmd_done is low; PCI must read them only after its synchronized
+--     copy of cmd_done is '1' (rule 2), which makes them stable there.
 --   Constrain all of these crossings in the timing constraints (false path
 --   or max-delay into the first synchronizer stage, and for the
 --   data buses).
@@ -56,7 +57,6 @@ entity mram_cmd_ctrl is
     port (
         aclk    : in  std_logic;
         aresetn : in  std_logic;
-        pci_clk : in  std_logic;
 
         -- PCI side (requests/data asynchronous to aclk)
         cmd_wren      : in  std_logic;
@@ -67,7 +67,7 @@ entity mram_cmd_ctrl is
         cmd_wrsr_data : in  std_logic_vector(7 downto 0);
         cmd_rdsr_data : out std_logic_vector(7 downto 0);
         cmd_rdid_data : out std_logic_vector(31 downto 0);
-        cmd_done      : out std_logic;   -- synchronous to pci_clk
+        cmd_done      : out std_logic;   -- aclk register; synchronize on the PCI side
 
         boot_hold      : in  std_logic;  -- asynchronous
         boot_hold_sync : out std_logic;  -- synchronized to aclk
@@ -90,9 +90,6 @@ architecture rtl of mram_cmd_ctrl is
     type sync_t is array (0 to G_SYNC_STAGES - 1) of std_logic_vector(5 downto 0);
     signal req_meta : sync_t := (others => (others => '0'));
     signal req_s    : std_logic_vector(5 downto 0);
-
-    type done_sync_t is array (0 to G_SYNC_STAGES - 1) of std_logic;
-    signal done_meta : done_sync_t := (others => '0');
 
     type state_t is (C_IDLE, C_ISSUE, C_WAIT, C_DONE);
     signal state  : state_t := C_IDLE;
@@ -121,19 +118,7 @@ begin
     req_s          <= req_meta(G_SYNC_STAGES - 1);
     boot_hold_sync <= req_s(5);
 
-    ----------------------------------------------------------------------------
-    -- aclk -> PCI synchronizer for cmd_done
-    ----------------------------------------------------------------------------
-    process (pci_clk)
-    begin
-        if rising_edge(pci_clk) then
-            done_meta(0) <= done_a;
-            for i in 1 to G_SYNC_STAGES - 1 loop
-                done_meta(i) <= done_meta(i - 1);
-            end loop;
-        end if;
-    end process;
-    cmd_done <= done_meta(G_SYNC_STAGES - 1);
+    cmd_done <= done_a;
 
     cmd_rdsr_data <= rdsr_q;
     cmd_rdid_data <= rdid_q;

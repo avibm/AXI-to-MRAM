@@ -35,9 +35,10 @@
 -- boot_done before touching this window, must be handled at system level.
 --
 -- MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID) for bring-up and
--- debug are driven from PCI registers through mram_cmd_ctrl, which handles
--- the pci_clk / aclk crossing and the four-phase cmd_* / cmd_done
--- handshake (see that file). boot_hold = '1' keeps the boot copy from
+-- debug are driven from PCI registers through mram_cmd_ctrl, which
+-- synchronizes the requests into aclk and runs the four-phase cmd_* /
+-- cmd_done handshake (see that file). cmd_done is an aclk register; the
+-- PCI side synchronizes it. boot_hold = '1' keeps the boot copy from
 -- starting after the power-up wait, so the device can be inspected first.
 --
 -- key_ok is a plain input here; the comparison that produces it (password
@@ -109,9 +110,8 @@ entity mram_top is
                                -- (synchronized inside mram_write_guard unless G_SYNC_KEY_OK = false)
 
         -- MRAM register commands from PCI registers (see mram_cmd_ctrl.vhd).
-        -- Requests, cmd_wrsr_data and boot_hold are asynchronous to aclk;
-        -- cmd_done is synchronous to pci_clk.
-        pci_clk       : in  std_logic;
+        -- Requests, cmd_wrsr_data and boot_hold may be asynchronous to aclk
+        -- (synchronized inside); cmd_done and the results are aclk registers.
         cmd_wren      : in  std_logic;
         cmd_wrdi      : in  std_logic;
         cmd_rdsr      : in  std_logic;
@@ -181,7 +181,6 @@ begin
         port map (
             aclk           => aclk,
             aresetn        => aresetn,
-            pci_clk        => pci_clk,
             cmd_wren       => cmd_wren,
             cmd_wrdi       => cmd_wrdi,
             cmd_rdsr       => cmd_rdsr,
