@@ -35,6 +35,8 @@
 --   * WLAST is not checked against AWLEN on the normal write path (the beat
 --     count comes from AWLEN); it is used only to drain rejected bursts.
 --   * 4KB-boundary crossing is not checked (the master must not do it).
+--   * Only AxADDR(C_MRAM_ADDR_WIDTH-1:0) reaches the MRAM: the upper bits
+--     (this slave's base address, decoded by the interconnect) are ignored.
 --   * core_req/core_resp completion is assumed in-order.
 --   * AWLOCK/AWCACHE/AWQOS/ARLOCK/ARCACHE/ARQOS/AWPROT/ARPROT are present
 --     on the port for interconnect compatibility but are not acted upon.
@@ -320,7 +322,7 @@ begin
                             -- issue the lowest contiguous run of enabled bytes
                             wr_core_req_o.valid  <= '1';
                             wr_core_req_o.we     <= '1';
-                            wr_core_req_o.addr   <= std_logic_vector(wr_addr(C_AXI_ADDR_WIDTH - 1 downto 6))
+                            wr_core_req_o.addr   <= std_logic_vector(wr_addr(C_MRAM_ADDR_WIDTH - 1 downto 6))
                                                     & std_logic_vector(to_unsigned(run_first, 6));
                             wr_core_req_o.nbytes <= to_unsigned(run_end - run_first, 7);
                             wr_core_req_o.wdata  <= wr_data;
@@ -419,8 +421,9 @@ begin
                         else
                             rd_core_req_o.valid  <= '1';
                             rd_core_req_o.we     <= '0';
-                            rd_core_req_o.addr   <= std_logic_vector(align_down(
-                                                        rd_fifo(rd_head_ptr).addr, rd_fifo(rd_head_ptr).size));
+                            rd_core_req_o.addr   <= std_logic_vector(resize(align_down(
+                                                        rd_fifo(rd_head_ptr).addr, rd_fifo(rd_head_ptr).size),
+                                                        C_MRAM_ADDR_WIDTH));
                             rd_core_req_o.nbytes <= to_unsigned(beat_bytes(rd_fifo(rd_head_ptr).size), 7);
                         end if;
 

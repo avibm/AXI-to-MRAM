@@ -49,7 +49,7 @@
 --   tCS3 >= 600ns after array write -> G_CS_HIGH_WRITE_CYCLES
 --   CS# high between WREN and the write -> G_CS_GAP_CYCLES
 --
--- Address width note: core_req.addr is 27 bits (128MB = one 1Gb die),
+-- Address width note: core_req.addr is C_MRAM_ADDR_WIDTH = 27 bits (128MB = one 1Gb die),
 -- zero-extended to the 4 address bytes RDQI/4WQIO require (Table 12).
 --
 -- SPI timing: every phase is counted in SCLK rising edges. The first

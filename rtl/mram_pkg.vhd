@@ -5,9 +5,12 @@
 -- PolarFire (RTPF500TCG1509), behind the existing PF_SRAM_AHB_AXI-
 -- compatible AXI4 slave interface.
 --
--- AXI address/data widths are fixed system constants -- they match the
--- existing PF_SRAM_AHB_AXI interface (512-bit data, 128MB usable MRAM
--- address space) and are not meant to vary per instance.
+-- AXI address/data/ID widths are fixed system constants that match the AXI
+-- interconnect (32-bit address, 512-bit data, 5-bit ID). The MRAM itself
+-- is addressed with C_MRAM_ADDR_WIDTH bits (128MB = one 1Gb die); the AXI
+-- wrapper uses only the low C_MRAM_ADDR_WIDTH bits of AxADDR, i.e. the
+-- byte offset inside this slave's 128MB window. Address decoding (which
+-- upper-bit values select this slave) is the interconnect's job.
 --
 -- Language: VHDL-2008
 --------------------------------------------------------------------------------
@@ -21,11 +24,12 @@ package mram_pkg is
     ----------------------------------------------------------------------------
     -- System-fixed widths (match PF_SRAM_AHB_AXI)
     ----------------------------------------------------------------------------
-    constant C_AXI_ADDR_WIDTH : integer := 27;                    -- 128MB usable MRAM space
+    constant C_AXI_ADDR_WIDTH : integer := 32;                    -- matches the AXI interconnect
+    constant C_MRAM_ADDR_WIDTH : integer := 27;                   -- 128MB usable MRAM space
     constant C_AXI_DATA_WIDTH : integer := 512;                   -- 512-bit AXI data bus
     constant C_AXI_STRB_WIDTH : integer := C_AXI_DATA_WIDTH / 8;  -- 64
     constant C_AXI_LEN_WIDTH  : integer := 8;                     -- AXI4 AWLEN/ARLEN
-    constant C_AXI_ID_WIDTH   : integer := 6;                     -- matches the AXI interconnect
+    constant C_AXI_ID_WIDTH   : integer := 5;                     -- matches the AXI interconnect
 
     constant C_MAX_OUTSTANDING : integer := 4; -- outstanding AXI read bursts tracked
 
@@ -55,7 +59,7 @@ package mram_pkg is
     ----------------------------------------------------------------------------
     type core_req_t is record
         valid  : std_logic;
-        addr   : std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0); -- first byte address
+        addr   : std_logic_vector(C_MRAM_ADDR_WIDTH - 1 downto 0); -- first byte address (MRAM)
         we     : std_logic;                                        -- '1' = write, '0' = read
         nbytes : unsigned(6 downto 0);                             -- 1..64 bytes
         wdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);  -- lane-aligned

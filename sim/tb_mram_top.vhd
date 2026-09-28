@@ -10,7 +10,8 @@
 -- (must stall, then return correct data), 64-byte / narrow / unaligned /
 -- sparse-strobe writes, INCR bursts, write-guard blocking and unlocking,
 -- FIXED-burst rejection, reads concurrent with writes, randomized
--- BREADY/RREADY back-pressure, and exactly one B / RLAST per transaction.
+-- BREADY/RREADY back-pressure, exactly one B / RLAST per transaction, and
+-- AXI addresses with upper (window base) bits set.
 --
 -- Run: see sim/run_ghdl.sh
 --------------------------------------------------------------------------------
@@ -249,7 +250,7 @@ begin
                 exit when bvalid = '1' and bready = '1';
             end loop;
             check(bresp = exp_resp, "BRESP " & to_string(bresp) & " expected " & to_string(exp_resp)
-                  & " at 0x" & to_hstring(to_unsigned(addr, 28)));
+                  & " at 0x" & to_hstring(to_unsigned(addr, 32)));
             check(bid = std_logic_vector(to_unsigned(len + 3, bid'length)), "BID mismatch");
             for i in 1 to 4 loop
                 wait until rising_edge(aclk);
@@ -274,7 +275,7 @@ begin
                     -- a later beat may legitimately overwrite an earlier one
                     -- only in FIXED bursts, which are rejected here anyway
                     if lane >= lo and lane < hi then
-                        check(mem.read(a) = exp, "byte 0x" & to_hstring(to_unsigned(a, 28))
+                        check(mem.read(a) = exp, "byte 0x" & to_hstring(to_unsigned(a, 32))
                               & " = " & to_hstring(mem.read(a)) & ", expected " & to_hstring(exp));
                     end if;
                 end loop;
@@ -357,6 +358,10 @@ begin
         axi_write(16#1100#, 1, 6, "00", beats, strbs, "10", false);
         beats(0) := mk_beat(52); strbs(0) := (others => '1');
         axi_write(16#1100#, 0, 6, "01", beats, strbs, "00", true);
+
+        -- T13: upper AXI address bits (window base) must be ignored
+        beats(0) := mk_beat(55); strbs(0) := (others => '1');
+        axi_write(16#2000_1200#, 0, 6, "01", beats, strbs, "00", true);
         wr_step <= 3;
 
         -- T10: writes while the reader is streaming reads elsewhere
@@ -423,7 +428,7 @@ begin
                     exit when rvalid = '1' and rready = '1';
                 end loop;
                 check(rresp = exp_resp, "RRESP " & to_string(rresp) & " at 0x"
-                      & to_hstring(to_unsigned(addr, 28)));
+                      & to_hstring(to_unsigned(addr, 32)));
                 check(rid = std_logic_vector(to_unsigned(len + 5, rid'length)), "RID mismatch");
                 check((rlast = '1') = (beat = len), "RLAST wrong on beat " & integer'image(beat));
                 if exp_resp = "00" then
@@ -433,7 +438,7 @@ begin
                     for lane in lo to hi - 1 loop
                         a := (ba / 64) * 64 + lane;
                         check(rdata(8 * lane + 7 downto 8 * lane) = mem.read(a),
-                              "read 0x" & to_hstring(to_unsigned(a, 28)) & " = "
+                              "read 0x" & to_hstring(to_unsigned(a, 32)) & " = "
                               & to_hstring(rdata(8 * lane + 7 downto 8 * lane))
                               & ", expected " & to_hstring(mem.read(a)));
                     end loop;
@@ -475,6 +480,8 @@ begin
         if wr_step < 3 then wait until wr_step >= 3; end if;
         axi_read(SRC_BASE + 16#100#, 0, 6, "01", "00"); -- T8: unlocked write landed
         axi_read(SRC_BASE + 16#140#, 0, 6, "01", "00"); -- T8: locked write did not
+        axi_read(16#0000_1200#, 0, 6, "01", "00");      -- T13 via the offset
+        axi_read(16#4800_1200#, 0, 6, "01", "00");      -- T13 via another base
 
         -- T10: stream reads while the writer works in another region
         for i in 0 to 15 loop

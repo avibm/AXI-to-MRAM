@@ -183,7 +183,7 @@ begin
                         else
                             core_req.valid  <= '1'; -- hold until accepted
                             core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
+                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_SRC_BASE);
                             core_req.we     <= '0';
                             core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;
@@ -201,7 +201,7 @@ begin
                         else
                             core_req.valid  <= '1'; -- hold until accepted
                             core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
+                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_DST_BASE);
                             core_req.we     <= '1';
                             core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                             core_req.wdata  <= hold_data;
@@ -229,7 +229,7 @@ begin
                         else
                             core_req.valid  <= '1'; -- hold until accepted
                             core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_SRC_BASE);
+                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_SRC_BASE);
                             core_req.we     <= '0';
                             core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;
@@ -247,7 +247,7 @@ begin
                         else
                             core_req.valid  <= '1'; -- hold until accepted
                             core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_AXI_ADDR_WIDTH) + G_DST_BASE);
+                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_DST_BASE);
                             core_req.we     <= '0';
                             core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
                         end if;

@@ -140,7 +140,7 @@ rev. 1 RTL it reports the missing mode byte and the timing violations below.
 | O12 | Safe-FSM / TMR settings are synthesis-tool options, not RTL (spec already says so). |
 | O13 | The copy runs on `aresetn` only. A CPU-only reset does not refresh address 0. |
 | O14 | Only 128 MB of the 2 Gb (256 MB) device is addressable. Confirm this is intended. |
-| O15 | "Same interface as PF_SRAM_AHB_AXI" (512-bit data, 27-bit address). I could not verify that Microchip core's configurable widths. Check against its handbook. |
+| O15 | AXI port widths now follow the interconnect: 32-bit address, 5-bit ID, 512-bit data. Only the low 27 address bits (the offset in the 128 MB window) reach the MRAM. That is correct whether the interconnect passes the full system address or the window offset, provided the window base is 128 MB-aligned. |
 
 ## Specification errata
 
