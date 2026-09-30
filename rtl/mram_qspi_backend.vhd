@@ -95,7 +95,9 @@ entity mram_qspi_backend is
         G_DUMMY_CYCLES         : integer := 8;          -- must equal CR2[3:0] (default 8, Table 25)
         G_SCLK_HALF_PERIOD     : integer := 2;          -- aclk cycles per SCLK half-period (>= 2 at 150MHz)
         G_CS_SETUP_CYCLES      : integer := 4;          -- aclk cycles CS# low before first edge / after last
-        G_CS_GAP_CYCLES        : integer := 4;          -- aclk cycles CS# high between WREN and write
+        G_CS_GAP_CYCLES        : integer := 92;         -- aclk cycles CS# high between WREN and write
+                                                        -- (613ns: the tCS3 value, as the datasheet
+                                                        -- gives no figure after WREN)
         G_CS_HIGH_READ_CYCLES  : integer := 4;          -- min CS# high after a read  (tCS1 20ns  -> 27ns)
         G_CS_HIGH_WRITE_CYCLES : integer := 92;         -- min CS# high after a write (tCS3 600ns -> 613ns)
         G_XIP_BYTE          : std_logic_vector(7 downto 0) := x"FF"; -- XIP mode byte, Fxh = no XIP

@@ -125,6 +125,15 @@ Things these commands can reveal when "writes don't apply":
     the device.
 * The hardware protect pins **HBP0–2 / HTBSEL** do not show up in RDSR.
 
+### Rev. 4 – bring-up aids
+
+* AXI access to the MRAM is open while `boot_hold` = 1 and after `boot_fail`,
+  not only after `boot_done`. Before this, a PCI read or write test with the
+  boot copy held off, or on a board whose boot failed, simply stalled.
+* The CS# high time between WREN and the write (`G_CS_GAP_CYCLES`) is 92
+  cycles (613 ns) instead of 4. The datasheet gives no figure after WREN, so
+  it now uses the 600 ns tCS3 value.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

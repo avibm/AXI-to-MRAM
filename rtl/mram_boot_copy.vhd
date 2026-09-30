@@ -102,7 +102,8 @@ entity mram_boot_copy is
         boot_fail   : out std_logic; -- asserted, and stays asserted, after G_MAX_RETRIES failures
 
         boot_hold    : in  std_logic := '0'; -- '1' = do not start the copy yet (aclk-synchronous)
-        powerup_done : out std_logic         -- tPU has elapsed; MRAM may be accessed
+        powerup_done : out std_logic;        -- tPU has elapsed; MRAM may be accessed
+        boot_held    : out std_logic         -- '1' = waiting on boot_hold, no request in flight
     );
 end entity mram_boot_copy;
 
@@ -134,6 +135,7 @@ architecture rtl of mram_boot_copy is
 begin
 
     powerup_done <= powerup_ok;
+    boot_held    <= '1' when state = S_POWERUP and powerup_ok = '1' and boot_hold = '1' else '0';
 
     watchdog_trip <= '1' when watchdog_cnt = G_WATCHDOG_LIMIT else '0';
 

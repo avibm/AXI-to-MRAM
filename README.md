@@ -30,13 +30,19 @@ and `boot_hold` are synchronized into `aclk` inside):
 | `cmd_wrsr_data[7:0]` | in | Status register value for WRSR; set it with or before the request and keep it stable while the request is high |
 | `cmd_rdsr_data[7:0]`, `cmd_rdid_data[31:0]` | out | Results; valid once `cmd_done` = 1, held until the same command runs again |
 | `cmd_done` | out | `aclk` register, not synchronized: the PCI side must synchronize it |
-| `boot_hold` | in | 1 = the boot copy waits after the 25 ms power-up time, so the device can be inspected first |
+| `boot_hold` | in | 1 = the boot copy waits after the 25 ms power-up time, so the device can be inspected first. AXI/PCI access to the MRAM window is open while held |
 
 Handshake for each command:
 1. Raise one request and hold it.
 2. Wait for (the synchronized) `cmd_done` = 1, then read the result.
 3. Lower the request.
 4. Wait for `cmd_done` = 0 before the next command.
+
+AXI access to the MRAM window is open after `boot_done`, after `boot_fail`
+(the CPU stays in reset), and while `boot_hold` = 1. Release `boot_hold` only
+when no AXI access to the MRAM is in flight; the boot copy then starts and
+AXI stalls until it finishes. `boot_hold` is sampled when the 25 ms power-up
+wait ends, so for bring-up its source should already be 1 at reset.
 
 One command runs per request, and WRSR does not send WREN itself. Commands
 wait for the 25 ms power-up time and run between memory accesses.

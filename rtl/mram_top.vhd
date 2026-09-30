@@ -28,9 +28,14 @@
 -- The CPU is held in reset during the copy, but the PCI master is not, so
 -- AXI traffic can arrive while mram_boot_copy owns the backend. To keep
 -- that traffic from seeing boot-copy responses, axi4_slave_wrapper is held
--- in reset until boot_done: AWREADY/ARREADY stay low and AXI requests
--- simply stall at the interconnect for the whole copy (roughly 9 s, or up
--- to roughly 35 s with retries -- see mram_boot_copy.vhd). Any PCI-side
+-- in reset until the AXI side owns the backend (axi_owns): after
+-- boot_done, after boot_fail (so PCI can inspect or reprogram the MRAM on a
+-- failed board; the CPU stays in reset), or while boot_hold keeps the copy
+-- from starting (debug). Release boot_hold only while no AXI access to
+-- this slave is in flight: the copy then takes the backend over and the
+-- AXI side goes back into reset. While the copy runs, AWREADY/ARREADY stay
+-- low and AXI requests simply stall at the interconnect (roughly 9 s, or
+-- up to roughly 35 s with retries -- see mram_boot_copy.vhd). Any PCI-side
 -- completion timeout, and whether the host should instead wait for
 -- boot_done before touching this window, must be handled at system level.
 --
@@ -140,6 +145,7 @@ architecture rtl of mram_top is
     signal backend_resp                                 : core_resp_t; -- raw, from mram_qspi_backend
     signal boot_done_i                                  : std_logic;
     signal axi_resetn                                   : std_logic;
+    signal axi_owns, boot_fail_i, boot_held           : std_logic;
 
     signal boot_hold_sync, powerup_done               : std_logic;
     signal reg_cmd_valid, reg_cmd_accept, reg_cmd_done : std_logic;
@@ -153,8 +159,11 @@ begin
 
     boot_done <= boot_done_i;
 
-    -- The AXI side stays in reset until the boot copy has finished.
-    axi_resetn <= aresetn and boot_done_i;
+    -- The AXI side owns the backend after the copy (pass or fail) or while
+    -- the copy is held off; otherwise it stays in reset.
+    axi_owns   <= boot_done_i or boot_fail_i or boot_held;
+    axi_resetn <= aresetn and axi_owns;
+    boot_fail  <= boot_fail_i;
 
     u_boot_copy : entity work.mram_boot_copy
         generic map (
@@ -172,9 +181,10 @@ begin
             core_resp   => guard_resp,
             cpu_reset_n => cpu_reset_n,
             boot_done    => boot_done_i,
-            boot_fail    => boot_fail,
+            boot_fail    => boot_fail_i,
             boot_hold    => boot_hold_sync,
-            powerup_done => powerup_done
+            powerup_done => powerup_done,
+            boot_held    => boot_held
         );
 
     u_cmd_ctrl : entity work.mram_cmd_ctrl
@@ -241,9 +251,9 @@ begin
             core_resp      => guard_resp
         );
 
-    -- Plain mux, not an arbiter -- the CPU is held in reset and the AXI
-    -- wrapper is held in reset for the entire time mram_boot_copy runs.
-    muxed_req <= boot_req when boot_done_i = '0' else axi_req;
+    -- Plain mux, not an arbiter: exactly one side owns the backend. The CPU
+    -- and the AXI wrapper are held in reset whenever mram_boot_copy does.
+    muxed_req <= axi_req when axi_owns = '1' else boot_req;
 
     u_write_guard : entity work.mram_write_guard
         generic map (

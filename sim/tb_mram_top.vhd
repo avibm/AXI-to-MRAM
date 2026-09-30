@@ -6,8 +6,8 @@
 -- checked byte-by-byte through the model's backdoor (including bytes that
 -- must NOT change), and every read is compared with the backdoor.
 --
--- Covered: boot copy + verify, an AXI read issued during the boot copy
--- (must stall, then return correct data), 64-byte / narrow / unaligned /
+-- Covered: boot copy + verify, an AXI read issued while boot_hold keeps
+-- the copy waiting (served during the hold), 64-byte / narrow / unaligned /
 -- sparse-strobe writes, INCR bursts, write-guard blocking and unlocking,
 -- FIXED-burst rejection, reads concurrent with writes, randomized
 -- BREADY/RREADY back-pressure, exactly one B / RLAST per transaction, and
@@ -91,6 +91,7 @@ architecture sim of tb_mram_top is
     signal pci_step      : natural := 0;
     signal wr_paused     : boolean := false; -- writer idle, PCI may change WREN/SR
     signal wr_t14_done   : boolean := false;
+    signal early_rd_done : boolean := false;
     signal pci_finish    : boolean := false;
     signal tb_errs_p     : natural := 0;
     signal cpu_reset_n : std_logic;
@@ -516,7 +517,9 @@ begin
         check(boot_done = '0', "boot finished before the early read was issued");
         t_issue := now;
         axi_read(16#0000#, 1, 6, "01", "00");
-        check(boot_done = '1', "early read completed before boot_done");
+        -- boot_hold is '1': the AXI side is served while the copy is held off
+        check(boot_done = '0' and model_wr = 0, "early read not served during boot_hold");
+        early_rd_done <= true;
         report "early read (issued " & time'image(t_issue) & ") completed " & time'image(now);
 
         if wr_step < 2 then wait until wr_step >= 2; end if;
@@ -601,7 +604,7 @@ begin
         -- boot_hold is '1' from time 0: the copy must not start
         do_cmd(I_RDID);
         check(cmd_rdid_data = DEVICE_ID, "RDID " & to_hstring(cmd_rdid_data));
-        check(boot_done = '0' and model_rd = 0, "boot copy ran despite boot_hold");
+        check(boot_done = '0' and model_wr = 0, "boot copy ran despite boot_hold");
         expect_sr(x"00", "after reset");
         do_cmd(I_WREN);
         expect_sr(x"02", "after WREN");
@@ -615,7 +618,9 @@ begin
         do_cmd(I_WREN);
         do_cmd(I_WRSR, x"00");
         expect_sr(x"00", "after WRSR 00h");
-        check(model_rd = 0 and model_wr = 0, "memory traffic while boot_hold");
+        check(model_wr = 0, "boot copy wrote while boot_hold");
+        -- release boot_hold only while no AXI access is in flight
+        if not early_rd_done then wait until early_rd_done; end if;
         report "PCI: register commands OK, releasing boot_hold at " & time'image(now);
         boot_hold <= '0';
 
