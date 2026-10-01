@@ -61,11 +61,37 @@ Status register (datasheet Table 16):
 | 4:2 | BPSEL[2:0] — any non-zero value write-protects part of the array, and writes there are silently ignored |
 | 1 | WREN |
 
+## Read sample delay (`rd_sample_dly`)
+
+Read data from the MRAM is sampled `rd_sample_dly` `aclk` cycles after each
+SCLK rising edge (0–7, default 2). On the first board, with 0, every bit was
+sampled one SCLK late: RDID read `0x73109480` instead of `0xE6212901`,
+because the board's SCLK → MRAM → FPGA delay exceeded half an SCLK period.
+
+The input is quasi-static, for example from a PCI register. Change it only
+while the MRAM is idle (`boot_hold` = 1, no access in flight).
+
+To tune on hardware, run RDID for each value. The ID must read `E6212901`
+for an AS302G208; pick the middle of the range of values that work.
+
+Simulated with the default `G_SCLK_HALF_PERIOD` = 2 (37.5 MHz). "Delay" is
+from SCLK falling at the FPGA to the data arriving back at the FPGA:
+
+| delay | 0 | 1 | 2 | 3 |
+|-------|---|---|---|---|
+| 6 ns  | ✓ | ✓ | ✓ | ✗ |
+| 12 ns | ✓ | ✓ | ✓ | ✓ |
+| 16 ns | ✗ | ✓ | ✓ | ✓ |
+| 20 ns | ✗ | ✓ | ✓ | ✓ |
+| 24 ns | ✗ | ✗ | ✓ | ✓ |
+| 28 ns | ✗ | ✗ | ✗ | ✗ |
+
 ## Simulation
 
 ```sh
 sim/run_ghdl.sh          # GHDL >= 4.x, VHDL-2008; prints TEST PASSED / FAILED
 sim/run_ghdl.sh --wave   # also writes sim/build/tb_mram_top.ghw
+sim/run_ghdl.sh -gG_MODEL_TCO_PS=20000 -gG_SAMPLE_DLY=0   # slow board, no delay: fails like the first board
 ```
 
 ## Status

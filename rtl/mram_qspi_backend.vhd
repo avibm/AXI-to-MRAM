@@ -57,11 +57,16 @@
 -- later one is driven on the falling edge after the rising edge that
 -- consumed the previous one. Read data is sampled on the aclk edge that
 -- raises SCLK, half an SCLK period after the device launched it on the
--- preceding falling edge. The device's output valid time is tCO <= 9ns
--- (Table 43); at 37.5MHz the half period is 13.3ns, leaving ~4ns for FPGA
--- clock-to-out, board delay both ways and input setup. That is tight:
--- constrain the I/O in timing analysis, or use G_SCLK_HALF_PERIOD = 3
--- (25MHz, 20ns half period) for more margin.
+-- preceding falling edge, plus rd_sample_dly aclk cycles. The device's
+-- output valid time is tCO <= 9ns (Table 43); with rd_sample_dly = 0 at
+-- 37.5MHz the half period is 13.3ns, which must cover FPGA clock-to-out,
+-- board delay both ways, tCO and input setup. On the first board that was
+-- not enough: every bit was sampled one SCLK late (RDID read 0x73109480,
+-- i.e. 0xE6212901 shifted right by one). rd_sample_dly (runtime input,
+-- 0..7, quasi-static, change only while no MRAM access is in progress)
+-- moves the read sample point that many aclk cycles after the SCLK rising
+-- edge. The device holds each bit until tOH >= 1ns after the next falling
+-- edge, so at G_SCLK_HALF_PERIOD = 2 the useful range is about 1..3.
 --
 -- Byte lanes: the byte at address A is carried in lane A(5:0) of wdata /
 -- rdata (see mram_pkg). The lowest-address byte is sent / received first.
@@ -134,7 +139,11 @@ entity mram_qspi_backend is
         -- regardless of which side (if any) is currently driving.
         mram_io_o  : out std_logic_vector(3 downto 0);
         mram_io_oe : out std_logic_vector(3 downto 0);
-        mram_io_i  : in  std_logic_vector(3 downto 0)
+        mram_io_i  : in  std_logic_vector(3 downto 0);
+
+        -- Read sample delay in aclk cycles after the SCLK rising edge (see
+        -- header). Quasi-static: change only while the MRAM is idle.
+        rd_sample_dly : in  std_logic_vector(2 downto 0) := "010"
     );
 end entity mram_qspi_backend;
 
@@ -212,6 +221,13 @@ architecture rtl of mram_qspi_backend is
     signal reg_rx       : std_logic_vector(31 downto 0);
     signal reg_done_i   : std_logic := '0';
 
+    -- Delayed read capture: cap_pipe(i) = an input-sampling rising edge
+    -- happened i+1 aclk cycles ago.
+    signal cap_now  : std_logic;
+    signal cap_pipe : std_logic_vector(0 to 7) := (others => '0');
+    signal cap_fire : std_logic;
+    signal dly_q1, dly_q2 : std_logic_vector(2 downto 0) := "010";
+
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
     signal resp_rdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
@@ -253,6 +269,13 @@ begin
     assert G_ACLK_FREQ_HZ / (2 * G_SCLK_HALF_PERIOD) <= 54_000_000
         report "SCLK above 54MHz SDR maximum (datasheet Table 39)" severity failure;
 
+    -- Read capture strobe: rising SCLK edges in a read data phase, delayed by
+    -- rd_sample_dly aclk cycles. Read data is shifted in by this strobe only.
+    cap_now  <= '1' when sclk_rise and ((state = S_DATA and req_we = '0') or state = S_REG_RDATA)
+                else '0';
+    cap_fire <= cap_now when unsigned(dly_q2) = 0
+                else cap_pipe(to_integer(unsigned(dly_q2)) - 1);
+
     -- Register commands win over a waiting memory request.
     reg_cmd_accept <= reg_cmd_valid when state = S_IDLE else '0';
     reg_cmd_done   <= reg_done_i;
@@ -282,6 +305,17 @@ begin
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
                 reg_done_i  <= '0';
+
+                dly_q1   <= rd_sample_dly; -- quasi-static input
+                dly_q2   <= dly_q1;
+                cap_pipe <= cap_now & cap_pipe(0 to 6);
+                if cap_fire = '1' then
+                    if req_is_reg = '1' then
+                        reg_rx <= reg_rx(30 downto 0) & mram_io_i(1);
+                    else
+                        shreg  <= shreg(507 downto 0) & mram_io_i;
+                    end if;
+                end if;
 
                 case state is
 
@@ -472,10 +506,7 @@ begin
 
                     when S_DATA =>
                         if sclk_rise then
-                            clks_left <= clks_left - 1;
-                            if req_we = '0' then
-                                shreg <= shreg(507 downto 0) & mram_io_i;
-                            end if;
+                            clks_left <= clks_left - 1; -- read data: see cap_fire
                         elsif sclk_fall then
                             if clks_left = 0 then
                                 sclk_run  <= false;
@@ -495,11 +526,12 @@ begin
                         if req_is_reg = '0' then
                             io_oe <= (others => '0');
                         end if;
-                        if setup_cnt = G_CS_SETUP_CYCLES - 1 then
+                        -- also wait for delayed read captures still in flight
+                        if setup_cnt >= G_CS_SETUP_CYCLES - 1 and cap_pipe = x"00" then
                             mram_cs_n <= '1';
                             state     <= S_DONE;
                             setup_cnt <= 0;
-                        else
+                        elsif setup_cnt < G_CS_SETUP_CYCLES - 1 then
                             setup_cnt <= setup_cnt + 1;
                         end if;
 
@@ -588,8 +620,7 @@ begin
 
                     when S_REG_RDATA =>
                         if sclk_rise then
-                            clks_left <= clks_left - 1;
-                            reg_rx    <= reg_rx(30 downto 0) & mram_io_i(1);
+                            clks_left <= clks_left - 1; -- data: see cap_fire
                         elsif sclk_fall and clks_left = 0 then
                             sclk_run  <= false;
                             setup_cnt <= 0;

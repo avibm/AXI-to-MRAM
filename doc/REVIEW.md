@@ -101,7 +101,7 @@ rev. 1 RTL it reports the missing mode byte and the timing violations below.
 | D4 | No instruction before tPU = 25 ms after power-up/RESET (1 ms for the -A variant) (Tables 10/11) | Boot copy waits `G_POWERUP_CYCLES` = 3,750,000 (25 ms) before its first request. The watchdog is held off during that wait. |
 | D5 | Max SCLK is **54 MHz** SDR, not 108 MHz (Tables 29, 39) | Comments corrected. `G_SCLK_HALF_PERIOD` must be ≥ 2 at 150 MHz; the default is 37.5 MHz. |
 | D6 | Read latency: CR2 default is 8 cycles, valid for (1-4-4) SDR up to 54 MHz (Tables 25, 26) | `G_DUMMY_CYCLES` = 8 confirmed; closes O1 as long as CR2 is left at its default. |
-| D7 | Output valid tCO ≤ 9 ns after the falling edge (Table 43). Sampling half a period later leaves ~4 ns at 37.5 MHz for FPGA and board delays | Documented. Use `G_SCLK_HALF_PERIOD` = 3 (25 MHz) if the I/O timing does not close. The model now uses tCO = 9 ns. |
+| D7 | Output valid tCO ≤ 9 ns after the falling edge (Table 43). Sampling half a period later leaves ~4 ns at 37.5 MHz for FPGA and board delays | Confirmed on hardware in rev. 5: insufficient on the first board. Fixed with `rd_sample_dly`. |
 
 ### Rev. 3 – register commands for bring-up
 
@@ -133,6 +133,22 @@ Things these commands can reveal when "writes don't apply":
 * The CS# high time between WREN and the write (`G_CS_GAP_CYCLES`) is 92
   cycles (613 ns) instead of 4. The datasheet gives no figure after WREN, so
   it now uses the 600 ns tCS3 value.
+
+### Rev. 5 – read sampling one SCLK late on hardware
+
+With CS#/SCLK connected, RDID on the board returned `0x73109480`. That is
+`0` followed by `0xE6212901` (Table 22: E6 · dual-quad · 3 V · −40…125 °C ·
+2 Gb · 54 MHz) shifted right by one bit. The chip works; the FPGA sampled
+every bit one SCLK late. Sampling half an SCLK period (13.3 ns at 37.5 MHz)
+after the chip launches a bit was not enough to cover FPGA output delay,
+board delay both ways, tCO and FPGA input delay. This is D7 in practice.
+The same lateness shifts quad reads by one nibble, which on its own makes
+the boot verify fail.
+
+Fix: a runtime input `rd_sample_dly` (0–7 `aclk` cycles after the SCLK
+rising edge, default 2) moves the read sample point. The simulation model
+reproduces the board failure (20 ns delay, setting 0) and passes with 2;
+see the README table.
 
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
