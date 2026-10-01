@@ -128,6 +128,12 @@ entity mram_top is
         cmd_done      : out std_logic;
         boot_hold     : in  std_logic; -- '1' = do not start the boot copy yet
 
+        -- MRAM read sample delay, aclk cycles after the SCLK rising edge
+        -- (see mram_qspi_backend.vhd). Quasi-static, e.g. from a PCI
+        -- register: change only while the MRAM is idle (boot_hold = 1, no
+        -- MRAM access in flight). "010" suits 37.5MHz SCLK on the first board.
+        rd_sample_dly : in  std_logic_vector(2 downto 0) := "010";
+
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
         boot_fail   : out std_logic; -- wire to a fault indicator; stays low unless retries exhausted
@@ -292,7 +298,8 @@ begin
             mram_sclk  => mram_sclk,
             mram_io_o  => backend_io_o,
             mram_io_oe => backend_io_oe,
-            mram_io_i  => backend_io_i
+            mram_io_i  => backend_io_i,
+            rd_sample_dly => rd_sample_dly
         );
 
     gen_pins : for i in 0 to 3 generate

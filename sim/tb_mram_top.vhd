@@ -30,6 +30,10 @@ use work.mram_pkg.all;
 use work.qspi_mram_mem_pkg.all;
 
 entity tb_mram_top is
+    generic (
+        G_MODEL_TCO_PS : natural := 9000; -- chip output delay incl. board after SCLK fall, ps
+        G_SAMPLE_DLY   : natural := 2     -- rd_sample_dly
+    );
 end entity tb_mram_top;
 
 architecture sim of tb_mram_top is
@@ -182,13 +186,14 @@ begin
             cmd_rdid => cmd_req(I_RDID), cmd_wrsr_data => cmd_wrsr_data,
             cmd_rdsr_data => cmd_rdsr_data, cmd_rdid_data => cmd_rdid_data,
             cmd_done => cmd_done, boot_hold => boot_hold,
+            rd_sample_dly => std_logic_vector(to_unsigned(G_SAMPLE_DLY, 3)),
             key_ok => key_ok, cpu_reset_n => cpu_reset_n, boot_done => boot_done,
             boot_fail => boot_fail,
             mram_cs_n => cs_n, mram_sclk => sclk, mram_io => io
         );
 
     mdl : entity work.qspi_mram_model
-        generic map (G_TPU => 10 us, G_DEVICE_ID => DEVICE_ID)
+        generic map (G_TPU => 10 us, G_DEVICE_ID => DEVICE_ID, G_TCO => G_MODEL_TCO_PS * 1 ps)
         port map (cs_n => cs_n, sclk => sclk, io => io,
                   errors => model_errs, n_rd => model_rd, n_wr => model_wr);
 
