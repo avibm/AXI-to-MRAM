@@ -72,16 +72,31 @@
 -- rdata (see mram_pkg). The lowest-address byte is sent / received first.
 --
 -- Register commands (reg_cmd_* ports, driven by mram_cmd_ctrl): WREN 06h,
--- WRDI 04h, RDSR 05h, WRSR 01h, RDID 9Fh, all single-bit SPI (Table 29):
--- opcode on IO0, write data on IO0, read data from the device on IO1
--- (SO), MSB first. IO2 (WP#) and IO3 are driven high throughout. They run
+-- WRDI 04h, RDSR 05h, WRSR 01h, RDID 9Fh, RDAR 65h, WRAR 71h, all
+-- single-bit SPI (Table 29, Figures 14 and 17): opcode, then for RDAR/WRAR
+-- a 4-byte register address (Table 13), and write data, on IO0; read data
+-- from the device on IO1 (SO), MSB first. RDAR inserts G_DUMMY_CYCLES
+-- latency clocks (CR2, Table 28) before the data. IO2 (WP#) and IO3 are driven high throughout. They run
 -- between memory accesses and take priority over a waiting core_req.
 -- RDSR and RDID are limited to 40MHz (Table 29); see the assertion below.
--- WRSR is followed by the array-write CS# high time, the others by the
--- read one.
+-- WRSR/WRAR are followed by the array-write CS# high time, the others by
+-- the read one.
+--
+-- Write continuation: a write request with cont = '1' whose address is the
+-- next byte after the write currently being shifted out is accepted while
+-- that write is still in its data phase. Its data then follows without a
+-- new WREN/opcode/address, in the same CS# transaction (the device keeps
+-- incrementing the address, "Instruction Description"). The first write's
+-- bvalid is given when the second one takes over. Never across the end of
+-- the 128MB die.
+--
+-- skip_wren = '1' omits the WREN transaction before array writes. Only
+-- valid after CR1[1:0] (WRENS) has been set to 01 "SRAM" (WREN not needed)
+-- or 10 "Back-to-Back" with a WREN issued (Table 23); with the default 00
+-- every write would be silently ignored. Quasi-static input.
 --
 -- Not implemented (documented scope):
---   * RDFSR, RDAR/WRAR (CR1/CR2 access).
+--   * RDFSR.
 --   * Driving the device RESET# pin (not on this entity's ports).
 --   * Burst aggregation / prefetch across consecutive core_req calls.
 --   * XIP mode (deliberately never entered: the mode byte is always Fxh).
@@ -113,6 +128,8 @@ entity mram_qspi_backend is
         G_OPCODE_RDSR       : std_logic_vector(7 downto 0) := x"05"; -- RDSR,  Table 29 #6
         G_OPCODE_RDID       : std_logic_vector(7 downto 0) := x"9F"; -- RDID,  Table 29 #8
         G_OPCODE_WRSR       : std_logic_vector(7 downto 0) := x"01"; -- WRSR,  Table 29 #10
+        G_OPCODE_RDAR       : std_logic_vector(7 downto 0) := x"65"; -- RDAR,  Table 29 #9
+        G_OPCODE_WRAR       : std_logic_vector(7 downto 0) := x"71"; -- WRAR,  Table 29 #11
         G_ACLK_FREQ_HZ      : natural := 150_000_000   -- only used by the SCLK limit checks
     );
     port (
@@ -126,10 +143,11 @@ entity mram_qspi_backend is
         -- hold valid and the fields until accept = '1' in the same cycle).
         reg_cmd_valid  : in  std_logic := '0';
         reg_cmd_op     : in  reg_cmd_t := REG_CMD_RDSR;
-        reg_cmd_wdata  : in  std_logic_vector(7 downto 0) := (others => '0'); -- WRSR data
+        reg_cmd_wdata  : in  std_logic_vector(7 downto 0) := (others => '0'); -- WRSR/WRAR data
+        reg_cmd_addr   : in  std_logic_vector(7 downto 0) := (others => '0'); -- RDAR/WRAR address
         reg_cmd_accept : out std_logic;
         reg_cmd_done   : out std_logic;                     -- one-cycle pulse
-        reg_cmd_rdata  : out std_logic_vector(31 downto 0); -- RDSR: bits 7:0; RDID: all 32
+        reg_cmd_rdata  : out std_logic_vector(31 downto 0); -- RDSR/RDAR: bits 7:0; RDID: all 32
 
         mram_cs_n  : out std_logic;
         mram_sclk  : out std_logic;
@@ -143,7 +161,10 @@ entity mram_qspi_backend is
 
         -- Read sample delay in aclk cycles after the SCLK rising edge (see
         -- header). Quasi-static: change only while the MRAM is idle.
-        rd_sample_dly : in  std_logic_vector(2 downto 0) := "010"
+        rd_sample_dly : in  std_logic_vector(2 downto 0) := "010";
+
+        -- '1' = no WREN before array writes (see header). Quasi-static.
+        skip_wren     : in  std_logic := '0'
     );
 end entity mram_qspi_backend;
 
@@ -153,7 +174,7 @@ architecture rtl of mram_qspi_backend is
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
         S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE, S_CS_HIGH,
-        S_REG_SETUP, S_REG_CMD, S_REG_WDATA, S_REG_RDATA
+        S_REG_SETUP, S_REG_CMD, S_REG_WDATA, S_REG_DUMMY, S_REG_RDATA
     );
     signal state : state_t := S_IDLE;
 
@@ -216,7 +237,8 @@ architecture rtl of mram_qspi_backend is
 
     -- Register command in progress
     signal req_is_reg   : std_logic := '0';
-    signal reg_wr_bits  : integer range 0 to 8;   -- data bits sent after the opcode
+    signal reg_wr_bits  : integer range 0 to 40;  -- bits sent after the opcode (addr + data)
+    signal reg_dummy    : boolean := false;       -- RDAR: latency clocks before the data
     signal reg_rd_bits  : integer range 0 to 32;  -- data bits received after the opcode
     signal reg_rx       : std_logic_vector(31 downto 0);
     signal reg_done_i   : std_logic := '0';
@@ -227,6 +249,13 @@ architecture rtl of mram_qspi_backend is
     signal cap_pipe : std_logic_vector(0 to 7) := (others => '0');
     signal cap_fire : std_logic;
     signal dly_q1, dly_q2 : std_logic_vector(2 downto 0) := "010";
+
+    -- Write continuation
+    signal next_addr     : unsigned(C_MRAM_ADDR_WIDTH downto 0);  -- one past the last byte
+    signal join_pending  : std_logic := '0';
+    signal join_nbytes   : unsigned(6 downto 0);
+    signal cont_ok       : std_logic;
+    signal skip_q1, skip_q2 : std_logic := '0';
 
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
@@ -282,7 +311,15 @@ begin
     reg_cmd_rdata  <= reg_rx;
 
     -- Accept combinationally whenever idle (see the mram_pkg contract).
-    core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else '0';
+    -- A continuation is taken while the current write still has at least
+    -- one rising edge to go, so it can be loaded on the final falling edge.
+    cont_ok <= '1' when state = S_DATA and req_we = '1' and req_is_reg = '0'
+                        and join_pending = '0' and clks_left >= 1
+                        and core_req.valid = '1' and core_req.we = '1' and core_req.cont = '1'
+                        and unsigned('0' & core_req.addr) = next_addr
+               else '0';
+
+    core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else cont_ok;
     core_resp.rvalid <= resp_rvalid;
     core_resp.bvalid <= resp_bvalid;
     core_resp.rdata  <= resp_rdata;
@@ -306,8 +343,20 @@ begin
                 resp_bvalid <= '0';
                 reg_done_i  <= '0';
 
-                dly_q1   <= rd_sample_dly; -- quasi-static input
+                dly_q1   <= rd_sample_dly; -- quasi-static inputs
                 dly_q2   <= dly_q1;
+                skip_q1  <= skip_wren;
+                skip_q2  <= skip_q1;
+
+                -- Accept a write continuation (see cont_ok); it is appended
+                -- on the current write's final falling edge in S_DATA.
+                if cont_ok = '1' then
+                    join_pending <= '1';
+                    join_nbytes  <= core_req.nbytes;
+                    v_off        := to_integer(unsigned(core_req.addr(5 downto 0)));
+                    tx_build     <= std_logic_vector(shift_left(
+                                        unsigned(byte_rev(core_req.wdata)), 8 * v_off));
+                end if;
                 cap_pipe <= cap_now & cap_pipe(0 to 6);
                 if cap_fire = '1' then
                     if req_is_reg = '1' then
@@ -327,10 +376,11 @@ begin
                         sclk_run  <= false;
                         io_oe     <= (others => '0');
                         if reg_cmd_valid = '1' then
-                            -- opcode, then (WRSR only) the data byte, MSB first
+                            -- opcode, then address / data bits, MSB first
                             req_is_reg  <= '1';
                             reg_wr_bits <= 0;
                             reg_rd_bits <= 0;
+                            reg_dummy   <= false;
                             req_we      <= '0'; -- selects the CS# high time afterwards
                             case reg_cmd_op is
                                 when REG_CMD_WREN =>
@@ -344,6 +394,16 @@ begin
                                     shreg(511 downto 496) <= G_OPCODE_WRSR & reg_cmd_wdata;
                                     reg_wr_bits <= 8;
                                     req_we      <= '1';
+                                when REG_CMD_RDAR =>
+                                    shreg(511 downto 472) <= G_OPCODE_RDAR & x"000000" & reg_cmd_addr;
+                                    reg_wr_bits <= 32;
+                                    reg_rd_bits <= 8;
+                                    reg_dummy   <= G_DUMMY_CYCLES > 0;
+                                when REG_CMD_WRAR =>
+                                    shreg(511 downto 464) <= G_OPCODE_WRAR & x"000000" & reg_cmd_addr
+                                                             & reg_cmd_wdata;
+                                    reg_wr_bits <= 40;
+                                    req_we      <= '1';
                                 when others => -- REG_CMD_RDID
                                     shreg(511 downto 504) <= G_OPCODE_RDID;
                                     reg_rd_bits <= 32;
@@ -356,6 +416,9 @@ begin
                             req_is_reg  <= '0';
                             req_we      <= core_req.we;
                             req_nbytes  <= core_req.nbytes;
+                            next_addr   <= resize(unsigned(core_req.addr), next_addr'length)
+                                           + core_req.nbytes;
+                            join_pending <= '0';
                             lane_offset <= unsigned(core_req.addr(5 downto 0));
                             req_addr32  <= std_logic_vector(resize(unsigned(core_req.addr), 32));
 
@@ -367,7 +430,7 @@ begin
 
                             setup_cnt <= 0;
                             mram_cs_n <= '0';
-                            if core_req.we = '1' then
+                            if core_req.we = '1' and skip_q2 = '0' then
                                 state <= S_WREN_SETUP;
                             else
                                 state <= S_CS_SETUP;
@@ -508,7 +571,15 @@ begin
                         if sclk_rise then
                             clks_left <= clks_left - 1; -- read data: see cap_fire
                         elsif sclk_fall then
-                            if clks_left = 0 then
+                            if clks_left = 0 and req_we = '1' and join_pending = '1' then
+                                -- continue with the appended write, same CS#
+                                io_drive     <= tx_build(511 downto 508);
+                                shreg        <= tx_build(507 downto 0) & "0000";
+                                clks_left    <= 2 * to_integer(join_nbytes);
+                                next_addr    <= next_addr + join_nbytes;
+                                join_pending <= '0';
+                                resp_bvalid  <= '1'; -- the previous write is complete
+                            elsif clks_left = 0 then
                                 sclk_run  <= false;
                                 io_oe     <= (others => '0');
                                 setup_cnt <= 0;
@@ -609,13 +680,30 @@ begin
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
-                                sclk_run  <= false;
-                                setup_cnt <= 0;
-                                state     <= S_CS_HOLD;
+                                if reg_rd_bits /= 0 and reg_dummy then
+                                    clks_left <= G_DUMMY_CYCLES;   -- RDAR latency
+                                    state     <= S_REG_DUMMY;
+                                elsif reg_rd_bits /= 0 then
+                                    clks_left <= reg_rd_bits;
+                                    state     <= S_REG_RDATA;
+                                else
+                                    sclk_run  <= false;
+                                    setup_cnt <= 0;
+                                    state     <= S_CS_HOLD;
+                                end if;
                             else
                                 io_drive(0) <= shreg(511);
                                 shreg       <= shreg(510 downto 0) & '0';
                             end if;
+                        end if;
+
+                    when S_REG_DUMMY =>
+                        if sclk_rise then
+                            clks_left <= clks_left - 1;
+                        elsif sclk_fall and clks_left = 0 then
+                            -- device shifts out on IO1 from this edge on
+                            clks_left <= reg_rd_bits;
+                            state     <= S_REG_RDATA;
                         end if;
 
                     when S_REG_RDATA =>

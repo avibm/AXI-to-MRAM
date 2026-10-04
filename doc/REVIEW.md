@@ -1,4 +1,4 @@
-# MRAM Subsystem – Design Review (rev. 2)
+# MRAM Subsystem – Design Review (rev. 6)
 
 Scope: `doc/MRAM_Subsystem_IP_Specification.pdf` (Sep 24, 2026) and the six
 VHDL files in `rtl/` as first committed (commit "Add MRAM subsystem RTL and IP
@@ -149,6 +149,33 @@ Fix: a runtime input `rd_sample_dly` (0–7 `aclk` cycles after the SCLK
 rising edge, default 2) moves the read sample point. The simulation model
 reproduces the board failure (20 ns delay, setting 0) and passes with 2;
 see the README table.
+
+### Rev. 6 – write throughput
+
+On hardware, large PCI writes left holes. Cause, on the PCI side: the
+bridge `pci2ddr4` has no flow control. PCI delivers about 70 MB/s against
+about 9 MB/s into the MRAM, and once its FIFO (≈16 KB) is full, data is
+dropped. That bridge needs back-pressure. Two changes in this IP raise the
+MRAM rate (estimates, see the README):
+
+* **Write continuation.** A new `cont` field on `core_req` lets the
+  wrapper extend a running D2h write with the next contiguous strobe run
+  of the same AXI burst. The backend accepts it while still shifting data
+  (`cont_ok`) and appends it without raising CS#. Each 64-byte burst at a
+  0x20 offset is now 1 MRAM write instead of 2, and a 4-beat burst is 1
+  instead of 4. One B response per AXI burst, as before; errors from any
+  part are OR-ed into it.
+* **WREN-once.** New PCI commands RDAR (65h) and WRAR (71h), plus a
+  `skip_wren` input, allow CR1 WRENS = 01 (Table 23), so writes skip the
+  WREN and its CS# gap. Read the warning about `skip_wren` at power-up in
+  the README.
+
+Simulation: the model now handles RDAR/WRAR on SR/CR1/CR2, the WRENS modes,
+and counts WRENs. The testbench checks the write counts for merged and
+split bursts, and that no WREN is sent with `skip_wren` = 1. Two
+deliberate breaks were caught: with continuation disabled, 4 checks fail;
+with `skip_wren` set but CR1 left at 00, the model flags writes without
+WREN.
 
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 

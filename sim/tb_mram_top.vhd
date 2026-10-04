@@ -20,6 +20,12 @@
 -- register block-protect bits set, an AXI write gets OKAY but the MRAM
 -- content does not change.
 --
+-- Write speed-ups: contiguous strobe runs of one burst become one 4WQIO
+-- (checked via the model's write count, including a 0x20-offset 64-byte
+-- burst and a strobe hole that must split), and WREN-once mode: RDAR/WRAR
+-- set CR1 WRENS=01, skip_wren=1 sends no WREN (model WREN count), then
+-- normal mode is restored.
+--
 -- Run: see sim/run_ghdl.sh
 --------------------------------------------------------------------------------
 
@@ -84,8 +90,12 @@ architecture sim of tb_mram_top is
     constant I_RDSR : natural := 2;
     constant I_WRSR : natural := 3;
     constant I_RDID : natural := 4;
+    constant I_RDAR : natural := 5;
+    constant I_WRAR : natural := 6;
     signal pci_clk       : std_logic := '0';
-    signal cmd_req       : std_logic_vector(4 downto 0) := (others => '0');
+    signal cmd_req       : std_logic_vector(6 downto 0) := (others => '0');
+    signal cmd_reg_addr  : std_logic_vector(7 downto 0) := (others => '0');
+    signal skip_wren     : std_logic := '0';
     signal cmd_wrsr_data : std_logic_vector(7 downto 0) := (others => '0');
     signal cmd_rdsr_data : std_logic_vector(7 downto 0);
     signal cmd_rdid_data : std_logic_vector(31 downto 0);
@@ -95,6 +105,8 @@ architecture sim of tb_mram_top is
     signal pci_step      : natural := 0;
     signal wr_paused     : boolean := false; -- writer idle, PCI may change WREN/SR
     signal wr_t14_done   : boolean := false;
+    signal wr_paused2    : boolean := false; -- writer idle before / after T15
+    signal wr_t15_done   : boolean := false;
     signal early_rd_done : boolean := false;
     signal pci_finish    : boolean := false;
     signal tb_errs_p     : natural := 0;
@@ -104,7 +116,7 @@ architecture sim of tb_mram_top is
 
     signal cs_n, sclk : std_logic;
     signal io         : std_logic_vector(3 downto 0);
-    signal model_errs, model_rd, model_wr : natural;
+    signal model_errs, model_rd, model_wr, model_wren : natural;
 
     -- test sequencing between the writer and reader processes
     signal wr_step   : natural := 0;
@@ -183,7 +195,9 @@ begin
             s_axi_rlast => rlast, s_axi_rvalid => rvalid, s_axi_rready => rready,
             cmd_wren => cmd_req(I_WREN), cmd_wrdi => cmd_req(I_WRDI),
             cmd_rdsr => cmd_req(I_RDSR), cmd_wrsr => cmd_req(I_WRSR),
-            cmd_rdid => cmd_req(I_RDID), cmd_wrsr_data => cmd_wrsr_data,
+            cmd_rdid => cmd_req(I_RDID), cmd_rdar => cmd_req(I_RDAR),
+            cmd_wrar => cmd_req(I_WRAR), cmd_reg_addr => cmd_reg_addr,
+            cmd_wrsr_data => cmd_wrsr_data, skip_wren => skip_wren,
             cmd_rdsr_data => cmd_rdsr_data, cmd_rdid_data => cmd_rdid_data,
             cmd_done => cmd_done, boot_hold => boot_hold,
             rd_sample_dly => std_logic_vector(to_unsigned(G_SAMPLE_DLY, 3)),
@@ -195,7 +209,8 @@ begin
     mdl : entity work.qspi_mram_model
         generic map (G_TPU => 10 us, G_DEVICE_ID => DEVICE_ID, G_TCO => G_MODEL_TCO_PS * 1 ps)
         port map (cs_n => cs_n, sclk => sclk, io => io,
-                  errors => model_errs, n_rd => model_rd, n_wr => model_wr);
+                  errors => model_errs, n_rd => model_rd, n_wr => model_wr,
+                  n_wren => model_wren);
 
     -- Preload the master copy region before reset is released.
     process
@@ -340,6 +355,7 @@ begin
 
         variable beats : beat_arr_t;
         variable strbs : strb_arr_t;
+        variable n0, w0 : natural;
     begin
         wait until boot_done = '1';
         wait until rising_edge(aclk);
@@ -373,7 +389,10 @@ begin
         for b in 0 to 3 loop
             beats(b) := mk_beat(10 + b); strbs(b) := (others => '1');
         end loop;
+        n0 := model_wr;
         axi_write(16#4000#, 3, 6, "01", beats, strbs, "00", true);
+        check(model_wr = n0 + 1, "4-beat burst took " & integer'image(model_wr - n0)
+              & " 4WQIO, expected 1 (write continuation)");
 
         -- T7: narrow (4-byte) INCR burst starting unaligned at 0x5002
         for b in 0 to 3 loop
@@ -431,6 +450,46 @@ begin
             strbs(0)(i) := '0';
             axi_write(16#3800# + 64 * i, 0, 6, "01", beats, strbs, "00", true);
         end loop;
+
+        -- T15: WREN-once mode (CR1 WRENS=01 + skip_wren) set up over PCI.
+        -- Includes the PCI bridge's pattern: a 64-byte INCR burst at a 0x20
+        -- offset that the interconnect packs into 2 beats of 64 bytes with
+        -- half strobes each -> must become ONE 4WQIO of 64 bytes.
+        wr_paused2 <= true;
+        if pci_step < 3 then wait until pci_step >= 3; end if;
+        wr_paused2 <= false;
+        n0 := model_wr; w0 := model_wren;
+        beats(0) := mk_beat(70); beats(1) := mk_beat(71);
+        strbs(0) := (others => '0'); strbs(0)(63 downto 32) := (others => '1');
+        strbs(1) := (others => '0'); strbs(1)(31 downto 0)  := (others => '1');
+        axi_write(16#17E0#, 1, 6, "01", beats, strbs, "00", true);
+        check(model_wr = n0 + 1, "0x20-offset burst took " & integer'image(model_wr - n0)
+              & " 4WQIO, expected 1");
+        for b in 0 to 3 loop
+            beats(b) := mk_beat(72 + b); strbs(b) := (others => '1');
+        end loop;
+        axi_write(16#1900#, 3, 6, "01", beats, strbs, "00", true);
+        check(model_wr = n0 + 2, "4-beat burst in SRAM mode took "
+              & integer'image(model_wr - n0 - 1) & " 4WQIO, expected 1");
+        -- a hole in the strobes must split the write
+        beats(0) := mk_beat(76); beats(1) := mk_beat(77);
+        strbs(0) := (others => '1');
+        strbs(1) := (others => '1'); strbs(1)(0) := '0';
+        axi_write(16#1A00#, 1, 6, "01", beats, strbs, "00", true);
+        check(model_wr = n0 + 4, "split burst: " & integer'image(model_wr - n0 - 2)
+              & " 4WQIO, expected 2");
+        beats(0) := mk_beat(78); strbs(0) := x"0000_0000_FFFF_FFFF";
+        axi_write(16#1A80#, 0, 6, "01", beats, strbs, "00", true);
+        check(model_wren = w0, "skip_wren=1 but " & integer'image(model_wren - w0)
+              & " WREN were sent");
+        wr_t15_done <= true;
+        wr_paused2  <= true;
+        if pci_step < 4 then wait until pci_step >= 4; end if; -- back to normal mode
+        wr_paused2  <= false;
+        w0 := model_wren;
+        beats(0) := mk_beat(79); strbs(0) := (others => '1');
+        axi_write(16#1AC0#, 0, 6, "01", beats, strbs, "00", true);
+        check(model_wren = w0 + 1, "normal mode: expected one WREN per write");
         wr_step <= 4;
 
         report "writer done, " & integer'image(writes_done) & " writes, errors=" & integer'image(errs);
@@ -555,6 +614,8 @@ begin
         for i in 0 to 7 loop
             axi_read(16#3800# + 64 * i, 0, 6, "01", "00");
         end loop;
+        axi_read(16#17C0#, 2, 6, "01", "00");      -- T15 0x20-offset burst
+        axi_read(16#1900#, 7, 6, "01", "00");      -- T15 bursts
 
         report "reader done, " & integer'image(reads_done) & " reads, errors=" & integer'image(errs);
         rd_finish <= true;
@@ -576,12 +637,14 @@ begin
             end if;
         end procedure;
 
-        procedure do_cmd(i : natural; wr_data : std_logic_vector(7 downto 0) := x"00") is
+        procedure do_cmd(i : natural; wr_data : std_logic_vector(7 downto 0) := x"00";
+                         reg : std_logic_vector(7 downto 0) := x"00") is
             variable n : natural := 0;
         begin
             wait until rising_edge(pci_clk);
             check(done_pci = '0', "cmd_done high before a request");
             cmd_wrsr_data <= wr_data;       -- same PCI write as the request
+            cmd_reg_addr  <= reg;
             cmd_req(i)    <= '1';
             loop
                 wait until rising_edge(pci_clk);
@@ -605,6 +668,13 @@ begin
             check(cmd_rdsr_data = v, what & ": status " & to_hstring(cmd_rdsr_data)
                   & ", expected " & to_hstring(v));
         end procedure;
+
+        procedure expect_reg(reg, v : std_logic_vector(7 downto 0); what : string) is
+        begin
+            do_cmd(I_RDAR, x"00", reg);
+            check(cmd_rdsr_data = v, what & ": RDAR " & to_hstring(reg) & " = "
+                  & to_hstring(cmd_rdsr_data) & ", expected " & to_hstring(v));
+        end procedure;
     begin
         -- boot_hold is '1' from time 0: the copy must not start
         do_cmd(I_RDID);
@@ -623,6 +693,11 @@ begin
         do_cmd(I_WREN);
         do_cmd(I_WRSR, x"00");
         expect_sr(x"00", "after WRSR 00h");
+        expect_reg(x"02", x"60", "CR1 default");
+        expect_reg(x"03", x"08", "CR2 default");
+        expect_reg(x"00", x"00", "SR via RDAR");
+        do_cmd(I_WRAR, x"61", x"02");              -- no WREN: ignored
+        expect_reg(x"02", x"60", "WRAR without WREN");
         check(model_wr = 0, "boot copy wrote while boot_hold");
         -- release boot_hold only while no AXI access is in flight
         if not early_rd_done then wait until early_rd_done; end if;
@@ -640,6 +715,24 @@ begin
         do_cmd(I_WRSR, x"00");
         expect_sr(x"00", "unprotected again");
         pci_step <= 2;
+
+        -- T15: WREN-once mode. Read-modify-write CR1 (keep ODSEL etc.),
+        -- WRENS=01 (SRAM), verify, then set skip_wren.
+        if not wr_paused2 then wait until wr_paused2; end if;
+        expect_reg(x"02", x"60", "CR1 before T15");
+        do_cmd(I_WREN);
+        do_cmd(I_WRAR, (cmd_rdsr_data and x"FC") or x"01", x"02");
+        expect_reg(x"02", x"61", "CR1 WRENS=01");
+        expect_sr(x"00", "WRAR clears WREN");
+        skip_wren <= '1';
+        pci_step  <= 3;
+        if not wr_t15_done then wait until wr_t15_done; end if;
+        if not wr_paused2 then wait until wr_paused2; end if;
+        skip_wren <= '0';                          -- first, then restore CR1
+        do_cmd(I_WREN);
+        do_cmd(I_WRAR, x"60", x"02");
+        expect_reg(x"02", x"60", "CR1 restored");
+        pci_step  <= 4;
 
         -- commands interleaved with AXI traffic
         for i in 1 to 6 loop

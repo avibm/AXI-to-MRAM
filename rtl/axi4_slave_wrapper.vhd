@@ -41,6 +41,14 @@
 --   * AWLOCK/AWCACHE/AWQOS/ARLOCK/ARCACHE/ARQOS/AWPROT/ARPROT are present
 --     on the port for interconnect compatibility but are not acted upon.
 --
+-- Write continuation: when the last enabled run of a W beat has been
+-- accepted and more beats follow, the engine does not wait for that
+-- write's completion; it fetches the next beat at once and marks its first
+-- run cont = '1'. If it starts at the byte after the previous write, the
+-- backend appends it to the SPI write still in progress (one WREN, opcode
+-- and address for the whole run of contiguous bytes); otherwise it is
+-- served as a separate write. At most two writes are outstanding.
+--
 -- Core-side arbitration: the write and read engines each hold their request
 -- until accepted. Writes win when both are presented; ready is routed only
 -- to the engine whose request is actually on core_req.
@@ -173,7 +181,7 @@ architecture rtl of axi4_slave_wrapper is
     ----------------------------------------------------------------------------
     -- Write side
     ----------------------------------------------------------------------------
-    type wr_state_t is (WR_IDLE, WR_WDATA, WR_BEAT, WR_WAIT_BVALID, WR_RESP, WR_ERR_DRAIN);
+    type wr_state_t is (WR_IDLE, WR_WDATA, WR_BEAT, WR_WAIT_BVALID, WR_LAST, WR_RESP, WR_ERR_DRAIN);
 
     signal wr_state      : wr_state_t := WR_IDLE;
     signal wr_id         : std_logic_vector(G_ID_WIDTH - 1 downto 0);
@@ -184,6 +192,10 @@ architecture rtl of axi4_slave_wrapper is
     signal wr_core_error : std_logic := '0';
     signal wr_core_req_o : core_req_t := CORE_REQ_IDLE;
     signal wr_ready      : std_logic;
+    signal wr_outst      : integer range 0 to 3 := 0; -- accepted writes without bvalid yet
+    signal wr_chain      : std_logic := '0';  -- next beat's first run may continue the last write
+    signal wr_first_run  : std_logic := '0';  -- no run of the current beat issued yet
+    signal wr_cand       : std_logic := '0';  -- the issued run is the beat's last, more beats follow
 
     -- Current W beat: data and the byte lanes still to be written.
     signal wr_data : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
@@ -249,9 +261,12 @@ begin
     -- Write channel FSM
     ----------------------------------------------------------------------------
     process (aclk)
+        variable v_out : integer range 0 to 4;
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
+                wr_outst      <= 0;
+                wr_chain      <= '0';
                 wr_state      <= WR_IDLE;
                 s_axi_awready <= '0';
                 s_axi_wready  <= '0';
@@ -263,6 +278,18 @@ begin
                 s_axi_awready <= '0';
                 s_axi_wready  <= '0';
 
+                -- Outstanding core writes: +1 on acceptance, -1 on bvalid
+                -- (every bvalid on core_resp belongs to this engine).
+                v_out := wr_outst;
+                if wr_core_req_o.valid = '1' and wr_ready = '1' then
+                    v_out := v_out + 1;
+                end if;
+                if core_resp.bvalid = '1' then
+                    v_out := v_out - 1;
+                    wr_core_error <= wr_core_error or core_resp.error;
+                end if;
+                wr_outst <= v_out;
+
                 case wr_state is
 
                     when WR_IDLE =>
@@ -273,6 +300,7 @@ begin
                             wr_size       <= s_axi_awsize;
                             wr_beats_left <= resize(unsigned(s_axi_awlen), wr_beats_left'length) + 1;
                             wr_core_error <= '0';
+                            wr_chain      <= '0';
                             if s_axi_awburst /= AXI_BURST_INCR or unsigned(s_axi_awsize) > 6 then
                                 wr_error     <= '1';
                                 s_axi_wready <= '1';
@@ -299,6 +327,7 @@ begin
                             s_axi_wready <= '1';
                             wr_data      <= s_axi_wdata;
                             wr_mask      <= s_axi_wstrb and beat_lanes(wr_addr(5 downto 0), wr_size);
+                            wr_first_run <= '1';
                             wr_state     <= WR_BEAT;
                         end if;
 
@@ -306,15 +335,24 @@ begin
                         if wr_core_req_o.valid = '1' then
                             if wr_ready = '1' then
                                 wr_core_req_o.valid <= '0';
-                                wr_state            <= WR_WAIT_BVALID;
+                                if wr_cand = '1' then
+                                    -- beat finished: fetch the next one now so
+                                    -- its first run can continue this write
+                                    wr_addr       <= next_beat_addr(wr_addr, wr_size);
+                                    wr_beats_left <= wr_beats_left - 1;
+                                    wr_chain      <= '1';
+                                    wr_state      <= WR_WDATA;
+                                else
+                                    wr_state <= WR_WAIT_BVALID;
+                                end if;
                             end if;
                         elsif unsigned(wr_mask) = 0 then
                             -- every enabled byte of this beat is written
+                            wr_chain      <= '0';
                             wr_addr       <= next_beat_addr(wr_addr, wr_size);
                             wr_beats_left <= wr_beats_left - 1;
                             if wr_beats_left = 1 then
-                                s_axi_bvalid <= '1';
-                                wr_state     <= WR_RESP;
+                                wr_state <= WR_LAST;
                             else
                                 wr_state <= WR_WDATA;
                             end if;
@@ -326,14 +364,29 @@ begin
                                                     & std_logic_vector(to_unsigned(run_first, 6));
                             wr_core_req_o.nbytes <= to_unsigned(run_end - run_first, 7);
                             wr_core_req_o.wdata  <= wr_data;
+                            wr_core_req_o.cont   <= wr_chain and wr_first_run;
+                            wr_first_run         <= '0';
+                            wr_chain             <= '0';
+                            if (wr_mask and std_logic_vector(run_sum(C_AXI_STRB_WIDTH - 1 downto 0)))
+                                   = (wr_mask'range => '0') and wr_beats_left > 1 then
+                                wr_cand <= '1';
+                            else
+                                wr_cand <= '0';
+                            end if;
                             wr_mask              <= wr_mask and std_logic_vector(
                                                         run_sum(C_AXI_STRB_WIDTH - 1 downto 0));
                         end if;
 
                     when WR_WAIT_BVALID =>
-                        if core_resp.bvalid = '1' then
-                            wr_core_error <= wr_core_error or core_resp.error;
-                            wr_state      <= WR_BEAT;
+                        -- all issued writes of this burst complete
+                        if v_out = 0 then
+                            wr_state <= WR_BEAT;
+                        end if;
+
+                    when WR_LAST =>
+                        if v_out = 0 then
+                            s_axi_bvalid <= '1';
+                            wr_state     <= WR_RESP;
                         end if;
 
                     when WR_RESP =>

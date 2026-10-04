@@ -3,14 +3,18 @@
 --
 -- Direct MRAM register commands for bring-up and debug, driven by PCI-side
 -- registers: Write Enable, Write Disable, Read Status Register, Write
--- Status Register, Read Device ID. Each command has its own request input.
+-- Status Register, Read Device ID, Read Any Register, Write Any Register.
+-- Each command has its own request input. RDAR/WRAR take the register
+-- address from cmd_reg_addr (Table 13: SR 00h, CR1 02h, CR2 03h, ...);
+-- WRSR/WRAR take their data from cmd_wrsr_data; RDSR/RDAR return theirs
+-- in cmd_rdsr_data.
 -- One command runs per request (WRSR does NOT send WREN by itself; issue
 -- WREN first).
 --
 -- Handshake (four-phase, per command):
 --   1. PCI raises exactly one cmd_* request and holds it.
---      For WRSR, cmd_wrsr_data must already be valid and stay stable
---      while the request is high.
+--      For WRSR/WRAR/RDAR, cmd_wrsr_data and cmd_reg_addr must already be
+--      valid and stay stable while the request is high.
 --   2. The command runs on the MRAM; cmd_done rises.
 --      cmd_rdsr_data / cmd_rdid_data are valid from then on and keep their
 --      value until the same command runs again.
@@ -18,7 +22,8 @@
 --   4. cmd_done falls once no request is high. The next command may be
 --      raised after PCI has seen cmd_done low.
 --   Raising more than one request at a time is not supported; if it
---   happens they are served in the order WREN, WRDI, RDSR, WRSR, RDID and
+--   happens they are served in the order WREN, WRDI, RDSR, WRSR, RDID,
+--   RDAR, WRAR and
 --   cmd_done only falls once all of them are low.
 --
 -- Clock domains: the cmd_* requests, cmd_wrsr_data and boot_hold come from
@@ -64,7 +69,10 @@ entity mram_cmd_ctrl is
         cmd_rdsr      : in  std_logic;
         cmd_wrsr      : in  std_logic;
         cmd_rdid      : in  std_logic;
+        cmd_rdar      : in  std_logic := '0';
+        cmd_wrar      : in  std_logic := '0';
         cmd_wrsr_data : in  std_logic_vector(7 downto 0);
+        cmd_reg_addr  : in  std_logic_vector(7 downto 0) := (others => '0');
         cmd_rdsr_data : out std_logic_vector(7 downto 0);
         cmd_rdid_data : out std_logic_vector(31 downto 0);
         cmd_done      : out std_logic;   -- aclk register; synchronize on the PCI side
@@ -78,6 +86,7 @@ entity mram_cmd_ctrl is
         reg_cmd_valid  : out std_logic;
         reg_cmd_op     : out reg_cmd_t;
         reg_cmd_wdata  : out std_logic_vector(7 downto 0);
+        reg_cmd_addr   : out std_logic_vector(7 downto 0);
         reg_cmd_accept : in  std_logic;
         reg_cmd_done   : in  std_logic;
         reg_cmd_rdata  : in  std_logic_vector(31 downto 0)
@@ -86,10 +95,11 @@ end entity mram_cmd_ctrl;
 
 architecture rtl of mram_cmd_ctrl is
 
-    -- bit 0 WREN, 1 WRDI, 2 RDSR, 3 WRSR, 4 RDID, 5 boot_hold
-    type sync_t is array (0 to G_SYNC_STAGES - 1) of std_logic_vector(5 downto 0);
+    -- bit 0 WREN, 1 WRDI, 2 RDSR, 3 WRSR, 4 RDID, 5 boot_hold, 6 RDAR, 7 WRAR
+    type sync_t is array (0 to G_SYNC_STAGES - 1) of std_logic_vector(7 downto 0);
     signal req_meta : sync_t := (others => (others => '0'));
-    signal req_s    : std_logic_vector(5 downto 0);
+    signal req_s    : std_logic_vector(7 downto 0);
+    signal any_req  : std_logic;
 
     type state_t is (C_IDLE, C_ISSUE, C_WAIT, C_DONE);
     signal state  : state_t := C_IDLE;
@@ -109,7 +119,8 @@ begin
     process (aclk)
     begin
         if rising_edge(aclk) then
-            req_meta(0) <= boot_hold & cmd_rdid & cmd_wrsr & cmd_rdsr & cmd_wrdi & cmd_wren;
+            req_meta(0) <= cmd_wrar & cmd_rdar & boot_hold & cmd_rdid & cmd_wrsr & cmd_rdsr
+                           & cmd_wrdi & cmd_wren;
             for i in 1 to G_SYNC_STAGES - 1 loop
                 req_meta(i) <= req_meta(i - 1);
             end loop;
@@ -117,6 +128,7 @@ begin
     end process;
     req_s          <= req_meta(G_SYNC_STAGES - 1);
     boot_hold_sync <= req_s(5);
+    any_req        <= '1' when (req_s(7 downto 6) & req_s(4 downto 0)) /= "0000000" else '0';
 
     cmd_done <= done_a;
 
@@ -138,7 +150,7 @@ begin
                 case state is
 
                     when C_IDLE =>
-                        if mem_ready = '1' and req_s(4 downto 0) /= "00000" then
+                        if mem_ready = '1' and any_req = '1' then
                             if req_s(0) = '1' then
                                 op <= REG_CMD_WREN;
                             elsif req_s(1) = '1' then
@@ -147,11 +159,16 @@ begin
                                 op <= REG_CMD_RDSR;
                             elsif req_s(3) = '1' then
                                 op <= REG_CMD_WRSR;
-                            else
+                            elsif req_s(4) = '1' then
                                 op <= REG_CMD_RDID;
+                            elsif req_s(6) = '1' then
+                                op <= REG_CMD_RDAR;
+                            else
+                                op <= REG_CMD_WRAR;
                             end if;
                             -- stable for >= G_SYNC_STAGES cycles (see header)
                             reg_cmd_wdata <= cmd_wrsr_data;
+                            reg_cmd_addr  <= cmd_reg_addr;
                             reg_cmd_valid <= '1';
                             state         <= C_ISSUE;
                         end if;
@@ -164,7 +181,7 @@ begin
 
                     when C_WAIT =>
                         if reg_cmd_done = '1' then
-                            if op = REG_CMD_RDSR then
+                            if op = REG_CMD_RDSR or op = REG_CMD_RDAR then
                                 rdsr_q <= reg_cmd_rdata(7 downto 0);
                             elsif op = REG_CMD_RDID then
                                 rdid_q <= reg_cmd_rdata;
@@ -174,7 +191,7 @@ begin
                         end if;
 
                     when C_DONE =>
-                        if req_s(4 downto 0) = "00000" then
+                        if any_req = '0' then
                             done_a <= '0';
                             state  <= C_IDLE;
                         end if;
