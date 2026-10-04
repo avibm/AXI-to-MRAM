@@ -122,7 +122,10 @@ entity mram_top is
         cmd_rdsr      : in  std_logic;
         cmd_wrsr      : in  std_logic;
         cmd_rdid      : in  std_logic;
-        cmd_wrsr_data : in  std_logic_vector(7 downto 0);
+        cmd_rdar      : in  std_logic := '0';  -- Read Any Register  (address: cmd_reg_addr)
+        cmd_wrar      : in  std_logic := '0';  -- Write Any Register (needs WREN first)
+        cmd_wrsr_data : in  std_logic_vector(7 downto 0);   -- WRSR / WRAR data
+        cmd_reg_addr  : in  std_logic_vector(7 downto 0) := (others => '0'); -- RDAR / WRAR
         cmd_rdsr_data : out std_logic_vector(7 downto 0);
         cmd_rdid_data : out std_logic_vector(31 downto 0);
         cmd_done      : out std_logic;
@@ -133,6 +136,13 @@ entity mram_top is
         -- register: change only while the MRAM is idle (boot_hold = 1, no
         -- MRAM access in flight). "010" suits 37.5MHz SCLK on the first board.
         rd_sample_dly : in  std_logic_vector(2 downto 0) := "010";
+
+        -- '1' = no WREN before MRAM array writes. Set only after CR1 WRENS
+        -- has been written to 01 (SRAM mode) with WRAR and checked with
+        -- RDAR; otherwise every write is silently ignored by the MRAM.
+        -- Quasi-static (PCI register). Must be '0' at power-up so the boot
+        -- copy works with the default CR1.
+        skip_wren     : in  std_logic := '0';
 
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
@@ -156,7 +166,7 @@ architecture rtl of mram_top is
     signal boot_hold_sync, powerup_done               : std_logic;
     signal reg_cmd_valid, reg_cmd_accept, reg_cmd_done : std_logic;
     signal reg_cmd_op                                  : reg_cmd_t;
-    signal reg_cmd_wdata                               : std_logic_vector(7 downto 0);
+    signal reg_cmd_wdata, reg_cmd_addr                 : std_logic_vector(7 downto 0);
     signal reg_cmd_rdata                               : std_logic_vector(31 downto 0);
 
     signal backend_io_o, backend_io_oe, backend_io_i : std_logic_vector(3 downto 0);
@@ -202,7 +212,10 @@ begin
             cmd_rdsr       => cmd_rdsr,
             cmd_wrsr       => cmd_wrsr,
             cmd_rdid       => cmd_rdid,
+            cmd_rdar       => cmd_rdar,
+            cmd_wrar       => cmd_wrar,
             cmd_wrsr_data  => cmd_wrsr_data,
+            cmd_reg_addr   => cmd_reg_addr,
             cmd_rdsr_data  => cmd_rdsr_data,
             cmd_rdid_data  => cmd_rdid_data,
             cmd_done       => cmd_done,
@@ -212,6 +225,7 @@ begin
             reg_cmd_valid  => reg_cmd_valid,
             reg_cmd_op     => reg_cmd_op,
             reg_cmd_wdata  => reg_cmd_wdata,
+            reg_cmd_addr   => reg_cmd_addr,
             reg_cmd_accept => reg_cmd_accept,
             reg_cmd_done   => reg_cmd_done,
             reg_cmd_rdata  => reg_cmd_rdata
@@ -291,6 +305,7 @@ begin
             reg_cmd_valid  => reg_cmd_valid,
             reg_cmd_op     => reg_cmd_op,
             reg_cmd_wdata  => reg_cmd_wdata,
+            reg_cmd_addr   => reg_cmd_addr,
             reg_cmd_accept => reg_cmd_accept,
             reg_cmd_done   => reg_cmd_done,
             reg_cmd_rdata  => reg_cmd_rdata,
@@ -299,7 +314,8 @@ begin
             mram_io_o  => backend_io_o,
             mram_io_oe => backend_io_oe,
             mram_io_i  => backend_io_i,
-            rd_sample_dly => rd_sample_dly
+            rd_sample_dly => rd_sample_dly,
+            skip_wren     => skip_wren
         );
 
     gen_pins : for i in 0 to 3 generate

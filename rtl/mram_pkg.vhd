@@ -57,12 +57,18 @@ package mram_pkg is
     --     were accepted (in-order completion). resp.error qualifies the
     --     rvalid/bvalid pulse it accompanies.
     ----------------------------------------------------------------------------
+    -- cont = '1' marks a write that directly follows the previous write
+    -- (addr = previous addr + nbytes). The backend may then append its data
+    -- to the write still in progress instead of starting a new SPI write;
+    -- the request is accepted only while that is possible, otherwise it is
+    -- served as an ordinary write once the backend is idle.
     type core_req_t is record
         valid  : std_logic;
         addr   : std_logic_vector(C_MRAM_ADDR_WIDTH - 1 downto 0); -- first byte address (MRAM)
         we     : std_logic;                                        -- '1' = write, '0' = read
         nbytes : unsigned(6 downto 0);                             -- 1..64 bytes
         wdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);  -- lane-aligned
+        cont   : std_logic;                                        -- see above
     end record;
 
     -- AXI AxSIZE encodings, used by axi4_slave_wrapper.
@@ -79,7 +85,8 @@ package mram_pkg is
         addr   => (others => '0'),
         we     => '0',
         nbytes => to_unsigned(64, 7),
-        wdata  => (others => '0')
+        wdata  => (others => '0'),
+        cont   => '0'
     );
 
     type core_resp_t is record
@@ -109,6 +116,10 @@ package mram_pkg is
     constant REG_CMD_RDSR : reg_cmd_t := "010"; -- 05h Read Status Reg     (1-0-1), 1 byte out
     constant REG_CMD_WRSR : reg_cmd_t := "011"; -- 01h Write Status Reg    (1-0-1), 1 byte in, needs WREN
     constant REG_CMD_RDID : reg_cmd_t := "100"; -- 9Fh Read Device ID      (1-0-1), 4 bytes out
+    constant REG_CMD_RDAR : reg_cmd_t := "101"; -- 65h Read Any Register   (1-1-1), 4 addr bytes,
+                                                --     CR2 latency, 1 byte out
+    constant REG_CMD_WRAR : reg_cmd_t := "110"; -- 71h Write Any Register  (1-1-1), 4 addr bytes,
+                                                --     1 byte in, needs WREN
 
     ----------------------------------------------------------------------------
     -- AXI4 response encodings (RRESP/BRESP)

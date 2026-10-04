@@ -11,9 +11,9 @@ guard for the protected region.
 | `rtl/mram_pkg.vhd` | Shared constants and the internal `core_req` / `core_resp` interface |
 | `rtl/axi4_slave_wrapper.vhd` | AXI4 slave: bursts → single core requests (INCR, 1–64 B beats, WSTRB) |
 | `rtl/mram_boot_copy.vhd` | Copies and verifies the boot image, holds the CPU in reset until done |
-| `rtl/mram_cmd_ctrl.vhd` | PCI-driven MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID) with clock-domain crossing |
+| `rtl/mram_cmd_ctrl.vhd` | PCI-driven MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID, RDAR, WRAR) with clock-domain crossing |
 | `rtl/mram_write_guard.vhd` | Blocks writes to the protected region unless `key_ok` |
-| `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR) |
+| `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous writes merged) |
 | `rtl/mram_top.vhd` | Top level |
 | `sim/` | Behavioural QSPI MRAM model, self-checking testbench, GHDL run script |
 | `doc/MRAM_Subsystem_IP_Specification.pdf` | IP specification |
@@ -27,8 +27,11 @@ and `boot_hold` are synchronized into `aclk` inside):
 | Port | Dir | Meaning |
 |------|-----|---------|
 | `cmd_wren`, `cmd_wrdi`, `cmd_rdsr`, `cmd_wrsr`, `cmd_rdid` | in | One request per command (06h, 04h, 05h, 01h, 9Fh) |
-| `cmd_wrsr_data[7:0]` | in | Status register value for WRSR; set it with or before the request and keep it stable while the request is high |
-| `cmd_rdsr_data[7:0]`, `cmd_rdid_data[31:0]` | out | Results; valid once `cmd_done` = 1, held until the same command runs again |
+| `cmd_rdar`, `cmd_wrar` | in | Read / Write Any Register (65h, 71h) |
+| `cmd_reg_addr[7:0]` | in | Register address for RDAR/WRAR (Table 13: SR 00h, CR1 02h, CR2 03h). Same rules as `cmd_wrsr_data` |
+| `cmd_wrsr_data[7:0]` | in | Data for WRSR and WRAR; set it with or before the request and keep it stable while the request is high |
+| `cmd_rdsr_data[7:0]`, `cmd_rdid_data[31:0]` | out | Results (`cmd_rdsr_data` also holds the RDAR result); valid once `cmd_done` = 1, held until the next RDSR/RDAR (or RDID) |
+| `skip_wren` | in | 1 = array writes are sent without a WREN first. Only for CR1 WRENS = 01, see below. Quasi-static; tie to 0 if unused |
 | `cmd_done` | out | `aclk` register, not synchronized: the PCI side must synchronize it |
 | `boot_hold` | in | 1 = the boot copy waits after the 25 ms power-up time, so the device can be inspected first. AXI/PCI access to the MRAM window is open while held |
 
@@ -51,6 +54,56 @@ wait for the 25 ms power-up time and run between memory accesses.
 clears the WREN bit when a write completes. A PCI WREN → WRSR sequence
 therefore only works while no memory writes are running: for example with
 `boot_hold` = 1, or with AXI writers idle. Check with RDSR afterwards.
+
+### Write speed: merged writes and WREN-once mode
+
+**Merged writes.** The contiguous strobe runs of one AXI write burst go to
+the MRAM as **one** D2h write, not one per beat. For example, the PCI
+bridge's 64-byte burst at a 0x20 offset arrives as 2 beats with 32 strobes
+each; it is now one 64-byte 4WQIO instead of two 32-byte ones. A gap in
+the strobes, a FIXED burst, or the end of the AXI burst still ends the MRAM
+write. Separate AXI bursts are never merged. This is automatic and needs no
+setting.
+
+**WREN-once mode** saves the WREN instruction and the 600 ns CS# high
+time after it on every write. Datasheet Table 23: CR1[1:0] WRENS = 01
+("SRAM") means WREN is not needed for array writes. Register writes still
+always need WREN. Sequence, with AXI writes idle:
+
+1. RDAR 02h → current CR1 (default 60h: ODSEL = 011).
+2. WREN, then WRAR 02h with `(CR1 & FCh) | 01h`, which keeps ODSEL/MAPLK.
+3. RDAR 02h → check that it reads back with WRENS = 01.
+4. Set `skip_wren` = 1.
+
+To undo: set `skip_wren` = 0 first, then WREN plus WRAR 02h with WRENS = 00.
+
+Notes:
+* `skip_wren` must be 0 whenever CR1 might be at WRENS = 00, i.e. after
+  power-up/reset: the boot copy runs before PCI can set CR1. With
+  `skip_wren` = 1 and WRENS = 00, every write is **silently dropped** by
+  the device.
+* The datasheet pages I reviewed do not say whether CR1 is volatile, so
+  re-check with RDAR after every power cycle.
+* With WRENS = 01 the WREN bit no longer protects the array, so any stray
+  write lands. The software block protection (BPSEL) and the write guard
+  still apply.
+* The RDAR latency is taken as `G_DUMMY_CYCLES` (8, the CR2 default). Table
+  28 gives 8–15 cycles, and that the value follows CR2 is my reading of it,
+  not something I could confirm in the datasheet text. If CR2 is changed,
+  `G_DUMMY_CYCLES` must match.
+
+Rough gain at the default 37.5 MHz SCLK. These are estimates from the
+cycle counts, not measured on hardware:
+
+| 64-byte PCI burst | Before | Merged | Merged + WREN-once |
+|---|---|---|---|
+| Time per burst | ≈ 7 µs | ≈ 5.3 µs | ≈ 4.5 µs |
+| Throughput | ≈ 9 MB/s | ≈ 12 MB/s | ≈ 14 MB/s |
+
+That is still well below the ≈ 70 MB/s that PCI can deliver. **The PCI
+bridge (`pci2ddr4`) still needs back-pressure** (target wait states or
+retry when its FIFO is full). Without it, data is still lost on large
+transfers, only later.
 
 Status register (datasheet Table 16):
 

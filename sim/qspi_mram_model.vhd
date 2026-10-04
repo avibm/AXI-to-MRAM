@@ -9,7 +9,12 @@
 -- (1-0-1, data out on IO1 / in on IO0); EBh RDQI and D2h 4WQIO in (1-4-4) SDR with
 -- the XIP mode byte after the address (Table 29, Figure 19). The mode byte
 -- must be Fxh; Axh (XIP entry) is reported as an error because the RTL must
--- never enter XIP. Anything else is reported as an error.
+-- never enter XIP. 65h RDAR / 71h WRAR (1-1-1, 4 address bytes; RDAR has
+-- G_DUMMY latency cycles before the data, assumed equal to the CR2 read
+-- latency) for SR (00h), CR1 (02h) and CR2 (03h). CR1 WRENS[1:0] (Table 23)
+-- is modelled: 00 normal, 01 SRAM (array writes need no WREN), 10
+-- back-to-back (WREN stays set until WRDI). Register writes always need
+-- WREN. Anything else is reported as an error.
 --
 -- Timing checks (Tables 10, 39, 41, 43): fCLK <= 54MHz, tPU before the
 -- first CS# fall, CS# high >= tCS1 (20ns) after a read and >= tCS3 (600ns)
@@ -82,7 +87,8 @@ entity qspi_mram_model is
         io     : inout std_logic_vector(3 downto 0);
         errors : out   natural := 0;
         n_rd   : out   natural := 0;  -- completed RDQI transactions
-        n_wr   : out   natural := 0   -- completed 4WQIO transactions
+        n_wr   : out   natural := 0;  -- completed 4WQIO transactions
+        n_wren : out   natural := 0   -- WREN instructions received
     );
 end entity qspi_mram_model;
 
@@ -159,8 +165,12 @@ begin
         variable wel     : boolean := false;
         variable aborted : boolean;
         variable err     : natural := 0;
-        variable rd_cnt, wr_cnt : natural := 0;
+        variable rd_cnt, wr_cnt, wren_cnt : natural := 0;
         variable sr      : std_logic_vector(7 downto 0) := x"00"; -- WREN bit kept in wel
+        variable cr1     : std_logic_vector(7 downto 0) := x"60"; -- Table 23 default
+        variable cr2     : std_logic_vector(7 downto 0) := x"08";
+        variable rbyte   : std_logic_vector(7 downto 0);
+        variable wr_ok   : boolean;
         variable out_v   : std_logic_vector(31 downto 0);
         variable nbits   : natural;
         variable bp      : natural;
@@ -226,6 +236,10 @@ begin
                 fail("extra SCLK after WREN/WRDI opcode");
             end if;
             wel := (op = x"06");
+            if op = x"06" then
+                wren_cnt := wren_cnt + 1;
+                n_wren   <= wren_cnt;
+            end if;
         elsif op = x"05" or op = x"9F" then
             -- RDSR / RDID: shift out on IO1 after each falling edge
             slow_cmd <= true;
@@ -267,6 +281,76 @@ begin
                 else
                     sr(7) := byte_v(7);
                     sr(5 downto 2) := byte_v(5 downto 2);
+                end if;
+            end if;
+            wel := false;
+        elsif op = x"65" or op = x"71" then
+            -- RDAR / WRAR (1-1-1): 4 address bytes on IO0
+            for i in 31 downto 0 loop
+                next_rise;
+                exit when aborted;
+                check_bits(io(0 downto 0), "RDAR/WRAR address bit");
+                addr(i) := io(0);
+            end loop;
+            if aborted then
+                fail("CS# deasserted during RDAR/WRAR address");
+            elsif op = x"65" then
+                case to_integer(addr) is
+                    when 0      => rbyte := sr(7 downto 2) & '1' & '0' when wel
+                                            else sr(7 downto 2) & "00";
+                    when 2      => rbyte := cr1;
+                    when 3      => rbyte := cr2;
+                    when others => rbyte := x"00";
+                                   fail("RDAR of unmodelled register 0x" & to_hstring(addr));
+                end case;
+                -- latency (CR2[3:0], assumed = G_DUMMY), then data on IO1
+                for i in 1 to G_DUMMY loop
+                    next_rise;
+                    exit when aborted;
+                end loop;
+                if aborted then
+                    fail("CS# deasserted during RDAR latency");
+                else
+                    -- the first bit goes out after the falling edge that
+                    -- follows the last latency rise
+                    nnib := 0;
+                    loop
+                        wait until falling_edge(sclk) or cs_n = '1';
+                        exit when cs_n = '1';
+                        io <= "ZZ" & rbyte(7 - (nnib mod 8)) & 'Z' after G_TCO;
+                        nnib := nnib + 1;
+                    end loop;
+                end if;
+            else
+                for i in 7 downto 0 loop
+                    next_rise;
+                    exit when aborted;
+                    check_bits(io(0 downto 0), "WRAR data bit");
+                    byte_v(i) := io(0);
+                end loop;
+                if aborted then
+                    fail("CS# deasserted during WRAR data");
+                else
+                    next_rise;
+                    if not aborted then
+                        fail("extra SCLK after WRAR data");
+                    end if;
+                    -- register writes always need WREN (Table 23 note 1)
+                    if not wel then
+                        report "MRAM model: WRAR without WREN ignored" severity note;
+                    elsif to_integer(addr) = 2 then
+                        if byte_v(1 downto 0) = "11" then
+                            fail("WRAR CR1 WRENS=11 is reserved");
+                        end if;
+                        cr1 := byte_v(7 downto 5) & "00" & byte_v(2 downto 0);
+                    elsif to_integer(addr) = 3 then
+                        cr2 := byte_v;
+                    elsif to_integer(addr) = 0 then
+                        sr(7) := byte_v(7);
+                        sr(5 downto 2) := byte_v(5 downto 2);
+                    else
+                        fail("WRAR to unmodelled register 0x" & to_hstring(addr));
+                    end if;
                 end if;
             end if;
             wel := false;
@@ -322,7 +406,9 @@ begin
                     n_rd   <= rd_cnt;
                 end if;
             else -- D2 write
-                if not wel then
+                -- CR1 WRENS: 00 normal, 01 SRAM (no WREN), 10 back-to-back
+                wr_ok := wel or cr1(1 downto 0) = "01";
+                if not wr_ok then
                     fail("4WQIO without preceding WREN");
                 end if;
                 nnib := 0;
@@ -334,7 +420,7 @@ begin
                         byte_v(7 downto 4) := io;
                     else
                         byte_v(3 downto 0) := io;
-                        if wel and not sw_protected(to_integer(addr(26 downto 0))) then
+                        if wr_ok and not sw_protected(to_integer(addr(26 downto 0))) then
                             mem.write(to_integer(addr(26 downto 0)), byte_v);
                         end if;
                         addr := addr + 1;
@@ -344,7 +430,11 @@ begin
                 if nnib mod 2 /= 0 then
                     fail("write ended on a half byte");
                 end if;
-                wel    := false;
+                -- WEL only self-clears in normal mode (back-to-back keeps
+                -- it until WRDI; SRAM mode ignores it)
+                if cr1(1 downto 0) = "00" then
+                    wel := false;
+                end if;
                 last_was_write <= true;
                 wr_cnt := wr_cnt + 1;
                 n_wr   <= wr_cnt;
