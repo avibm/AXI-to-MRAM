@@ -1,7 +1,9 @@
 --------------------------------------------------------------------------------
 -- tb_mram_top.vhd  (simulation only)
 --
--- Self-checking testbench for mram_top against qspi_mram_model. Uses a
+-- Self-checking testbench for mram_top against qspi_mram_model. Works for
+-- any C_AXI_DATA_WIDTH in mram_pkg (64, 128, 256, 512): 64-byte transfers
+-- are full-width INCR bursts of 64 / C_BEAT_BYTES beats. Uses a
 -- 512-byte boot image so the boot copy finishes quickly. Every write is
 -- checked byte-by-byte through the model's backdoor (including bytes that
 -- must NOT change), and every read is compared with the backdoor.
@@ -29,6 +31,8 @@
 -- right after each B must become one 4WQIO (posted B + append), a write
 -- after CS# rose starts a new one, and a write arriving while SCLK is
 -- paused with CS# low (linger) resumes the same 4WQIO.
+-- Read streaming (T17): six back-to-back 64-byte read bursts and one
+-- 256-byte burst must each be one RDQI.
 --
 -- Run: see sim/run_ghdl.sh
 --------------------------------------------------------------------------------
@@ -52,10 +56,13 @@ architecture sim of tb_mram_top is
     constant SRC_BASE   : natural := 16#6000000#;
     constant BOOT_BYTES : natural := 512;
 
-    subtype beat_t is std_logic_vector(511 downto 0);
-    subtype strb_t is std_logic_vector(63 downto 0);
-    type beat_arr_t is array (0 to 15) of beat_t;
-    type strb_arr_t is array (0 to 15) of strb_t;
+    -- Everything below follows the data width set in mram_pkg.
+    constant BB  : natural := C_BEAT_BYTES;   -- bytes per beat
+    constant SZM : natural := C_LANE_BITS;    -- full-width AxSIZE
+    subtype beat_t is std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    subtype strb_t is std_logic_vector(BB - 1 downto 0);
+    type beat_arr_t is array (0 to 63) of beat_t;
+    type strb_arr_t is array (0 to 63) of strb_t;
 
     signal aclk    : std_logic := '0';
     signal aresetn : std_logic := '0';
@@ -63,7 +70,7 @@ architecture sim of tb_mram_top is
     signal awid    : std_logic_vector(C_AXI_ID_WIDTH - 1 downto 0) := (others => '0');
     signal awaddr  : std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0) := (others => '0');
     signal awlen   : std_logic_vector(7 downto 0) := (others => '0');
-    signal awsize  : std_logic_vector(2 downto 0) := "110";
+    signal awsize  : std_logic_vector(2 downto 0) := SIZE_BEAT;
     signal awburst : std_logic_vector(1 downto 0) := "01";
     signal awvalid, awready : std_logic := '0';
     signal wdata   : beat_t := (others => '0');
@@ -76,7 +83,7 @@ architecture sim of tb_mram_top is
     signal arid    : std_logic_vector(C_AXI_ID_WIDTH - 1 downto 0) := (others => '0');
     signal araddr  : std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0) := (others => '0');
     signal arlen   : std_logic_vector(7 downto 0) := (others => '0');
-    signal arsize  : std_logic_vector(2 downto 0) := "110";
+    signal arsize  : std_logic_vector(2 downto 0) := SIZE_BEAT;
     signal arburst : std_logic_vector(1 downto 0) := "01";
     signal arvalid, arready : std_logic := '0';
     signal rid     : std_logic_vector(C_AXI_ID_WIDTH - 1 downto 0);
@@ -143,10 +150,18 @@ architecture sim of tb_mram_top is
     function mk_beat(seed : natural) return beat_t is
         variable b : beat_t;
     begin
-        for i in 0 to 63 loop
+        for i in 0 to BB - 1 loop
             b(8 * i + 7 downto 8 * i) := std_logic_vector(to_unsigned((seed * 31 + i * 5 + 1) mod 256, 8));
         end loop;
         return b;
+    end function;
+
+    -- Byte j of a range written with range_burst(addr, n, seed, ...)
+    function range_byte(addr, j, seed : natural) return std_logic_vector is
+        constant a : natural := addr + j;
+        constant k : natural := a / BB - addr / BB;
+    begin
+        return mk_beat(seed + k)(8 * (a mod BB) + 7 downto 8 * (a mod BB));
     end function;
 
     function size_bytes(sz : natural) return natural is
@@ -249,7 +264,7 @@ begin
         variable errs : natural := 0;
         variable lfsr : unsigned(15 downto 0) := x"ACE1";
         variable writes_done : natural := 0;
-        type snap_t is array (0 to 17 * 64 - 1) of std_logic_vector(7 downto 0);
+        type snap_t is array (0 to 2047) of std_logic_vector(7 downto 0);
         variable snap : snap_t;
 
         procedure check(cond : boolean; msg : string) is
@@ -272,7 +287,7 @@ begin
                             exp_resp : std_logic_vector(1 downto 0); expect_change : boolean) is
             variable wi     : natural := 0;
             variable aw_ok  : boolean := false;
-            variable base   : natural := (addr / 64) * 64;
+            variable base   : natural := (addr / BB) * BB;
             variable ba, lo, hi, a : natural;
             variable exp    : std_logic_vector(7 downto 0);
         begin
@@ -338,10 +353,10 @@ begin
             -- Byte-exact check of every byte the burst could have touched.
             for b in 0 to len loop
                 ba := beat_addr(addr, sz, b);
-                lo := ba mod 64;
-                hi := ((ba mod 64) / size_bytes(sz)) * size_bytes(sz) + size_bytes(sz);
-                for lane in 0 to 63 loop
-                    a := (ba / 64) * 64 + lane;
+                lo := ba mod BB;
+                hi := ((ba mod BB) / size_bytes(sz)) * size_bytes(sz) + size_bytes(sz);
+                for lane in 0 to BB - 1 loop
+                    a := (ba / BB) * BB + lane;
                     if expect_change and lane >= lo and lane < hi and strbs(b)(lane) = '1' then
                         exp := beats(b)(8 * lane + 7 downto 8 * lane);
                     else
@@ -355,8 +370,8 @@ begin
                     end if;
                 end loop;
                 -- bytes just outside the beat's container must be untouched
-                if lo > 0 and ((ba / 64) * 64 + lo - 1) >= base then
-                    a := (ba / 64) * 64 + lo - 1;
+                if lo > 0 and ((ba / BB) * BB + lo - 1) >= base then
+                    a := (ba / BB) * BB + lo - 1;
                     if b = 0 then
                         check(mem.read(a) = snap(a - base), "byte below first beat changed");
                     end if;
@@ -364,29 +379,70 @@ begin
             end loop;
         end procedure;
 
-        -- One 64-byte single-beat write, next one issued right after B; no
-        -- per-write memory check (T16 checks at the end).
-        procedure stream_write(addr : natural; d : std_logic_vector(511 downto 0)) is
-            variable aw_ok, w_ok : boolean := false;
+        -- n bytes from addr as one full-width INCR burst (what an AXI
+        -- width converter makes of a narrower master's burst): beat k is
+        -- container addr/BB + k, strobes only on the bytes in range.
+        procedure range_burst(addr, n, seed : natural; variable bts : out beat_arr_t;
+                              variable sts : out strb_arr_t; variable len : out natural) is
+            variable c : natural;
         begin
+            len := (addr + n - 1) / BB - addr / BB;
+            for k in 0 to len loop
+                bts(k) := mk_beat(seed + k);
+                for lane in 0 to BB - 1 loop
+                    c := (addr / BB + k) * BB + lane;
+                    sts(k)(lane) := '1' when c >= addr and c < addr + n else '0';
+                end loop;
+            end loop;
+        end procedure;
+
+        -- Like axi_write for a byte range, with the full byte-exact check.
+        procedure write_range(addr, n, seed : natural; exp_resp : std_logic_vector(1 downto 0);
+                              expect_change : boolean) is
+            variable bts : beat_arr_t;
+            variable sts : strb_arr_t;
+            variable len : natural;
+        begin
+            range_burst(addr, n, seed, bts, sts, len);
+            axi_write(addr, len, SZM, "01", bts, sts, exp_resp, expect_change);
+        end procedure;
+
+        -- A 64-byte range_burst; the next one is issued right after B. No
+        -- per-write memory check (T16 checks at the end).
+        procedure stream_write(addr, seed : natural) is
+            variable bts : beat_arr_t;
+            variable sts : strb_arr_t;
+            variable len : natural;
+            variable aw_ok : boolean := false;
+            variable wi    : natural := 0;
+        begin
+            range_burst(addr, 64, seed, bts, sts, len);
             awaddr  <= std_logic_vector(to_unsigned(addr, awaddr'length));
-            awlen   <= x"00";
-            awsize  <= "110";
+            awlen   <= std_logic_vector(to_unsigned(len, 8));
+            awsize  <= SIZE_BEAT;
             awburst <= "01";
             awid    <= std_logic_vector(to_unsigned(3, awid'length));
             awvalid <= '1';
-            wdata   <= d;
-            wstrb   <= (others => '1');
-            wlast   <= '1';
+            wdata   <= bts(0);
+            wstrb   <= sts(0);
+            wlast   <= '1' when len = 0 else '0';
             wvalid  <= '1';
             bready  <= '1';
             loop
                 wait until rising_edge(aclk);
                 if awvalid = '1' and awready = '1' then awvalid <= '0'; aw_ok := true; end if;
-                if wvalid = '1' and wready = '1' then wvalid <= '0'; wlast <= '0'; w_ok := true; end if;
+                if wvalid = '1' and wready = '1' then
+                    wi := wi + 1;
+                    if wi > len then
+                        wvalid <= '0'; wlast <= '0';
+                    else
+                        wdata <= bts(wi); wstrb <= sts(wi);
+                        wlast <= '1' when wi = len else '0';
+                    end if;
+                end if;
                 exit when bvalid = '1' and bready = '1';
             end loop;
-            check(aw_ok and w_ok and bresp = "00", "stream_write handshake / BRESP");
+            check(aw_ok and wi > len and bresp = "00", "stream_write handshake / BRESP");
             bready <= '0';
             writes_done := writes_done + 1;
             wait until rising_edge(aclk);
@@ -398,6 +454,8 @@ begin
         variable strbs : strb_arr_t;
         variable n0, w0 : natural;
         variable n_idle : natural;
+        variable n_len  : natural;
+        constant C_SPARSE : std_logic_vector(63 downto 0) := x"F0F0_8001_0F0F_1234";
         variable t0     : time;
         constant G_WR_LINGER : natural := 256; -- mram_top default
     begin
@@ -412,9 +470,8 @@ begin
         check(mem.read(BOOT_BYTES) = x"EE", "boot copy wrote past its end");
         wr_step <= 1;
 
-        -- T3: full 64-byte write
-        beats(0) := mk_beat(1); strbs(0) := (others => '1');
-        axi_write(16#1000#, 0, 6, "01", beats, strbs, "00", true);
+        -- T3: 64-byte write (one beat at 512 bits, a burst on a narrower bus)
+        write_range(16#1000#, 64, 1, "00", true);
 
         -- T4: narrow 4-byte write at an offset inside the line
         beats(0) := mk_beat(2); strbs(0) := (others => '0'); strbs(0)(7 downto 4) := "1111";
@@ -422,19 +479,19 @@ begin
 
         -- T5: sparse, non-contiguous strobes on a full beat
         beats(0) := mk_beat(3);
-        strbs(0) := x"F0F0_8001_0F0F_1234";
-        axi_write(16#3000#, 0, 6, "01", beats, strbs, "00", true);
+        strbs(0) := C_SPARSE(BB - 1 downto 0);
+        axi_write(16#3000#, 0, SZM, "01", beats, strbs, "00", true);
 
         -- T5b: all strobes off -> nothing written, still OKAY
         beats(0) := mk_beat(9); strbs(0) := (others => '0');
-        axi_write(16#3040#, 0, 6, "01", beats, strbs, "00", true);
+        axi_write(16#3040#, 0, SZM, "01", beats, strbs, "00", true);
 
-        -- T6: 4-beat 64-byte INCR burst
+        -- T6: 4-beat full-width INCR burst -> one 4WQIO
         for b in 0 to 3 loop
             beats(b) := mk_beat(10 + b); strbs(b) := (others => '1');
         end loop;
         n0 := model_wr;
-        axi_write(16#4000#, 3, 6, "01", beats, strbs, "00", true);
+        axi_write(16#4000#, 3, SZM, "01", beats, strbs, "00", true);
         check(model_wr = n0 + 1, "4-beat burst took " & integer'image(model_wr - n0)
               & " 4WQIO, expected 1 (write continuation)");
 
@@ -452,28 +509,24 @@ begin
         wr_step <= 2;
 
         -- T8: protected region, locked then unlocked
-        beats(0) := mk_beat(40); strbs(0) := (others => '1');
         key_ok <= '0';
-        axi_write(SRC_BASE + 16#100#, 0, 6, "01", beats, strbs, "10", false);
+        write_range(SRC_BASE + 16#100#, 64, 40, "10", false);
         key_ok <= '1';
         for i in 1 to 4 loop wait until rising_edge(aclk); end loop; -- synchronizer
-        axi_write(SRC_BASE + 16#100#, 0, 6, "01", beats, strbs, "00", true);
+        write_range(SRC_BASE + 16#100#, 64, 40, "00", true);
         key_ok <= '0';
         for i in 1 to 4 loop wait until rising_edge(aclk); end loop;
-        beats(0) := mk_beat(41);
-        axi_write(SRC_BASE + 16#140#, 0, 6, "01", beats, strbs, "10", false);
+        write_range(SRC_BASE + 16#140#, 64, 41, "10", false);
 
         -- T11: FIXED burst rejected (all beats drained), next write still fine
         for b in 0 to 1 loop
             beats(b) := mk_beat(50 + b); strbs(b) := (others => '1');
         end loop;
-        axi_write(16#1100#, 1, 6, "00", beats, strbs, "10", false);
-        beats(0) := mk_beat(52); strbs(0) := (others => '1');
-        axi_write(16#1100#, 0, 6, "01", beats, strbs, "00", true);
+        axi_write(16#1100#, 1, SZM, "00", beats, strbs, "10", false);
+        write_range(16#1100#, 64, 52, "00", true);
 
         -- T13: upper AXI address bits (window base) must be ignored
-        beats(0) := mk_beat(55); strbs(0) := (others => '1');
-        axi_write(16#2000_1200#, 0, 6, "01", beats, strbs, "00", true);
+        write_range(16#2000_1200#, 64, 55, "00", true);
 
         -- T14: block-protect bits set over PCI -> write is accepted (OKAY)
         -- by AXI but does not change the MRAM ("write doesn't apply")
@@ -482,48 +535,46 @@ begin
         wr_paused <= true;
         if pci_step < 1 then wait until pci_step >= 1; end if;
         wr_paused <= false;
-        beats(0) := mk_beat(56); strbs(0) := (others => '1');
-        axi_write(16#3900#, 0, 6, "01", beats, strbs, "00", false);
+        write_range(16#3900#, 64, 56, "00", false);
         wr_t14_done <= true;
         if pci_step < 2 then wait until pci_step >= 2; end if; -- unprotected again
         wr_step <= 3;
 
-        -- T10: writes while the reader is streaming reads elsewhere
+        -- T10: writes while the reader is streaming reads elsewhere, each
+        -- with one disabled byte in its first beat
         for i in 0 to 7 loop
-            beats(0) := mk_beat(60 + i); strbs(0) := (others => '1');
-            strbs(0)(i) := '0';
-            axi_write(16#3800# + 64 * i, 0, 6, "01", beats, strbs, "00", true);
+            range_burst(16#3800# + 64 * i, 64, 60 + i, beats, strbs, n_len);
+            strbs(0)(i mod BB) := '0';
+            axi_write(16#3800# + 64 * i, n_len, SZM, "01", beats, strbs, "00", true);
         end loop;
 
         -- T15: WREN-once mode (CR1 WRENS=01 + skip_wren) set up over PCI.
         -- Includes the PCI bridge's pattern: a 64-byte INCR burst at a 0x20
-        -- offset that the interconnect packs into 2 beats of 64 bytes with
-        -- half strobes each -> must become ONE 4WQIO of 64 bytes.
+        -- offset (at 512 bits: 2 beats with half strobes) -> must become ONE
+        -- 4WQIO of 64 bytes.
         wr_paused2 <= true;
         if pci_step < 3 then wait until pci_step >= 3; end if;
         wr_paused2 <= false;
         n0 := model_wr; w0 := model_wren;
-        beats(0) := mk_beat(70); beats(1) := mk_beat(71);
-        strbs(0) := (others => '0'); strbs(0)(63 downto 32) := (others => '1');
-        strbs(1) := (others => '0'); strbs(1)(31 downto 0)  := (others => '1');
-        axi_write(16#17E0#, 1, 6, "01", beats, strbs, "00", true);
+        write_range(16#17E0#, 64, 70, "00", true);
         check(model_wr = n0 + 1, "0x20-offset burst took " & integer'image(model_wr - n0)
               & " 4WQIO, expected 1");
         for b in 0 to 3 loop
             beats(b) := mk_beat(72 + b); strbs(b) := (others => '1');
         end loop;
-        axi_write(16#1900#, 3, 6, "01", beats, strbs, "00", true);
+        axi_write(16#1900#, 3, SZM, "01", beats, strbs, "00", true);
         check(model_wr = n0 + 2, "4-beat burst in SRAM mode took "
               & integer'image(model_wr - n0 - 1) & " 4WQIO, expected 1");
         -- a hole in the strobes must split the write
         beats(0) := mk_beat(76); beats(1) := mk_beat(77);
         strbs(0) := (others => '1');
         strbs(1) := (others => '1'); strbs(1)(0) := '0';
-        axi_write(16#1A00#, 1, 6, "01", beats, strbs, "00", true);
+        axi_write(16#1A00#, 1, SZM, "01", beats, strbs, "00", true);
         check(model_wr = n0 + 4, "split burst: " & integer'image(model_wr - n0 - 2)
               & " 4WQIO, expected 2");
-        beats(0) := mk_beat(78); strbs(0) := x"0000_0000_FFFF_FFFF";
-        axi_write(16#1A80#, 0, 6, "01", beats, strbs, "00", true);
+        beats(0) := mk_beat(78); strbs(0) := (others => '0');
+        strbs(0)((BB + 1) / 2 - 1 downto 0) := (others => '1');
+        axi_write(16#1A80#, 0, SZM, "01", beats, strbs, "00", true);
         check(model_wren = w0, "skip_wren=1 but " & integer'image(model_wren - w0)
               & " WREN were sent");
         wr_t15_done <= true;
@@ -532,34 +583,34 @@ begin
         wr_paused2  <= false;
         w0 := model_wren;
         beats(0) := mk_beat(79); strbs(0) := (others => '1');
-        axi_write(16#1AC0#, 0, 6, "01", beats, strbs, "00", true);
+        axi_write(16#1AC0#, 0, SZM, "01", beats, strbs, "00", true);
         check(model_wren = w0 + 1, "normal mode: expected one WREN per write");
 
-        -- T16: separate single-beat AXI writes to contiguous addresses, each
-        -- issued right after the previous B (like the PCI bridge: 32-bit
-        -- INCR len 15 = 64 bytes, packed into one 64-byte beat). With posted
-        -- B they must stream into ONE 4WQIO. Then a pause longer than the
-        -- linger time must end it, and a non-contiguous write starts anew.
+        -- T16: separate 64-byte AXI write bursts to contiguous addresses,
+        -- each issued right after the previous B (like the PCI bridge).
+        -- With posted B they must stream into ONE 4WQIO. Then a pause longer
+        -- than the linger time must end it, and a non-contiguous write
+        -- starts anew.
         n0 := model_wr; w0 := model_wren;
         t0 := now;
         for i in 0 to 5 loop
-            stream_write(16#2400# + 64 * i, mk_beat(90 + i));
+            stream_write(16#2400# + 64 * i, 90 + 8 * i);
         end loop;
         while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
-        report "T16: 384 bytes in " & time'image(now - t0 - G_WR_LINGER * T_CLK)
+        report "T16: 384 bytes written in " & time'image(now - t0 - G_WR_LINGER * T_CLK)
                & " (excluding the final linger wait)";
         for i in 0 to 5 loop
-            for lane in 0 to 63 loop
-                check(mem.read(16#2400# + 64 * i + lane) = mk_beat(90 + i)(8 * lane + 7 downto 8 * lane),
-                      "T16 byte 0x" & to_hstring(to_unsigned(16#2400# + 64 * i + lane, 16)));
+            for j in 0 to 63 loop
+                check(mem.read(16#2400# + 64 * i + j) = range_byte(16#2400# + 64 * i, j, 90 + 8 * i),
+                      "T16 byte 0x" & to_hstring(to_unsigned(16#2400# + 64 * i + j, 16)));
             end loop;
         end loop;
         check(model_wr = n0 + 1, "T16: 6 contiguous transactions took "
               & integer'image(model_wr - n0) & " 4WQIO, expected 1");
         check(model_wren = w0 + 1, "T16: expected one WREN for the stream");
         n0 := model_wr;
-        stream_write(16#2580#, mk_beat(96));       -- contiguous, but after CS# rose
-        stream_write(16#2600#, mk_beat(97));       -- gap at 0x25C0: new write
+        stream_write(16#2580#, 150);               -- contiguous, but after CS# rose
+        stream_write(16#2600#, 160);               -- gap at 0x25C0: new write
         while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
         check(model_wr = n0 + 2, "T16: after the pause " & integer'image(model_wr - n0)
               & " 4WQIO, expected 2");
@@ -568,7 +619,7 @@ begin
         -- Needs a quiet bus: any read or register command ends the wait.
         if not (rd_t10_done and pci_finish) then wait until rd_t10_done and pci_finish; end if;
         n0 := model_wr;
-        stream_write(16#2700#, mk_beat(98));
+        stream_write(16#2700#, 170);
         n_idle := 0;
         for i in 1 to 2000 loop
             wait until rising_edge(aclk);
@@ -577,13 +628,11 @@ begin
         end loop;
         report "T16b: second write issued at " & time'image(now) & ", SCLK idle with CS# low: "
                & boolean'image(n_idle = 16);
-        stream_write(16#2740#, mk_beat(99));
+        stream_write(16#2740#, 180);
         while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
-        for i in 0 to 1 loop
-            for lane in 0 to 63 loop
-                check(mem.read(16#2700# + 64 * i + lane) = mk_beat(98 + i)(8 * lane + 7 downto 8 * lane),
-                      "T16b byte 0x" & to_hstring(to_unsigned(16#2700# + 64 * i + lane, 16)));
-            end loop;
+        for j in 0 to 63 loop
+            check(mem.read(16#2700# + j) = range_byte(16#2700#, j, 170), "T16b byte");
+            check(mem.read(16#2740# + j) = range_byte(16#2740#, j, 180), "T16b byte");
         end loop;
         check(model_wr = n0 + 1, "T16b: resume after linger took " & integer'image(model_wr - n0)
               & " 4WQIO, expected 1");
@@ -650,10 +699,10 @@ begin
                 check((rlast = '1') = (beat = len), "RLAST wrong on beat " & integer'image(beat));
                 if exp_resp = "00" then
                     ba := beat_addr(addr, sz, beat);
-                    lo := ba mod 64;
-                    hi := ((ba mod 64) / size_bytes(sz)) * size_bytes(sz) + size_bytes(sz);
+                    lo := ba mod BB;
+                    hi := ((ba mod BB) / size_bytes(sz)) * size_bytes(sz) + size_bytes(sz);
                     for lane in lo to hi - 1 loop
-                        a := (ba / 64) * 64 + lane;
+                        a := (ba / BB) * BB + lane;
                         check(rdata(8 * lane + 7 downto 8 * lane) = mem.read(a),
                               "read 0x" & to_hstring(to_unsigned(a, 32)) & " = "
                               & to_hstring(rdata(8 * lane + 7 downto 8 * lane))
@@ -670,50 +719,81 @@ begin
                   & ", expected " & integer'image(reads_done));
         end procedure;
 
+        -- n bytes from addr as one full-width INCR read burst
+        procedure read_range(addr, n : natural) is
+        begin
+            axi_read(addr, (addr + n - 1) / BB - addr / BB, SZM, "01", "00");
+        end procedure;
+
         variable t_issue : time;
+        variable n0      : natural;
+        variable t0, t1  : time;
     begin
         -- T12: read issued while the boot copy is still running
         wait until aresetn = '1';
         for i in 1 to 50 loop wait until rising_edge(aclk); end loop;
         check(boot_done = '0', "boot finished before the early read was issued");
         t_issue := now;
-        axi_read(16#0000#, 1, 6, "01", "00");
+        read_range(16#0000#, 128);
         -- boot_hold is '1': the AXI side is served while the copy is held off
         check(boot_done = '0' and model_wr = 0, "early read not served during boot_hold");
         early_rd_done <= true;
         report "early read (issued " & time'image(t_issue) & ") completed " & time'image(now);
 
         if wr_step < 2 then wait until wr_step >= 2; end if;
-        axi_read(16#1000#, 0, 6, "01", "00");      -- T3
+        read_range(16#1000#, 64);                 -- T3
         axi_read(16#2004#, 0, 2, "01", "00");      -- T4 narrow
-        axi_read(16#2000#, 0, 6, "01", "00");      -- T4 whole line
-        axi_read(16#3000#, 0, 6, "01", "00");      -- T5 sparse
-        axi_read(16#4000#, 3, 6, "01", "00");      -- T6 burst
+        read_range(16#2000#, 64);                 -- T4 whole line
+        read_range(16#3000#, 64);                 -- T5 sparse
+        axi_read(16#4000#, 3, SZM, "01", "00");    -- T6 burst
         axi_read(16#5002#, 3, 2, "01", "00");      -- T7 narrow unaligned burst
         axi_read(16#5030#, 3, 3, "01", "00");      -- T7b
         axi_read(16#5000#, 0, 0, "01", "00");      -- single byte
         axi_read(16#5001#, 0, 0, "01", "00");      -- single byte, odd lane
-        axi_read(16#1000#, 1, 6, "10", "10");      -- WRAP rejected, 2 SLVERR beats
-        axi_read(16#1000#, 0, 6, "01", "00");      -- still healthy afterwards
+        axi_read(16#1000#, 1, SZM, "10", "10");    -- WRAP rejected, 2 SLVERR beats
+        read_range(16#1000#, 64);                 -- still healthy afterwards
 
         if wr_step < 3 then wait until wr_step >= 3; end if;
-        axi_read(SRC_BASE + 16#100#, 0, 6, "01", "00"); -- T8: unlocked write landed
-        axi_read(SRC_BASE + 16#140#, 0, 6, "01", "00"); -- T8: locked write did not
-        axi_read(16#0000_1200#, 0, 6, "01", "00");      -- T13 via the offset
-        axi_read(16#4800_1200#, 0, 6, "01", "00");      -- T13 via another base
+        read_range(SRC_BASE + 16#100#, 64);      -- T8: unlocked write landed
+        read_range(SRC_BASE + 16#140#, 64);      -- T8: locked write did not
+        read_range(16#0000_1200#, 64);           -- T13 via the offset
+        read_range(16#4800_1200#, 64);           -- T13 via another base
 
         -- T10: stream reads while the writer works in another region
         for i in 0 to 15 loop
-            axi_read(16#1000# + 64 * (i mod 2), 0, 6, "01", "00");
+            read_range(16#1000# + 64 * (i mod 2), 64);
             axi_read(16#2004#, 0, 2, "01", "00");
         end loop;
         rd_t10_done <= true;
         if wr_step < 4 then wait until wr_step >= 4; end if;
         for i in 0 to 7 loop
-            axi_read(16#3800# + 64 * i, 0, 6, "01", "00");
+            read_range(16#3800# + 64 * i, 64);
         end loop;
-        axi_read(16#17C0#, 2, 6, "01", "00");      -- T15 0x20-offset burst
-        axi_read(16#1900#, 7, 6, "01", "00");      -- T15 bursts
+        read_range(16#17C0#, 192);                -- T15 0x20-offset burst
+        read_range(16#1900#, 512);                -- T15 bursts
+
+        -- T17: read streaming (writer and PCI are done: quiet bus).
+        -- Six 64-byte bursts back to back -> one RDQI; one 256-byte burst
+        -- -> one RDQI.
+        if cs_n = '0' then wait until cs_n = '1'; end if;
+        wait until rising_edge(aclk);  -- the model counts on CS# rising
+        n0 := model_rd;
+        t0 := now;
+        for i in 0 to 5 loop
+            read_range(16#2400# + 64 * i, 64);
+        end loop;
+        t1 := now;
+        if cs_n = '0' then wait until cs_n = '1'; end if;
+        wait until rising_edge(aclk);
+        report "T17: 384 bytes read in " & time'image(t1 - t0);
+        check(model_rd = n0 + 1, "T17: 6 contiguous read bursts took "
+              & integer'image(model_rd - n0) & " RDQI, expected 1");
+        n0 := model_rd;
+        read_range(16#2400#, 256);
+        if cs_n = '0' then wait until cs_n = '1'; end if;
+        wait until rising_edge(aclk);
+        check(model_rd = n0 + 1, "T17: 256-byte burst took "
+              & integer'image(model_rd - n0) & " RDQI, expected 1");
 
         report "reader done, " & integer'image(reads_done) & " reads, errors=" & integer'image(errs);
         rd_finish <= true;

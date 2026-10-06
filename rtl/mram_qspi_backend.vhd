@@ -68,8 +68,9 @@
 -- edge. The device holds each bit until tOH >= 1ns after the next falling
 -- edge, so at G_SCLK_HALF_PERIOD = 2 the useful range is about 1..3.
 --
--- Byte lanes: the byte at address A is carried in lane A(5:0) of wdata /
--- rdata (see mram_pkg). The lowest-address byte is sent / received first.
+-- Byte lanes: the byte at address A is carried in lane A(C_LANE_BITS-1:0)
+-- of wdata / rdata (see mram_pkg). The data path is one beat
+-- (C_AXI_DATA_WIDTH, >= 64 bits) wide. The lowest-address byte is sent / received first.
 --
 -- Register commands (reg_cmd_* ports, driven by mram_cmd_ctrl): WREN 06h,
 -- WRDI 04h, RDSR 05h, WRSR 01h, RDID 9Fh, RDAR 65h, WRAR 71h, all
@@ -100,6 +101,17 @@
 -- has ended. wr_pending = '1' while accepted write data has not reached the
 -- MRAM yet (check it before power-down or a reset of the MRAM).
 --
+-- Read streaming (G_STREAM_READS = true): a read request whose address is
+-- the next byte after the read being clocked in is accepted during its
+-- data phase and continues the same RDQI (no new opcode, address or
+-- latency). Each request's data is delivered (rvalid) as soon as its last
+-- nibble has been sampled; a small in-order queue holds the byte count and
+-- first lane of each read in flight. The requester must take every rvalid
+-- (axi4_slave_wrapper only issues reads it has buffer room for).
+-- G_RD_LINGER_CYCLES works as for writes: SCLK is stopped low with CS# low
+-- after a read chunk, waiting for the next contiguous read. The device has
+-- already put out the next nibble, which the next rising edge samples.
+--
 -- Linger (G_WR_LINGER_CYCLES > 0, posted writes only): when a write's data
 -- is done and no continuation is waiting, SCLK is stopped low with CS# kept
 -- low for up to G_WR_LINGER_CYCLES aclk cycles, waiting for the next
@@ -117,7 +129,7 @@
 -- Not implemented (documented scope):
 --   * RDFSR.
 --   * Driving the device RESET# pin (not on this entity's ports).
---   * Read prefetch / read streaming across consecutive core_req calls.
+--   * Read prefetch beyond what has been requested.
 --   * XIP mode (deliberately never entered: the mode byte is always Fxh).
 --   * Error/status reporting beyond core_resp.error tied low ('0').
 --
@@ -152,7 +164,9 @@ entity mram_qspi_backend is
         G_ACLK_FREQ_HZ      : natural := 150_000_000;  -- only used by the SCLK limit checks
         G_POSTED_WRITES     : boolean := true;   -- bvalid at acceptance (see header)
         G_STREAM_WRITES     : boolean := true;   -- append contiguous writes across transactions
-        G_WR_LINGER_CYCLES  : natural := 256     -- CS# low wait for the next write; 0 = off
+        G_WR_LINGER_CYCLES  : natural := 256;    -- CS# low wait for the next write; 0 = off
+        G_STREAM_READS      : boolean := true;   -- one RDQI for contiguous read requests
+        G_RD_LINGER_CYCLES  : natural := 256     -- CS# low wait for the next read; 0 = off
     );
     port (
         aclk    : in  std_logic;
@@ -198,7 +212,7 @@ architecture rtl of mram_qspi_backend is
     type state_t is (
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
-        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_WR_LINGER, S_CS_HOLD, S_DONE, S_CS_HIGH,
+        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_LINGER, S_CS_HOLD, S_DONE, S_CS_HIGH,
         S_REG_SETUP, S_REG_CMD, S_REG_WDATA, S_REG_DUMMY, S_REG_RDATA
     );
     signal state : state_t := S_IDLE;
@@ -218,13 +232,19 @@ architecture rtl of mram_qspi_backend is
 
     signal high_cnt    : natural range 0 to max(C_HIGH_WAIT_RD, C_HIGH_WAIT_WR) := 0;
 
-    -- Byte-order reversal of a 512-bit word: byte k <-> byte 63-k. Pure
-    -- wiring, no logic.
-    function byte_rev(v : std_logic_vector(511 downto 0)) return std_logic_vector is
-        variable r : std_logic_vector(511 downto 0);
+    -- Data-path width: the shift register holds one beat. Register
+    -- commands need the top 48 bits (WRAR), so the width must be >= 64.
+    constant W  : natural := C_AXI_DATA_WIDTH;
+    constant T  : natural := W - 1;
+    constant NB : natural := C_BEAT_BYTES;
+    constant LB : natural := C_LANE_BITS;
+
+    -- Byte-order reversal of a beat: byte k <-> byte NB-1-k. Pure wiring.
+    function byte_rev(v : std_logic_vector(T downto 0)) return std_logic_vector is
+        variable r : std_logic_vector(T downto 0);
     begin
-        for k in 0 to 63 loop
-            r(8 * (63 - k) + 7 downto 8 * (63 - k)) := v(8 * k + 7 downto 8 * k);
+        for k in 0 to NB - 1 loop
+            r(8 * (NB - 1 - k) + 7 downto 8 * (NB - 1 - k)) := v(8 * k + 7 downto 8 * k);
         end loop;
         return r;
     end function;
@@ -233,16 +253,16 @@ architecture rtl of mram_qspi_backend is
     signal req_addr32   : std_logic_vector(31 downto 0);
     signal req_we       : std_logic;
     signal req_nbytes   : unsigned(6 downto 0);
-    signal lane_offset  : unsigned(5 downto 0);
+    signal lane_offset  : unsigned(LB - 1 downto 0);
 
     -- Shared 512-bit shift register. During single-bit phases (WREN
-    -- opcode, main opcode) bit 511 is on IO0 and the register shifts by 1.
+    -- opcode, main opcode) bit T is on IO0 and the register shifts by 1.
     -- During quad phases (address, write data) the top 4 bits are on IO3..0
     -- and the register shifts by 4. Read data shifts in at the bottom.
-    signal shreg : std_logic_vector(511 downto 0);
+    signal shreg : std_logic_vector(T downto 0);
 
     -- Write data with the first byte (lane lane_offset) moved to the top.
-    signal tx_build : std_logic_vector(511 downto 0);
+    signal tx_build : std_logic_vector(T downto 0);
 
     -- SCLK rising edges still to come in the current phase.
     signal clks_left : integer range 0 to 128;
@@ -282,9 +302,26 @@ architecture rtl of mram_qspi_backend is
     signal cont_ok       : std_logic;
     signal skip_q1, skip_q2 : std_logic := '0';
     signal wr_accept     : std_logic;  -- a memory write is accepted this cycle
+    signal rd_accept     : std_logic;  -- a memory read is accepted this cycle
 
-    constant C_LINGER : boolean := G_POSTED_WRITES and G_WR_LINGER_CYCLES > 0;
-    signal linger_cnt : natural range 0 to G_WR_LINGER_CYCLES := 0;
+    constant C_WR_LINGER : boolean := G_POSTED_WRITES and G_WR_LINGER_CYCLES > 0;
+    constant C_RD_LINGER : boolean := G_STREAM_READS and G_RD_LINGER_CYCLES > 0;
+    signal linger_cnt : natural range 0 to max(G_WR_LINGER_CYCLES, G_RD_LINGER_CYCLES) := 0;
+
+    -- Read chunks in flight (accepted, data not yet delivered), in order:
+    -- byte count and first lane. The capture side delivers each chunk as
+    -- soon as its last nibble has been sampled.
+    constant C_DQ : natural := 4;
+    type dq_nb_t  is array (0 to C_DQ - 1) of unsigned(6 downto 0);
+    type dq_off_t is array (0 to C_DQ - 1) of unsigned(LB - 1 downto 0);
+    signal dq_nb    : dq_nb_t;
+    signal dq_off   : dq_off_t;
+    signal dq_wr, dq_rd : natural range 0 to C_DQ - 1 := 0;
+    signal dq_cnt   : natural range 0 to C_DQ := 0;
+    signal cap_cnt  : natural range 0 to 2 * NB := 0;   -- nibbles of the head chunk so far
+    signal chunk_done : std_logic := '0';
+    signal done_nb  : unsigned(6 downto 0);
+    signal done_off : unsigned(LB - 1 downto 0);
 
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
@@ -342,19 +379,23 @@ begin
     -- Accept combinationally whenever idle (see the mram_pkg contract).
     -- A continuation is taken while the current write still has at least
     -- one rising edge to go, so it can be loaded on the final falling edge.
-    -- In S_WR_LINGER the SCLK is stopped after a complete write; a
-    -- continuation is taken there too.
-    cont_ok <= '1' when ((state = S_DATA and clks_left >= 1) or state = S_WR_LINGER)
-                        and req_we = '1' and req_is_reg = '0' and join_pending = '0'
-                        and core_req.valid = '1' and core_req.we = '1'
-                        and (core_req.cont = '1' or G_STREAM_WRITES)
+    -- In S_LINGER the SCLK is stopped after a complete chunk; a
+    -- continuation is taken there too. Reads also need a free descriptor.
+    cont_ok <= '1' when ((state = S_DATA and clks_left >= 1) or state = S_LINGER)
+                        and req_is_reg = '0' and join_pending = '0'
+                        and core_req.valid = '1' and core_req.we = req_we
                         and unsigned('0' & core_req.addr) = next_addr
+                        and ((req_we = '1' and (core_req.cont = '1' or G_STREAM_WRITES)) or
+                             (req_we = '0' and G_STREAM_READS and dq_cnt < C_DQ - 1))
                else '0';
 
     core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else cont_ok;
 
     wr_accept <= '1' when (state = S_IDLE and reg_cmd_valid = '0' and core_req.valid = '1'
-                           and core_req.we = '1') or cont_ok = '1'
+                           and core_req.we = '1') or (cont_ok = '1' and core_req.we = '1')
+                 else '0';
+    rd_accept <= '1' when (state = S_IDLE and reg_cmd_valid = '0' and core_req.valid = '1'
+                           and core_req.we = '0') or (cont_ok = '1' and core_req.we = '0')
                  else '0';
 
     -- Accepted write data not yet in the MRAM: from acceptance until CS#
@@ -368,7 +409,9 @@ begin
     core_resp.error  <= '0';
 
     process (aclk)
-        variable v_off : natural range 0 to 63;
+        variable v_off  : natural range 0 to NB - 1;
+        variable v_push : boolean;
+        variable v_pop  : boolean;
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
@@ -380,6 +423,11 @@ begin
                 resp_bvalid <= '0';
                 reg_done_i  <= '0';
                 req_is_reg  <= '0';
+                dq_wr       <= 0;
+                dq_rd       <= 0;
+                dq_cnt      <= 0;
+                cap_cnt     <= 0;
+                chunk_done  <= '0';
             else
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
@@ -400,17 +448,56 @@ begin
                 if cont_ok = '1' then
                     join_pending <= '1';
                     join_nbytes  <= core_req.nbytes;
-                    v_off        := to_integer(unsigned(core_req.addr(5 downto 0)));
+                    v_off        := to_integer(unsigned(core_req.addr(LB - 1 downto 0)));
                     tx_build     <= std_logic_vector(shift_left(
                                         unsigned(byte_rev(core_req.wdata)), 8 * v_off));
                 end if;
                 cap_pipe <= cap_now & cap_pipe(0 to 6);
+
+                -- Read chunk bookkeeping: push on acceptance, pop when the
+                -- chunk's last nibble has been captured.
+                v_push := rd_accept = '1';
+                v_pop  := false;
+                if v_push then
+                    dq_nb(dq_wr)  <= core_req.nbytes;
+                    dq_off(dq_wr) <= unsigned(core_req.addr(LB - 1 downto 0));
+                    dq_wr         <= (dq_wr + 1) mod C_DQ;
+                end if;
+
+                chunk_done <= '0';
                 if cap_fire = '1' then
                     if req_is_reg = '1' then
                         reg_rx <= reg_rx(30 downto 0) & mram_io_i(1);
                     else
-                        shreg  <= shreg(507 downto 0) & mram_io_i;
+                        shreg  <= shreg(T-4 downto 0) & mram_io_i;
+                        if cap_cnt + 1 = 2 * to_integer(dq_nb(dq_rd)) then
+                            cap_cnt    <= 0;
+                            chunk_done <= '1';
+                            done_nb    <= dq_nb(dq_rd);
+                            done_off   <= dq_off(dq_rd);
+                            dq_rd      <= (dq_rd + 1) mod C_DQ;
+                            v_pop      := true;
+                        else
+                            cap_cnt <= cap_cnt + 1;
+                        end if;
                     end if;
+                end if;
+                if v_push and not v_pop then
+                    dq_cnt <= dq_cnt + 1;
+                elsif v_pop and not v_push then
+                    dq_cnt <= dq_cnt - 1;
+                end if;
+
+                -- Deliver a completed read chunk (the cycle after its last
+                -- nibble; the next capture is >= one SCLK period away).
+                -- Received bytes sit in shreg(8*n-1:0), first byte highest.
+                -- After byte_rev the first byte is in lane NB-n; shift it
+                -- down to its lane.
+                if chunk_done = '1' then
+                    resp_rdata  <= std_logic_vector(shift_right(
+                                       unsigned(byte_rev(shreg)),
+                                       8 * (NB - to_integer(done_nb) - to_integer(done_off))));
+                    resp_rvalid <= '1';
                 end if;
 
                 case state is
@@ -431,28 +518,28 @@ begin
                             req_we      <= '0'; -- selects the CS# high time afterwards
                             case reg_cmd_op is
                                 when REG_CMD_WREN =>
-                                    shreg(511 downto 504) <= G_OPCODE_WREN;
+                                    shreg(T downto T-7) <= G_OPCODE_WREN;
                                 when REG_CMD_WRDI =>
-                                    shreg(511 downto 504) <= G_OPCODE_WRDI;
+                                    shreg(T downto T-7) <= G_OPCODE_WRDI;
                                 when REG_CMD_RDSR =>
-                                    shreg(511 downto 504) <= G_OPCODE_RDSR;
+                                    shreg(T downto T-7) <= G_OPCODE_RDSR;
                                     reg_rd_bits <= 8;
                                 when REG_CMD_WRSR =>
-                                    shreg(511 downto 496) <= G_OPCODE_WRSR & reg_cmd_wdata;
+                                    shreg(T downto T-15) <= G_OPCODE_WRSR & reg_cmd_wdata;
                                     reg_wr_bits <= 8;
                                     req_we      <= '1';
                                 when REG_CMD_RDAR =>
-                                    shreg(511 downto 472) <= G_OPCODE_RDAR & x"000000" & reg_cmd_addr;
+                                    shreg(T downto T-39) <= G_OPCODE_RDAR & x"000000" & reg_cmd_addr;
                                     reg_wr_bits <= 32;
                                     reg_rd_bits <= 8;
                                     reg_dummy   <= G_DUMMY_CYCLES > 0;
                                 when REG_CMD_WRAR =>
-                                    shreg(511 downto 464) <= G_OPCODE_WRAR & x"000000" & reg_cmd_addr
+                                    shreg(T downto T-47) <= G_OPCODE_WRAR & x"000000" & reg_cmd_addr
                                                              & reg_cmd_wdata;
                                     reg_wr_bits <= 40;
                                     req_we      <= '1';
                                 when others => -- REG_CMD_RDID
-                                    shreg(511 downto 504) <= G_OPCODE_RDID;
+                                    shreg(T downto T-7) <= G_OPCODE_RDID;
                                     reg_rd_bits <= 32;
                             end case;
                             reg_rx    <= (others => '0');
@@ -466,12 +553,12 @@ begin
                             next_addr   <= resize(unsigned(core_req.addr), next_addr'length)
                                            + core_req.nbytes;
                             join_pending <= '0';
-                            lane_offset <= unsigned(core_req.addr(5 downto 0));
+                            lane_offset <= unsigned(core_req.addr(LB - 1 downto 0));
                             req_addr32  <= std_logic_vector(resize(unsigned(core_req.addr), 32));
 
                             -- Byte-reverse so lane 0 is at the top, then shift
-                            -- the first byte (lane addr(5:0)) up to bits 511:504.
-                            v_off    := to_integer(unsigned(core_req.addr(5 downto 0)));
+                            -- the first byte (lane addr(LB-1:0)) up to bits T:T-7.
+                            v_off    := to_integer(unsigned(core_req.addr(LB - 1 downto 0)));
                             tx_build <= std_logic_vector(shift_left(
                                             unsigned(byte_rev(core_req.wdata)), 8 * v_off));
 
@@ -492,7 +579,7 @@ begin
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
                             -- first opcode bit set up before the first edge
                             io_drive    <= "11" & '0' & G_OPCODE_WREN(7);
-                            shreg(511 downto 504) <= G_OPCODE_WREN(6 downto 0) & '0';
+                            shreg(T downto T-7) <= G_OPCODE_WREN(6 downto 0) & '0';
                             clks_left   <= 8;
                             io_oe       <= "1101"; -- drive IO0, IO2 (WP#), IO3 (HOLD#)
                             sclk_run    <= true;
@@ -512,8 +599,8 @@ begin
                                 gap_cnt   <= 0;
                                 state     <= S_WREN_GAP;
                             else
-                                io_drive(0) <= shreg(511);
-                                shreg       <= shreg(510 downto 0) & '0';
+                                io_drive(0) <= shreg(T);
+                                shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 
@@ -534,10 +621,10 @@ begin
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
                             if req_we = '1' then
                                 io_drive <= "11" & '0' & G_OPCODE_QUAD_WRITE(7);
-                                shreg(511 downto 504) <= G_OPCODE_QUAD_WRITE(6 downto 0) & '0';
+                                shreg(T downto T-7) <= G_OPCODE_QUAD_WRITE(6 downto 0) & '0';
                             else
                                 io_drive <= "11" & '0' & G_OPCODE_QUAD_READ(7);
-                                shreg(511 downto 504) <= G_OPCODE_QUAD_READ(6 downto 0) & '0';
+                                shreg(T downto T-7) <= G_OPCODE_QUAD_READ(6 downto 0) & '0';
                             end if;
                             clks_left <= 8;
                             io_oe     <= "1101";
@@ -554,13 +641,13 @@ begin
                             if clks_left = 0 then
                                 -- opcode done: first address nibble, quad drive
                                 io_drive  <= req_addr32(31 downto 28);
-                                shreg(511 downto 484) <= req_addr32(27 downto 0);
+                                shreg(T downto T-27) <= req_addr32(27 downto 0);
                                 io_oe     <= "1111";
                                 clks_left <= 8; -- 32 addr bits / 4 bits per clock
                                 state     <= S_ADDR;
                             else
-                                io_drive(0) <= shreg(511);
-                                shreg       <= shreg(510 downto 0) & '0';
+                                io_drive(0) <= shreg(T);
+                                shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 
@@ -571,12 +658,12 @@ begin
                             if clks_left = 0 then
                                 -- XIP mode byte, 2 quad clocks (Figure 19)
                                 io_drive  <= G_XIP_BYTE(7 downto 4);
-                                shreg(511 downto 508) <= G_XIP_BYTE(3 downto 0);
+                                shreg(T downto T-3) <= G_XIP_BYTE(3 downto 0);
                                 clks_left <= 2;
                                 state     <= S_XIP;
                             else
-                                io_drive <= shreg(511 downto 508);
-                                shreg    <= shreg(507 downto 0) & "0000";
+                                io_drive <= shreg(T downto T-3);
+                                shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
                         end if;
 
@@ -586,8 +673,8 @@ begin
                         elsif sclk_fall then
                             if clks_left = 0 then
                                 if req_we = '1' then
-                                    io_drive  <= tx_build(511 downto 508);
-                                    shreg     <= tx_build(507 downto 0) & "0000";
+                                    io_drive  <= tx_build(T downto T-3);
+                                    shreg     <= tx_build(T-4 downto 0) & "0000";
                                     clks_left <= 2 * to_integer(req_nbytes);
                                     state     <= S_DATA;
                                 elsif G_DUMMY_CYCLES = 0 then
@@ -600,8 +687,8 @@ begin
                                     state     <= S_DUMMY;
                                 end if;
                             else
-                                io_drive <= shreg(511 downto 508);
-                                shreg    <= shreg(507 downto 0) & "0000";
+                                io_drive <= shreg(T downto T-3);
+                                shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
                         end if;
 
@@ -618,47 +705,54 @@ begin
                         if sclk_rise then
                             clks_left <= clks_left - 1; -- read data: see cap_fire
                         elsif sclk_fall then
-                            if clks_left = 0 and req_we = '1' and join_pending = '1' then
-                                -- continue with the appended write, same CS#
-                                io_drive     <= tx_build(511 downto 508);
-                                shreg        <= tx_build(507 downto 0) & "0000";
+                            if clks_left = 0 and join_pending = '1' then
+                                -- continue with the appended chunk, same CS#
+                                if req_we = '1' then
+                                    io_drive <= tx_build(T downto T-3);
+                                    shreg    <= tx_build(T-4 downto 0) & "0000";
+                                end if;
                                 clks_left    <= 2 * to_integer(join_nbytes);
                                 next_addr    <= next_addr + join_nbytes;
                                 join_pending <= '0';
                                 if not G_POSTED_WRITES then
                                     resp_bvalid <= '1'; -- the previous write is complete
                                 end if;
-                            elsif clks_left = 0 and req_we = '1' and C_LINGER then
+                            elsif clks_left = 0 and ((req_we = '1' and C_WR_LINGER) or
+                                                     (req_we = '0' and C_RD_LINGER)) then
                                 -- SCLK stops low on this edge; wait for more
                                 sclk_run   <= false;
                                 linger_cnt <= 0;
-                                state      <= S_WR_LINGER;
+                                state      <= S_LINGER;
                             elsif clks_left = 0 then
                                 sclk_run  <= false;
                                 io_oe     <= (others => '0');
                                 setup_cnt <= 0;
                                 state     <= S_CS_HOLD;
                             elsif req_we = '1' then
-                                io_drive <= shreg(511 downto 508);
-                                shreg    <= shreg(507 downto 0) & "0000";
+                                io_drive <= shreg(T downto T-3);
+                                shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
                         end if;
 
-                    -- CS# low, SCLK stopped low after a complete write,
-                    -- waiting for a contiguous write (see header).
-                    when S_WR_LINGER =>
+                    -- CS# low, SCLK stopped low after a complete chunk,
+                    -- waiting for a contiguous one (see header). For a
+                    -- read the device already drives the next nibble.
+                    when S_LINGER =>
                         if join_pending = '1' then
                             -- accepted last cycle: resume, data set up half
                             -- an SCLK period before the first rising edge
-                            io_drive     <= tx_build(511 downto 508);
-                            shreg        <= tx_build(507 downto 0) & "0000";
+                            if req_we = '1' then
+                                io_drive <= tx_build(T downto T-3);
+                                shreg    <= tx_build(T-4 downto 0) & "0000";
+                            end if;
                             clks_left    <= 2 * to_integer(join_nbytes);
                             next_addr    <= next_addr + join_nbytes;
                             join_pending <= '0';
                             sclk_run     <= true;
                             state        <= S_DATA;
                         elsif cont_ok = '0' and (reg_cmd_valid = '1' or core_req.valid = '1'
-                                                 or linger_cnt >= G_WR_LINGER_CYCLES - 1) then
+                                  or (req_we = '1' and linger_cnt >= G_WR_LINGER_CYCLES - 1)
+                                  or (req_we = '0' and linger_cnt >= G_RD_LINGER_CYCLES - 1)) then
                             io_oe     <= (others => '0');
                             setup_cnt <= 0;
                             state     <= S_CS_HOLD;
@@ -689,16 +783,8 @@ begin
                             if not G_POSTED_WRITES then
                                 resp_bvalid <= '1';
                             end if;
-                        else
-                            -- Received bytes sit in shreg(8*n-1:0), first byte
-                            -- highest. After byte_rev the first byte is in
-                            -- lane 64-n; shift it down to lane lane_offset.
-                            resp_rdata  <= std_logic_vector(shift_right(
-                                               unsigned(byte_rev(shreg)),
-                                               8 * (64 - to_integer(req_nbytes)
-                                                       - to_integer(lane_offset))));
-                            resp_rvalid <= '1';
                         end if;
+                        -- read data is delivered per chunk (chunk_done)
                         high_cnt <= 0;
                         state    <= S_CS_HIGH;
 
@@ -718,8 +804,8 @@ begin
                     ------------------------------------------------------------
                     when S_REG_SETUP =>
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
-                            io_drive  <= "11" & '0' & shreg(511);
-                            shreg     <= shreg(510 downto 0) & '0';
+                            io_drive  <= "11" & '0' & shreg(T);
+                            shreg     <= shreg(T-1 downto 0) & '0';
                             clks_left <= 8;
                             io_oe     <= "1101"; -- IO1 is the device's SO
                             sclk_run  <= true;
@@ -734,8 +820,8 @@ begin
                         elsif sclk_fall then
                             if clks_left = 0 then
                                 if reg_wr_bits /= 0 then
-                                    io_drive(0) <= shreg(511);
-                                    shreg       <= shreg(510 downto 0) & '0';
+                                    io_drive(0) <= shreg(T);
+                                    shreg       <= shreg(T-1 downto 0) & '0';
                                     clks_left   <= reg_wr_bits;
                                     state       <= S_REG_WDATA;
                                 elsif reg_rd_bits /= 0 then
@@ -748,8 +834,8 @@ begin
                                     state     <= S_CS_HOLD;
                                 end if;
                             else
-                                io_drive(0) <= shreg(511);
-                                shreg       <= shreg(510 downto 0) & '0';
+                                io_drive(0) <= shreg(T);
+                                shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 
@@ -770,8 +856,8 @@ begin
                                     state     <= S_CS_HOLD;
                                 end if;
                             else
-                                io_drive(0) <= shreg(511);
-                                shreg       <= shreg(510 downto 0) & '0';
+                                io_drive(0) <= shreg(T);
+                                shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 

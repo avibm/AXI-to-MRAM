@@ -76,7 +76,9 @@ entity mram_top is
         G_CS_HIGH_WRITE_CYCLES : integer := 92;  -- tCS3 600ns at 150MHz
         G_POSTED_WRITES        : boolean := true; -- B as soon as the write data is held
         G_STREAM_WRITES        : boolean := true; -- one SPI write for contiguous AXI writes
-        G_WR_LINGER_CYCLES     : natural := 256   -- CS# low wait for the next write; 0 = off
+        G_WR_LINGER_CYCLES     : natural := 256;  -- CS# low wait for the next write; 0 = off
+        G_STREAM_READS         : boolean := true; -- one RDQI for contiguous reads
+        G_RD_LINGER_CYCLES     : natural := 256   -- CS# low wait for the next read; 0 = off
     );
     port (
         aclk    : in  std_logic;
@@ -303,7 +305,9 @@ begin
             G_CS_HIGH_WRITE_CYCLES => G_CS_HIGH_WRITE_CYCLES,
             G_POSTED_WRITES        => G_POSTED_WRITES,
             G_STREAM_WRITES        => G_STREAM_WRITES,
-            G_WR_LINGER_CYCLES     => G_WR_LINGER_CYCLES
+            G_WR_LINGER_CYCLES     => G_WR_LINGER_CYCLES,
+            G_STREAM_READS         => G_STREAM_READS,
+            G_RD_LINGER_CYCLES     => G_RD_LINGER_CYCLES
         )
         port map (
             aclk       => aclk,

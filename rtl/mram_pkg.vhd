@@ -5,8 +5,10 @@
 -- PolarFire (RTPF500TCG1509), behind the existing PF_SRAM_AHB_AXI-
 -- compatible AXI4 slave interface.
 --
--- AXI address/data/ID widths are fixed system constants that match the AXI
--- interconnect (32-bit address, 512-bit data, 5-bit ID). The MRAM itself
+-- AXI address/data/ID widths are system constants that match the AXI
+-- interconnect (32-bit address, 5-bit ID). The data width
+-- C_AXI_DATA_WIDTH is set here: 64 (default), 128, 256 or 512. Everything
+-- else (byte lanes, largest AxSIZE, request size) follows from it. The MRAM itself
 -- is addressed with C_MRAM_ADDR_WIDTH bits (128MB = one 1Gb die); the AXI
 -- wrapper uses only the low C_MRAM_ADDR_WIDTH bits of AxADDR, i.e. the
 -- byte offset inside this slave's 128MB window. Address decoding (which
@@ -22,12 +24,18 @@ use ieee.numeric_std.all;
 package mram_pkg is
 
     ----------------------------------------------------------------------------
-    -- System-fixed widths (match PF_SRAM_AHB_AXI)
+    -- System widths
     ----------------------------------------------------------------------------
     constant C_AXI_ADDR_WIDTH : integer := 32;                    -- matches the AXI interconnect
     constant C_MRAM_ADDR_WIDTH : integer := 27;                   -- 128MB usable MRAM space
-    constant C_AXI_DATA_WIDTH : integer := 512;                   -- 512-bit AXI data bus
-    constant C_AXI_STRB_WIDTH : integer := C_AXI_DATA_WIDTH / 8;  -- 64
+    constant C_AXI_DATA_WIDTH : integer := 64;                    -- 64, 128, 256 or 512
+    constant C_AXI_STRB_WIDTH : integer := C_AXI_DATA_WIDTH / 8;
+    constant C_BEAT_BYTES     : integer := C_AXI_DATA_WIDTH / 8;  -- bytes per data beat
+    -- log2(C_BEAT_BYTES): byte-lane address bits, and the largest AxSIZE
+    constant C_LANE_BITS      : integer := 3 * boolean'pos(C_BEAT_BYTES = 8)
+                                         + 4 * boolean'pos(C_BEAT_BYTES = 16)
+                                         + 5 * boolean'pos(C_BEAT_BYTES = 32)
+                                         + 6 * boolean'pos(C_BEAT_BYTES = 64);
     constant C_AXI_LEN_WIDTH  : integer := 8;                     -- AXI4 AWLEN/ARLEN
     constant C_AXI_ID_WIDTH   : integer := 5;                     -- matches the AXI interconnect
 
@@ -37,11 +45,12 @@ package mram_pkg is
     -- Core-side request/response interface between the AXI wrapper, the
     -- boot-copy sequencer, the write guard, and the MRAM backend.
     --
-    -- A request moves core_req.nbytes bytes (1 to 64) starting at byte
-    -- address core_req.addr. The whole request must lie inside one 64-byte
-    -- aligned window: addr(5:0) + nbytes <= 64. Data is lane-aligned: the
-    -- byte at address A travels in byte lane A(5:0) of wdata/rdata, exactly
-    -- as on the AXI data bus. There is no byte strobe on this interface --
+    -- A request moves core_req.nbytes bytes (1 to C_BEAT_BYTES) starting at
+    -- byte address core_req.addr. The whole request must lie inside one
+    -- C_BEAT_BYTES-aligned window: addr(C_LANE_BITS-1:0) + nbytes <=
+    -- C_BEAT_BYTES. Data is lane-aligned: the byte at address A travels in
+    -- byte lane A(C_LANE_BITS-1:0) of wdata/rdata, exactly as on the AXI
+    -- data bus. There is no byte strobe on this interface --
     -- every one of the nbytes bytes is written. axi4_slave_wrapper turns
     -- AXI WSTRB into one request per contiguous run of enabled bytes.
     --
@@ -56,6 +65,11 @@ package mram_pkg is
     --     previously accepted read/write completes, in the order requests
     --     were accepted (in-order completion). resp.error qualifies the
     --     rvalid/bvalid pulse it accompanies.
+    --   * Requesters may present the next request before the previous one
+    --     has completed (the backend then streams contiguous accesses, see
+    --     mram_qspi_backend). A requester must be able to take every
+    --     rvalid/bvalid it has requests outstanding for: there is no
+    --     back-pressure on rvalid/bvalid.
     ----------------------------------------------------------------------------
     -- cont = '1' marks a write that directly follows the previous write
     -- (addr = previous addr + nbytes). The backend may then append its data
@@ -66,7 +80,7 @@ package mram_pkg is
         valid  : std_logic;
         addr   : std_logic_vector(C_MRAM_ADDR_WIDTH - 1 downto 0); -- first byte address (MRAM)
         we     : std_logic;                                        -- '1' = write, '0' = read
-        nbytes : unsigned(6 downto 0);                             -- 1..64 bytes
+        nbytes : unsigned(6 downto 0);                             -- 1..C_BEAT_BYTES
         wdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);  -- lane-aligned
         cont   : std_logic;                                        -- see above
     end record;
@@ -78,13 +92,15 @@ package mram_pkg is
     constant SIZE_8B  : std_logic_vector(2 downto 0) := "011";
     constant SIZE_16B : std_logic_vector(2 downto 0) := "100";
     constant SIZE_32B : std_logic_vector(2 downto 0) := "101";
-    constant SIZE_64B : std_logic_vector(2 downto 0) := "110"; -- full AXI beat width
+    constant SIZE_64B : std_logic_vector(2 downto 0) := "110";
+    constant SIZE_BEAT : std_logic_vector(2 downto 0) :=
+        std_logic_vector(to_unsigned(C_LANE_BITS, 3));              -- full AXI beat width
 
     constant CORE_REQ_IDLE : core_req_t := (
         valid  => '0',
         addr   => (others => '0'),
         we     => '0',
-        nbytes => to_unsigned(64, 7),
+        nbytes => to_unsigned(C_BEAT_BYTES, 7),
         wdata  => (others => '0'),
         cont   => '0'
     );

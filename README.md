@@ -9,15 +9,32 @@ guard for the protected region.
 | Path | Contents |
 |------|----------|
 | `rtl/mram_pkg.vhd` | Shared constants and the internal `core_req` / `core_resp` interface |
-| `rtl/axi4_slave_wrapper.vhd` | AXI4 slave: bursts → single core requests (INCR, 1–64 B beats, WSTRB) |
+| `rtl/axi4_slave_wrapper.vhd` | AXI4 slave: bursts → core requests (INCR, narrow and full-width beats, WSTRB); reads issued ahead for streaming |
 | `rtl/mram_boot_copy.vhd` | Copies and verifies the boot image, holds the CPU in reset until done |
 | `rtl/mram_cmd_ctrl.vhd` | PCI-driven MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID, RDAR, WRAR) with clock-domain crossing |
 | `rtl/mram_write_guard.vhd` | Blocks writes to the protected region unless `key_ok` |
-| `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous writes merged) |
+| `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous reads and writes streamed) |
 | `rtl/mram_top.vhd` | Top level |
 | `sim/` | Behavioural QSPI MRAM model, self-checking testbench, GHDL run script |
 | `doc/MRAM_Subsystem_IP_Specification.pdf` | IP specification |
 | `doc/REVIEW.md` | Design review: bugs found and fixed, open items, spec errata |
+
+## Data width
+
+`C_AXI_DATA_WIDTH` in `rtl/mram_pkg.vhd` sets the AXI data width: **64
+(default)**, 128, 256 or 512. Everything else follows from it: byte lanes,
+largest AxSIZE, request size. The testbench passes at 64, 128 and 512.
+
+The width does not limit speed: the MRAM tops out at ≈ 18.75 MB/s, and a
+64-bit bus at 150 MHz carries far more. A narrower data path is much
+smaller. In a rough GHDL synthesis count (not Libero), the 64-bit build has
+about 1,850 register bits against about 5,900 for the previous 512-bit
+build, before TMR. The large 512-bit byte shifters shrink by a similar
+factor. Check the Libero resource report for real numbers.
+
+Interconnect: the MRAM target port must be configured for the same width.
+The PCI bridge's 32-bit bursts are then packed into 64-bit beats, and
+NOEL-V's 64-bit port needs no conversion.
 
 ## MRAM register commands (bring-up / debug)
 
@@ -55,6 +72,23 @@ clears the WREN bit when a write completes. A PCI WREN → WRSR sequence
 therefore only works while no memory writes are running: for example with
 `boot_hold` = 1, or with AXI writers idle. Check with RDSR afterwards.
 
+### Read streaming
+
+Contiguous reads become **one** RDQI (EBh) transaction, without a new
+opcode, address or 8 latency clocks per beat. This holds both within a
+burst and across back-to-back AR bursts. The wrapper issues beat reads
+ahead of the R channel, up to a 4-beat read buffer. The backend appends
+each contiguous read to the running RDQI and returns each beat as soon as
+its last nibble is in. Generics: `G_STREAM_READS` (default on) and
+`G_RD_LINGER_CYCLES` (default 256). After a read, SCLK stops and CS#
+stays low for up to that long, waiting for the next contiguous read; any
+other access ends the wait at once. Same assumption about pausing SCLK as
+for writes, below.
+
+Measured in simulation at 64 bits, six back-to-back 64-byte read bursts:
+384 bytes in 21.6 µs, ≈ 17.8 MB/s, as one RDQI. Without streaming, each
+8-byte beat would be its own RDQI (≈ 7 MB/s, my estimate).
+
 ### Write speed: streaming, merged writes and WREN-once mode
 
 **Streaming across AXI transactions (default on).** Contiguous writes go
@@ -82,17 +116,17 @@ it work:
   still works whenever the next write arrives before the current one has
   finished.
 
-Measured in simulation, back-to-back 64-byte single-beat writes: 384 bytes
-in 21.3 µs, ≈ 18 MB/s. The Identify capture of the current hardware
+Measured in simulation, back-to-back 64-byte write bursts: 384 bytes in
+21.3 µs, ≈ 18 MB/s (same at 64 and 512 bits). The Identify capture of the current hardware
 (`mram_wr.vcd`) shows ≈ 5.4 µs per 64 bytes, ≈ 11.8 MB/s. The ceiling at
 37.5 MHz SCLK is 18.75 MB/s (2 SCLK per byte); going higher needs a
 faster SCLK, i.e. an aclk other than 150 MHz, since 150 / 4 = 37.5 MHz and
 150 / 2 = 75 MHz is above the 54 MHz limit.
 
 **Merged writes within a burst.** The contiguous strobe runs of one AXI
-write burst also go out as one D2h write. For example, a 64-byte burst at a
-0x20 offset arrives as 2 beats with 32 strobes each and becomes one 64-byte
-4WQIO. A gap in the strobes or a FIXED burst ends the MRAM write.
+write burst also go out as one D2h write: at 64 bits, a 64-byte burst of 8
+beats is one 4WQIO. A gap in the strobes or a FIXED burst ends the MRAM
+write.
 
 **WREN-once mode** saves the WREN instruction and the 600 ns CS# high
 time after it on every write. Datasheet Table 23: CR1[1:0] WRENS = 01

@@ -207,6 +207,35 @@ Testbench T16/T16b check:
 Switching off each of the three generics makes T16 or T16b fail. Measured
 in simulation: ≈ 18 MB/s, against ≈ 11.8 MB/s in the capture.
 
+### Rev. 8 – 64-bit data path, read streaming
+
+* `C_AXI_DATA_WIDTH` (mram_pkg) is now a design constant, default 64:
+  * the backend shift register, write-data and read-data alignment, the
+    wrapper's strobe handling and the AxSIZE limit all follow from it;
+  * 128/256/512 still work.
+
+  Rough register count (GHDL synthesis, not Libero), before TMR:
+  * about 1,850 bits at 64 bits;
+  * about 5,900 bits for the previous 512-bit build.
+* Read streaming:
+  * **Wrapper:** the read engine was rewritten. An issue engine sends beat
+    reads ahead of the R channel, bounded by a 4-beat read-data buffer.
+    Error bursts (WRAP/FIXED/oversize) still return SLVERR beats in order.
+  * **Backend:** contiguous reads continue the running RDQI. Per-request
+    data is delivered from the capture side through a small in-order queue
+    of read sizes. Linger applies to reads as to writes.
+* Boot copy: it moves `G_BLOCK_BYTES` (64) blocks as back-to-back
+  beat-sized requests. Each block is one streamed read and one streamed
+  write, so a boot takes about as long as before at any width. The verify
+  pass compares each destination beat with the buffered source block.
+* Testbench:
+  * now width-generic: 64-byte transfers are full-width bursts;
+  * new T17: six back-to-back read bursts make 1 RDQI, and one 256-byte
+    burst makes 1 RDQI. Turning off `G_STREAM_READS` or
+    `G_RD_LINGER_CYCLES` makes it fail;
+  * passes at 64, 128 and 512 bits and with sample delays 1–3;
+  * spot checks of the `rd_sample_dly` table still match.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,
