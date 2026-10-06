@@ -1,17 +1,15 @@
 --------------------------------------------------------------------------------
 -- axi4_slave_wrapper.vhd
 --
--- AXI4 slave front end for the MRAM subsystem. Presents the same AXI4 slave
--- interface as the existing PF_SRAM_AHB_AXI block (512-bit read/write data)
--- so software and the AXI interconnect require no changes. Translates AXI
+-- AXI4 slave front end for the MRAM subsystem. The data width is
+-- C_AXI_DATA_WIDTH from mram_pkg (default 64 bits). Translates AXI
 -- transactions into single-beat core_req_t/core_resp_t requests (see
 -- mram_pkg) to be serviced directly by the MRAM backend, with no
 -- cache in the path.
 --
--- AWSIZE/ARSIZE 0..6 (1..64 bytes) are supported, so narrow accesses (e.g.
--- the small random reads/writes typical of this workload) are serviced
--- without moving a full 512-bit word each time. AxSIZE = 7 (128 bytes)
--- exceeds this bus width and is rejected with SLVERR.
+-- AWSIZE/ARSIZE 0..C_LANE_BITS (1 byte .. the bus width) are supported, so
+-- narrow accesses are serviced without moving a full word each time.
+-- Larger sizes exceed the bus width and are rejected with SLVERR.
 --
 -- Writes honour WSTRB: each W beat becomes one core write per contiguous
 -- run of enabled byte lanes (restricted to the lanes the beat's address
@@ -27,8 +25,8 @@
 --   * AxSIZE is fixed for the whole burst per AXI4 semantics; this design
 --     relies on that (captures size once at AW/AR acceptance and reuses it
 --     for every beat's address increment in that burst).
---   * Beats within a burst are serviced strictly in order, one at a time
---     (no write pipelining, no read pipelining within a burst).
+--   * Beats are serviced strictly in order. Reads are issued ahead of the
+--     R channel (see "Read streaming" below); writes up to two runs ahead.
 --   * Read bursts may be outstanding at the AR-channel level, up to
 --     G_MAX_OUTSTANDING, but data is returned strictly in the order the
 --     bursts were accepted (in-order completion).
@@ -48,6 +46,13 @@
 -- backend appends it to the SPI write still in progress (one WREN, opcode
 -- and address for the whole run of contiguous bytes); otherwise it is
 -- served as a separate write. At most two writes are outstanding.
+--
+-- Read streaming: an issue engine walks the accepted AR bursts and issues
+-- one core read per beat (the beat's size-aligned container) as long as
+-- the read-data buffer (C_RBUF beats) has room for every read in flight,
+-- without waiting for the R channel. Contiguous beats, also across
+-- consecutive bursts, therefore reach the backend back to back and are
+-- read in one RDQI. R data is returned in order from the buffer.
 --
 -- Core-side arbitration: the write and read engines each hold their request
 -- until accepted. Writes win when both are presented; ready is routed only
@@ -125,8 +130,11 @@ end entity axi4_slave_wrapper;
 
 architecture rtl of axi4_slave_wrapper is
 
-    -- 2**size bytes for an AXI-style 3-bit AxSIZE field (0..6 valid on this
-    -- 64-byte-wide bus; 7 is rejected before any of these are used).
+    constant LB : natural := C_LANE_BITS;
+    constant NB : natural := C_BEAT_BYTES;
+
+    -- 2**size bytes for an AXI-style 3-bit AxSIZE field (0..LB valid on
+    -- this bus; larger sizes are rejected before any of these are used).
     function beat_bytes(sz : std_logic_vector(2 downto 0)) return natural is
     begin
         return to_integer(shift_left(to_unsigned(1, 8), to_integer(unsigned(sz))));
@@ -136,7 +144,7 @@ architecture rtl of axi4_slave_wrapper is
     function next_beat_addr(a : unsigned; sz : std_logic_vector(2 downto 0)) return unsigned is
         variable r : unsigned(a'length - 1 downto 0) := a;
     begin
-        r(5 downto 0) := r(5 downto 0) and not to_unsigned(beat_bytes(sz) - 1, 6);
+        r(LB - 1 downto 0) := r(LB - 1 downto 0) and not to_unsigned(beat_bytes(sz) - 1, LB);
         return r + beat_bytes(sz);
     end function;
 
@@ -144,21 +152,21 @@ architecture rtl of axi4_slave_wrapper is
     function align_down(a : unsigned; sz : std_logic_vector(2 downto 0)) return unsigned is
         variable r : unsigned(a'length - 1 downto 0) := a;
     begin
-        r(5 downto 0) := r(5 downto 0) and not to_unsigned(beat_bytes(sz) - 1, 6);
+        r(LB - 1 downto 0) := r(LB - 1 downto 0) and not to_unsigned(beat_bytes(sz) - 1, LB);
         return r;
     end function;
 
-    -- Byte lanes a write beat may touch: from lane addr(5:0) up to the end
-    -- of the size-aligned container.
-    function beat_lanes(a6 : unsigned(5 downto 0); sz : std_logic_vector(2 downto 0))
+    -- Byte lanes a write beat may touch: from lane addr(LB-1:0) up to the
+    -- end of the size-aligned container.
+    function beat_lanes(a6 : unsigned(LB - 1 downto 0); sz : std_logic_vector(2 downto 0))
         return std_logic_vector is
-        variable m  : std_logic_vector(63 downto 0) := (others => '0');
-        variable lo : natural range 0 to 63;
-        variable hi : natural range 1 to 64;
+        variable m  : std_logic_vector(NB - 1 downto 0) := (others => '0');
+        variable lo : natural range 0 to NB - 1;
+        variable hi : natural range 1 to NB;
     begin
         lo := to_integer(a6);
-        hi := to_integer(a6 and not to_unsigned(beat_bytes(sz) - 1, 6)) + beat_bytes(sz);
-        for i in 0 to 63 loop
+        hi := to_integer(a6 and not to_unsigned(beat_bytes(sz) - 1, LB)) + beat_bytes(sz);
+        for i in 0 to NB - 1 loop
             if i >= lo and i < hi then
                 m(i) := '1';
             end if;
@@ -186,7 +194,7 @@ architecture rtl of axi4_slave_wrapper is
     signal wr_state      : wr_state_t := WR_IDLE;
     signal wr_id         : std_logic_vector(G_ID_WIDTH - 1 downto 0);
     signal wr_addr       : unsigned(C_AXI_ADDR_WIDTH - 1 downto 0);
-    signal wr_size       : std_logic_vector(2 downto 0) := SIZE_64B;
+    signal wr_size       : std_logic_vector(2 downto 0) := SIZE_BEAT;
     signal wr_beats_left : unsigned(C_AXI_LEN_WIDTH downto 0); -- one extra bit of headroom
     signal wr_error      : std_logic := '0';
     signal wr_core_error : std_logic := '0';
@@ -209,16 +217,19 @@ architecture rtl of axi4_slave_wrapper is
     signal run_end   : natural range 0 to C_AXI_STRB_WIDTH;
 
     ----------------------------------------------------------------------------
-    -- Read side: small outstanding-burst tracking FIFO (single process drives
-    -- all of rd_fifo / rd_fifo_count / rd_head_ptr / rd_tail_ptr to avoid
-    -- multiple-driver conflicts).
+    -- Read side: outstanding-burst FIFO (one process drives all of it).
+    -- An issue engine walks the bursts and issues one core read per beat,
+    -- ahead of the R channel, as long as the read-data buffer has room for
+    -- every read in flight. Contiguous beats (also of consecutive bursts)
+    -- reach the backend back to back and are streamed in one RDQI.
     ----------------------------------------------------------------------------
     type rd_entry_t is record
         id         : std_logic_vector(G_ID_WIDTH - 1 downto 0);
         addr       : unsigned(C_AXI_ADDR_WIDTH - 1 downto 0);
         size       : std_logic_vector(2 downto 0);
-        beats_left : unsigned(C_AXI_LEN_WIDTH downto 0);
+        beats_left : unsigned(C_AXI_LEN_WIDTH downto 0); -- beats still to output on R
         error      : std_logic;
+        started    : std_logic;                          -- taken by the issue engine
     end record;
 
     type rd_fifo_array_t is array (0 to G_MAX_OUTSTANDING - 1) of rd_entry_t;
@@ -228,19 +239,30 @@ architecture rtl of axi4_slave_wrapper is
     signal rd_head_ptr   : integer range 0 to G_MAX_OUTSTANDING - 1 := 0;
     signal rd_tail_ptr   : integer range 0 to G_MAX_OUTSTANDING - 1 := 0;
 
-    type rd_state_t is (RD_IDLE, RD_ISSUE, RD_WAIT_RVALID, RD_OUTPUT);
-    signal rd_state : rd_state_t := RD_IDLE;
-
     signal rd_fifo_full  : std_logic;
-    signal rd_fifo_empty : std_logic;
     signal rd_core_req_o : core_req_t := CORE_REQ_IDLE;
     signal rd_ready      : std_logic;
-    signal rd_beat_error : std_logic := '0';
+
+    -- Issue engine
+    signal is_ptr    : integer range 0 to G_MAX_OUTSTANDING - 1 := 0;
+    signal is_avail  : integer range 0 to G_MAX_OUTSTANDING := 0; -- pushed, not yet taken
+    signal is_active : std_logic := '0';
+    signal is_addr   : unsigned(C_AXI_ADDR_WIDTH - 1 downto 0);
+    signal is_size   : std_logic_vector(2 downto 0);
+    signal is_left   : unsigned(C_AXI_LEN_WIDTH downto 0);       -- beats still to issue
+
+    -- Read data buffer: core reads in flight + buffered beats <= C_RBUF
+    constant C_RBUF : natural := 4;
+    type rbuf_t is array (0 to C_RBUF - 1) of std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    signal rbuf      : rbuf_t;
+    signal rbuf_err  : std_logic_vector(C_RBUF - 1 downto 0);
+    signal rb_wr, rb_rd : integer range 0 to C_RBUF - 1 := 0;
+    signal rb_cnt    : integer range 0 to C_RBUF := 0;
+    signal rd_infl   : integer range 0 to C_RBUF := 0;
 
 begin
 
     rd_fifo_full  <= '1' when rd_fifo_count = G_MAX_OUTSTANDING else '0';
-    rd_fifo_empty <= '1' when rd_fifo_count = 0                else '0';
 
     ----------------------------------------------------------------------------
     -- Core request arbiter (combinational mux, fixed write priority --
@@ -301,7 +323,7 @@ begin
                             wr_beats_left <= resize(unsigned(s_axi_awlen), wr_beats_left'length) + 1;
                             wr_core_error <= '0';
                             wr_chain      <= '0';
-                            if s_axi_awburst /= AXI_BURST_INCR or unsigned(s_axi_awsize) > 6 then
+                            if s_axi_awburst /= AXI_BURST_INCR or unsigned(s_axi_awsize) > LB then
                                 wr_error     <= '1';
                                 s_axi_wready <= '1';
                                 wr_state     <= WR_ERR_DRAIN;
@@ -326,7 +348,7 @@ begin
                         if s_axi_wvalid = '1' then
                             s_axi_wready <= '1';
                             wr_data      <= s_axi_wdata;
-                            wr_mask      <= s_axi_wstrb and beat_lanes(wr_addr(5 downto 0), wr_size);
+                            wr_mask      <= s_axi_wstrb and beat_lanes(wr_addr(LB - 1 downto 0), wr_size);
                             wr_first_run <= '1';
                             wr_state     <= WR_BEAT;
                         end if;
@@ -360,8 +382,8 @@ begin
                             -- issue the lowest contiguous run of enabled bytes
                             wr_core_req_o.valid  <= '1';
                             wr_core_req_o.we     <= '1';
-                            wr_core_req_o.addr   <= std_logic_vector(wr_addr(C_MRAM_ADDR_WIDTH - 1 downto 6))
-                                                    & std_logic_vector(to_unsigned(run_first, 6));
+                            wr_core_req_o.addr   <= std_logic_vector(wr_addr(C_MRAM_ADDR_WIDTH - 1 downto LB))
+                                                    & std_logic_vector(to_unsigned(run_first, LB));
                             wr_core_req_o.nbytes <= to_unsigned(run_end - run_first, 7);
                             wr_core_req_o.wdata  <= wr_data;
                             wr_core_req_o.cont   <= wr_chain and wr_first_run;
@@ -413,116 +435,140 @@ begin
     s_axi_arready <= not rd_fifo_full and aresetn;
 
     process (aclk)
-        variable v_push : boolean;
-        variable v_pop  : boolean;
+        variable v_push  : boolean;  -- AR accepted into the FIFO
+        variable v_pop   : boolean;  -- head burst fully output
+        variable v_take  : boolean;  -- issue engine takes an entry
+        variable v_infl  : integer range 0 to C_RBUF + 1;
+        variable v_rbcnt : integer range 0 to C_RBUF + 1;
+        variable v_load  : boolean;
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
                 rd_fifo_count <= 0;
                 rd_head_ptr   <= 0;
                 rd_tail_ptr   <= 0;
-                rd_state      <= RD_IDLE;
+                is_ptr        <= 0;
+                is_avail      <= 0;
+                is_active     <= '0';
+                rb_wr         <= 0;
+                rb_rd         <= 0;
+                rb_cnt        <= 0;
+                rd_infl       <= 0;
                 s_axi_rvalid  <= '0';
                 rd_core_req_o <= CORE_REQ_IDLE;
             else
-                v_push := (s_axi_arvalid = '1') and (s_axi_arready = '1');
-                v_pop  := (rd_state = RD_OUTPUT) and (s_axi_rvalid = '1') and (s_axi_rready = '1')
-                          and (rd_fifo(rd_head_ptr).beats_left = 1);
+                v_push  := (s_axi_arvalid = '1') and (s_axi_arready = '1');
+                v_pop   := false;
+                v_take  := false;
+                v_infl  := rd_infl;
+                v_rbcnt := rb_cnt;
 
-                -- Push: accept a new AR burst into the tail of the FIFO
+                -- AR: push a new burst at the tail
                 if v_push then
-                    rd_fifo(rd_tail_ptr).id   <= s_axi_arid;
-                    rd_fifo(rd_tail_ptr).addr <= unsigned(s_axi_araddr);
-                    rd_fifo(rd_tail_ptr).size <= s_axi_arsize;
+                    rd_fifo(rd_tail_ptr).id      <= s_axi_arid;
+                    rd_fifo(rd_tail_ptr).addr    <= unsigned(s_axi_araddr);
+                    rd_fifo(rd_tail_ptr).size    <= s_axi_arsize;
+                    rd_fifo(rd_tail_ptr).started <= '0';
                     rd_fifo(rd_tail_ptr).beats_left <=
                         resize(unsigned(s_axi_arlen), C_AXI_LEN_WIDTH + 1) + 1;
-                    if s_axi_arburst /= AXI_BURST_INCR or unsigned(s_axi_arsize) > 6 then
+                    if s_axi_arburst /= AXI_BURST_INCR or unsigned(s_axi_arsize) > LB then
                         rd_fifo(rd_tail_ptr).error <= '1';
                     else
                         rd_fifo(rd_tail_ptr).error <= '0';
                     end if;
+                    rd_tail_ptr <= (rd_tail_ptr + 1) mod G_MAX_OUTSTANDING;
+                end if;
 
-                    if rd_tail_ptr = G_MAX_OUTSTANDING - 1 then
-                        rd_tail_ptr <= 0;
+                -- Core read data -> buffer
+                if core_resp.rvalid = '1' then
+                    rbuf(rb_wr)     <= core_resp.rdata;
+                    rbuf_err(rb_wr) <= core_resp.error;
+                    rb_wr           <= (rb_wr + 1) mod C_RBUF;
+                    v_infl  := v_infl - 1;
+                    v_rbcnt := v_rbcnt + 1;
+                end if;
+
+                ----------------------------------------------------------------
+                -- Issue engine
+                ----------------------------------------------------------------
+                if is_active = '0' then
+                    if is_avail > 0 then
+                        -- take the next burst; a rejected one issues nothing
+                        v_take := true;
+                        rd_fifo(is_ptr).started <= '1';
+                        is_ptr <= (is_ptr + 1) mod G_MAX_OUTSTANDING;
+                        if rd_fifo(is_ptr).error = '0' then
+                            is_addr   <= rd_fifo(is_ptr).addr;
+                            is_size   <= rd_fifo(is_ptr).size;
+                            is_left   <= rd_fifo(is_ptr).beats_left;
+                            is_active <= '1';
+                        end if;
+                    end if;
+                elsif rd_core_req_o.valid = '1' then
+                    if rd_ready = '1' then
+                        rd_core_req_o.valid <= '0';
+                        v_infl  := v_infl + 1;
+                        is_addr <= next_beat_addr(is_addr, is_size);
+                        is_left <= is_left - 1;
+                        if is_left = 1 then
+                            is_active <= '0';
+                        end if;
+                    end if;
+                elsif rd_infl + rb_cnt < C_RBUF then
+                    -- room for its data: issue the next beat's container
+                    rd_core_req_o.valid  <= '1';
+                    rd_core_req_o.we     <= '0';
+                    rd_core_req_o.cont   <= '0';
+                    rd_core_req_o.addr   <= std_logic_vector(resize(align_down(is_addr, is_size),
+                                                                    C_MRAM_ADDR_WIDTH));
+                    rd_core_req_o.nbytes <= to_unsigned(beat_bytes(is_size), 7);
+                end if;
+
+                ----------------------------------------------------------------
+                -- R channel: load the next beat when the output is free
+                ----------------------------------------------------------------
+                if s_axi_rvalid = '1' and s_axi_rready = '1' then
+                    s_axi_rvalid <= '0';
+                end if;
+                v_load := (s_axi_rvalid = '0' or s_axi_rready = '1') and rd_fifo_count > 0
+                          and rd_fifo(rd_head_ptr).started = '1'
+                          and (rd_fifo(rd_head_ptr).error = '1' or rb_cnt > 0);
+                if v_load then
+                    if rd_fifo(rd_head_ptr).error = '1' then
+                        s_axi_rdata <= (others => '0');
+                        s_axi_rresp <= AXI_RESP_SLVERR;
                     else
-                        rd_tail_ptr <= rd_tail_ptr + 1;
+                        s_axi_rdata <= rbuf(rb_rd);
+                        s_axi_rresp <= AXI_RESP_SLVERR when rbuf_err(rb_rd) = '1' else AXI_RESP_OKAY;
+                        rb_rd   <= (rb_rd + 1) mod C_RBUF;
+                        v_rbcnt := v_rbcnt - 1;
+                    end if;
+                    s_axi_rid    <= rd_fifo(rd_head_ptr).id;
+                    s_axi_rvalid <= '1';
+                    if rd_fifo(rd_head_ptr).beats_left = 1 then
+                        s_axi_rlast <= '1';
+                        rd_head_ptr <= (rd_head_ptr + 1) mod G_MAX_OUTSTANDING;
+                        v_pop := true;
+                    else
+                        s_axi_rlast <= '0';
+                        rd_fifo(rd_head_ptr).beats_left <= rd_fifo(rd_head_ptr).beats_left - 1;
                     end if;
                 end if;
 
-                -- Pop / service: drain the head entry one beat at a time
-                case rd_state is
+                rd_infl <= v_infl;
+                rb_cnt  <= v_rbcnt;
 
-                    when RD_IDLE =>
-                        -- Only a committed entry is looked at: an entry being
-                        -- pushed this cycle is not readable until the next.
-                        if rd_fifo_empty = '0' then
-                            if rd_fifo(rd_head_ptr).error = '1' then
-                                s_axi_rdata   <= (others => '0');
-                                rd_beat_error <= '1';
-                                rd_state      <= RD_OUTPUT;
-                            else
-                                rd_state <= RD_ISSUE;
-                            end if;
-                        end if;
+                if v_push and not v_take then
+                    is_avail <= is_avail + 1;
+                elsif v_take and not v_push then
+                    is_avail <= is_avail - 1;
+                end if;
 
-                    when RD_ISSUE =>
-                        if rd_core_req_o.valid = '1' then
-                            if rd_ready = '1' then
-                                rd_core_req_o.valid <= '0';
-                                rd_state            <= RD_WAIT_RVALID;
-                            end if;
-                        else
-                            rd_core_req_o.valid  <= '1';
-                            rd_core_req_o.we     <= '0';
-                            rd_core_req_o.addr   <= std_logic_vector(resize(align_down(
-                                                        rd_fifo(rd_head_ptr).addr, rd_fifo(rd_head_ptr).size),
-                                                        C_MRAM_ADDR_WIDTH));
-                            rd_core_req_o.nbytes <= to_unsigned(beat_bytes(rd_fifo(rd_head_ptr).size), 7);
-                        end if;
-
-                    when RD_WAIT_RVALID =>
-                        if core_resp.rvalid = '1' then
-                            s_axi_rdata   <= core_resp.rdata;
-                            rd_beat_error <= core_resp.error;
-                            rd_state      <= RD_OUTPUT;
-                        end if;
-
-                    when RD_OUTPUT =>
-                        s_axi_rid    <= rd_fifo(rd_head_ptr).id;
-                        s_axi_rresp  <= AXI_RESP_SLVERR when rd_beat_error = '1' else AXI_RESP_OKAY;
-                        s_axi_rlast  <= '1' when rd_fifo(rd_head_ptr).beats_left = 1 else '0';
-                        s_axi_rvalid <= '1';
-
-                        if s_axi_rvalid = '1' and s_axi_rready = '1' then
-                            s_axi_rvalid <= '0';
-                            if rd_fifo(rd_head_ptr).beats_left = 1 then
-                                if rd_head_ptr = G_MAX_OUTSTANDING - 1 then
-                                    rd_head_ptr <= 0;
-                                else
-                                    rd_head_ptr <= rd_head_ptr + 1;
-                                end if;
-                                rd_state <= RD_IDLE;
-                            else
-                                rd_fifo(rd_head_ptr).beats_left <=
-                                    rd_fifo(rd_head_ptr).beats_left - 1;
-                                if rd_fifo(rd_head_ptr).error = '0' then
-                                    rd_fifo(rd_head_ptr).addr <= next_beat_addr(
-                                        rd_fifo(rd_head_ptr).addr, rd_fifo(rd_head_ptr).size);
-                                    rd_state <= RD_ISSUE;
-                                end if;
-                                -- a rejected burst stays here: every beat SLVERR
-                            end if;
-                        end if;
-
-                end case;
-
-                -- Single point of truth for the occupancy counter
                 if v_push and not v_pop then
                     rd_fifo_count <= rd_fifo_count + 1;
                 elsif v_pop and not v_push then
                     rd_fifo_count <= rd_fifo_count - 1;
                 end if;
-
             end if;
         end if;
     end process;

@@ -10,7 +10,7 @@
 --
 -- Robustness features, given a one-minute boot budget. One copy+verify
 -- pass moves 4 x 32MB over the QSPI bus (read src, write dst, re-read src,
--- re-read dst) in 64-byte transactions; at 37.5MHz SCLK (150MHz aclk,
+-- re-read dst) in G_BLOCK_BYTES (64-byte) streamed transactions; at 37.5MHz SCLK (150MHz aclk,
 -- G_SCLK_HALF_PERIOD = 2) that is roughly 9 s per pass and roughly 35-36 s
 -- if all G_MAX_RETRIES retries are used (4 passes). These are hand
 -- estimates from the transaction framing, not measurements:
@@ -83,8 +83,11 @@ entity mram_boot_copy is
         G_SRC_BASE      : natural := 100663296; -- 0x6000000: pristine master copy (top 32MB)
         G_DST_BASE      : natural := 0;         -- 0x0: working copy, matches NOEL-V's fixed reset vector
         G_COPY_SIZE     : natural := 33554432;  -- 32MB
-        G_CHUNK_BYTES   : natural := 64;         -- bytes per request, 1..64; must divide the
-                                                 -- bases and G_COPY_SIZE (64-byte window rule)
+        G_BLOCK_BYTES   : natural := 64;         -- bytes buffered per copy step; a multiple of
+                                                 -- C_BEAT_BYTES that divides the bases and
+                                                 -- G_COPY_SIZE. Each block is moved as
+                                                 -- back-to-back beat-sized requests, which the
+                                                 -- backend streams into one SPI transaction.
         G_MAX_RETRIES   : natural := 3;
         G_WATCHDOG_LIMIT: natural := 1_000_000;  -- aclk cycles with no state change = hang
         G_POWERUP_CYCLES: natural := 3_750_000   -- MRAM tPU (25ms at 150MHz) before the first
@@ -109,30 +112,47 @@ end entity mram_boot_copy;
 
 architecture rtl of mram_boot_copy is
 
+    constant NB     : natural := C_BEAT_BYTES;
+    constant NBEATS : natural := G_BLOCK_BYTES / C_BEAT_BYTES;
+
+    -- One block, phases: read src -> write dst, then verify: read src ->
+    -- read dst and compare.
     type state_t is (
         S_POWERUP,
-        S_COPY_READ_ISSUE, S_COPY_READ_WAIT, S_COPY_WRITE_ISSUE, S_COPY_WRITE_WAIT,
-        S_VERIFY_SRC_ISSUE, S_VERIFY_SRC_WAIT, S_VERIFY_DST_ISSUE, S_VERIFY_DST_WAIT,
-        S_VERIFY_COMPARE,
+        S_COPY_READ, S_COPY_WRITE, S_VERIFY_SRC, S_VERIFY_DST, S_NEXT,
         S_RETRY_CHECK,
         S_DONE, S_FAIL
     );
     signal state      : state_t := S_POWERUP;
     signal prev_state : state_t := S_POWERUP;
+    signal verifying  : std_logic := '0';
     signal powerup_cnt : natural range 0 to G_POWERUP_CYCLES := 0;
     signal powerup_ok  : std_logic := '0';
 
     -- 26 bits comfortably covers a 32MB (2**25) offset with headroom.
     signal byte_off   : unsigned(25 downto 0) := (others => '0');
-    signal hold_data  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
-    signal verify_src : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    type block_t is array (0 to NBEATS - 1) of std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    signal blk        : block_t;
+    signal iss_idx    : natural range 0 to NBEATS := 0;  -- requests accepted in this phase
+    signal rsp_idx    : natural range 0 to NBEATS := 0;  -- responses received in this phase
     signal mismatch   : std_logic := '0';
 
     signal retry_count : integer range 0 to G_MAX_RETRIES := 0;
     signal watchdog_cnt : integer range 0 to G_WATCHDOG_LIMIT := 0;
     signal watchdog_trip : std_logic;
 
+    function phase_base(st : state_t) return natural is
+    begin
+        if st = S_COPY_WRITE or st = S_VERIFY_DST then
+            return G_DST_BASE;
+        end if;
+        return G_SRC_BASE;
+    end function;
+
 begin
+
+    assert G_BLOCK_BYTES mod C_BEAT_BYTES = 0 and G_BLOCK_BYTES > 0
+        report "G_BLOCK_BYTES must be a multiple of C_BEAT_BYTES" severity failure;
 
     powerup_done <= powerup_ok;
     boot_held    <= '1' when state = S_POWERUP and powerup_ok = '1' and boot_hold = '1' else '0';
@@ -140,6 +160,8 @@ begin
     watchdog_trip <= '1' when watchdog_cnt = G_WATCHDOG_LIMIT else '0';
 
     process (aclk)
+        variable v_iss : natural range 0 to NBEATS;
+        variable v_rsp : natural range 0 to NBEATS;
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
@@ -153,15 +175,19 @@ begin
                 powerup_ok   <= '0';
                 boot_fail    <= '0';
                 mismatch     <= '0';
+                verifying    <= '0';
+                iss_idx      <= 0;
+                rsp_idx      <= 0;
                 watchdog_cnt <= 0;
                 core_req     <= CORE_REQ_IDLE;
             else
                 prev_state <= state;
 
-                -- Watchdog: reset on any state change (progress); force a
-                -- retry attempt if nothing has moved for G_WATCHDOG_LIMIT
-                -- cycles, rather than hanging forever.
-                if state /= prev_state or state = S_POWERUP then
+                -- Watchdog: reset on progress (a state change or a
+                -- response); force a retry attempt if nothing has moved for
+                -- G_WATCHDOG_LIMIT cycles, rather than hanging forever.
+                if state /= prev_state or state = S_POWERUP
+                   or core_resp.rvalid = '1' or core_resp.bvalid = '1' then
                     watchdog_cnt <= 0;
                 elsif watchdog_cnt < G_WATCHDOG_LIMIT then
                     watchdog_cnt <= watchdog_cnt + 1;
@@ -184,106 +210,84 @@ begin
                         if powerup_cnt >= G_POWERUP_CYCLES then
                             powerup_ok <= '1';
                             if boot_hold = '0' then
-                                state <= S_COPY_READ_ISSUE;
+                                iss_idx <= 0;
+                                rsp_idx <= 0;
+                                state   <= S_COPY_READ;
                             end if;
                         else
                             powerup_cnt <= powerup_cnt + 1;
                         end if;
 
-                    when S_COPY_READ_ISSUE =>
+                    ------------------------------------------------------------
+                    -- One phase: NBEATS beat requests back to back (held until
+                    -- accepted), responses collected in order.
+                    ------------------------------------------------------------
+                    when S_COPY_READ | S_COPY_WRITE | S_VERIFY_SRC | S_VERIFY_DST =>
+                        v_iss := iss_idx;
+                        v_rsp := rsp_idx;
                         if core_req.valid = '1' and core_resp.ready = '1' then
-                            core_req.valid <= '0'; -- accepted
-                            state          <= S_COPY_READ_WAIT;
-                        else
-                            core_req.valid  <= '1'; -- hold until accepted
-                            core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_SRC_BASE);
-                            core_req.we     <= '0';
-                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
+                            v_iss := v_iss + 1;
                         end if;
-
-                    when S_COPY_READ_WAIT =>
-                        if core_resp.rvalid = '1' then
-                            hold_data <= core_resp.rdata;
-                            state     <= S_COPY_WRITE_ISSUE;
-                        end if;
-
-                    when S_COPY_WRITE_ISSUE =>
-                        if core_req.valid = '1' and core_resp.ready = '1' then
-                            core_req.valid <= '0'; -- accepted
-                            state          <= S_COPY_WRITE_WAIT;
-                        else
-                            core_req.valid  <= '1'; -- hold until accepted
-                            core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_DST_BASE);
-                            core_req.we     <= '1';
-                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
-                            core_req.wdata  <= hold_data;
-                        end if;
-
-                    when S_COPY_WRITE_WAIT =>
-                        if core_resp.bvalid = '1' then
-                            if byte_off + G_CHUNK_BYTES >= G_COPY_SIZE then
-                                byte_off <= (others => '0');
-                                state    <= S_VERIFY_SRC_ISSUE;
+                        if v_iss < NBEATS then
+                            core_req.valid  <= '1';
+                            core_req.addr   <= std_logic_vector(resize(byte_off, C_MRAM_ADDR_WIDTH)
+                                                   + phase_base(state) + v_iss * NB);
+                            core_req.nbytes <= to_unsigned(NB, 7);
+                            core_req.cont   <= '0';
+                            if state = S_COPY_WRITE then
+                                core_req.we    <= '1';
+                                core_req.wdata <= blk(v_iss);
                             else
-                                byte_off <= byte_off + G_CHUNK_BYTES;
-                                state    <= S_COPY_READ_ISSUE;
+                                core_req.we    <= '0';
                             end if;
-                        end if;
-
-                    ------------------------------------------------------------
-                    -- Verify pass: re-read both sides of every chunk and
-                    -- compare before trusting the copy.
-                    ------------------------------------------------------------
-                    when S_VERIFY_SRC_ISSUE =>
-                        if core_req.valid = '1' and core_resp.ready = '1' then
-                            core_req.valid <= '0'; -- accepted
-                            state          <= S_VERIFY_SRC_WAIT;
                         else
-                            core_req.valid  <= '1'; -- hold until accepted
-                            core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_SRC_BASE);
-                            core_req.we     <= '0';
-                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
+                            core_req.valid <= '0';
                         end if;
 
-                    when S_VERIFY_SRC_WAIT =>
                         if core_resp.rvalid = '1' then
-                            verify_src <= core_resp.rdata;
-                            state      <= S_VERIFY_DST_ISSUE;
-                        end if;
-
-                    when S_VERIFY_DST_ISSUE =>
-                        if core_req.valid = '1' and core_resp.ready = '1' then
-                            core_req.valid <= '0'; -- accepted
-                            state          <= S_VERIFY_DST_WAIT;
-                        else
-                            core_req.valid  <= '1'; -- hold until accepted
-                            core_req.addr   <= std_logic_vector(
-                                                   resize(byte_off, C_MRAM_ADDR_WIDTH) + G_DST_BASE);
-                            core_req.we     <= '0';
-                            core_req.nbytes <= to_unsigned(G_CHUNK_BYTES, 7);
-                        end if;
-
-                    when S_VERIFY_DST_WAIT =>
-                        if core_resp.rvalid = '1' then
-                            state <= S_VERIFY_COMPARE;
-                            if core_resp.rdata /= verify_src then
-                                mismatch <= '1';
+                            if state = S_VERIFY_DST then
+                                if core_resp.rdata /= blk(rsp_idx) then
+                                    mismatch <= '1';
+                                end if;
+                            else
+                                blk(rsp_idx) <= core_resp.rdata;
                             end if;
+                            v_rsp := v_rsp + 1;
+                        elsif core_resp.bvalid = '1' then
+                            v_rsp := v_rsp + 1;
                         end if;
 
-                    when S_VERIFY_COMPARE =>
-                        if byte_off + G_CHUNK_BYTES >= G_COPY_SIZE then
-                            if mismatch = '1' then
+                        iss_idx <= v_iss;
+                        rsp_idx <= v_rsp;
+                        if v_rsp = NBEATS then
+                            iss_idx <= 0;
+                            rsp_idx <= 0;
+                            case state is
+                                when S_COPY_READ  => state <= S_COPY_WRITE;
+                                when S_VERIFY_SRC => state <= S_VERIFY_DST;
+                                when others       => state <= S_NEXT;
+                            end case;
+                        end if;
+
+                    -- Next block, or switch from copying to verifying, or end.
+                    when S_NEXT =>
+                        if byte_off + G_BLOCK_BYTES >= G_COPY_SIZE then
+                            byte_off <= (others => '0');
+                            if verifying = '0' then
+                                verifying <= '1';
+                                state     <= S_VERIFY_SRC;
+                            elsif mismatch = '1' then
                                 state <= S_RETRY_CHECK;
                             else
                                 state <= S_DONE;
                             end if;
                         else
-                            byte_off <= byte_off + G_CHUNK_BYTES;
-                            state    <= S_VERIFY_SRC_ISSUE;
+                            byte_off <= byte_off + G_BLOCK_BYTES;
+                            if verifying = '1' then
+                                state <= S_VERIFY_SRC;
+                            else
+                                state <= S_COPY_READ;
+                            end if;
                         end if;
 
                     ------------------------------------------------------------
@@ -296,7 +300,10 @@ begin
                             retry_count <= retry_count + 1;
                             byte_off    <= (others => '0');
                             mismatch    <= '0';
-                            state       <= S_COPY_READ_ISSUE;
+                            verifying   <= '0';
+                            iss_idx     <= 0;
+                            rsp_idx     <= 0;
+                            state       <= S_COPY_READ;
                         end if;
 
                     when S_DONE =>
