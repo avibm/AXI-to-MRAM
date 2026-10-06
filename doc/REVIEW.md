@@ -177,6 +177,36 @@ deliberate breaks were caught: with continuation disabled, 4 checks fail;
 with `skip_wren` set but CR1 left at 00, the model flags writes without
 WREN.
 
+### Rev. 7 – streaming writes across AXI transactions
+
+The Identify capture `mram_wr.vcd` (hardware, rev. 5 bitstream) shows the
+PCI bridge writing 32- or 64-byte INCR bursts (32-bit, len 7/15). Each one
+arrives at the MRAM port as a single 64-byte beat. The bridge issues the
+next AW about 17 aclk after B, although its FIFO held up to 191 words. Each
+64 bytes took about 813 aclk (5.4 µs): data 512, WREN + CS# gap ≈ 128,
+opcode/address ≈ 72, CS# high after the write 92. So the MRAM sat idle for
+37 % of the time because of per-transaction overhead.
+
+Changes (backend only; the wrapper and guard are unchanged):
+
+* **Posted B.** bvalid one cycle after a write request is accepted. A
+  read or register command still waits until the write's CS# rises.
+  Output `mram_wr_pending` shows posted data not yet in the MRAM.
+* **Append across transactions.** A contiguous write is appended to the
+  running SPI write whether or not it belongs to the same burst.
+* **Linger.** SCLK is stopped low and CS# held low for up to
+  `G_WR_LINGER_CYCLES` waiting for the next contiguous write. This assumes
+  the device accepts a paused SCLK with CS# low, which the reviewed
+  datasheet pages do not forbid but do not state either.
+
+Testbench T16/T16b check:
+* six back-to-back single-beat transactions → 1 4WQIO and 1 WREN;
+* a write after CS# rose → a new 4WQIO;
+* a write arriving during the linger → resumes the same 4WQIO.
+
+Switching off each of the three generics makes T16 or T16b fail. Measured
+in simulation: ≈ 18 MB/s, against ≈ 11.8 MB/s in the capture.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

@@ -73,7 +73,10 @@ entity mram_top is
         -- QSPI backend
         G_DUMMY_CYCLES         : integer := 8;   -- = MRAM CR2 latency (default 8)
         G_SCLK_HALF_PERIOD     : integer := 2;   -- SCLK = aclk / (2*N); datasheet max 54MHz
-        G_CS_HIGH_WRITE_CYCLES : integer := 92   -- tCS3 600ns at 150MHz
+        G_CS_HIGH_WRITE_CYCLES : integer := 92;  -- tCS3 600ns at 150MHz
+        G_POSTED_WRITES        : boolean := true; -- B as soon as the write data is held
+        G_STREAM_WRITES        : boolean := true; -- one SPI write for contiguous AXI writes
+        G_WR_LINGER_CYCLES     : natural := 256   -- CS# low wait for the next write; 0 = off
     );
     port (
         aclk    : in  std_logic;
@@ -143,6 +146,8 @@ entity mram_top is
         -- Quasi-static (PCI register). Must be '0' at power-up so the boot
         -- copy works with the default CR1.
         skip_wren     : in  std_logic := '0';
+        -- '1' while accepted (posted) write data has not reached the MRAM
+        mram_wr_pending : out std_logic;
 
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
@@ -295,7 +300,10 @@ begin
         generic map (
             G_DUMMY_CYCLES         => G_DUMMY_CYCLES,
             G_SCLK_HALF_PERIOD     => G_SCLK_HALF_PERIOD,
-            G_CS_HIGH_WRITE_CYCLES => G_CS_HIGH_WRITE_CYCLES
+            G_CS_HIGH_WRITE_CYCLES => G_CS_HIGH_WRITE_CYCLES,
+            G_POSTED_WRITES        => G_POSTED_WRITES,
+            G_STREAM_WRITES        => G_STREAM_WRITES,
+            G_WR_LINGER_CYCLES     => G_WR_LINGER_CYCLES
         )
         port map (
             aclk       => aclk,
@@ -315,7 +323,8 @@ begin
             mram_io_oe => backend_io_oe,
             mram_io_i  => backend_io_i,
             rd_sample_dly => rd_sample_dly,
-            skip_wren     => skip_wren
+            skip_wren     => skip_wren,
+            wr_pending    => mram_wr_pending
         );
 
     gen_pins : for i in 0 to 3 generate

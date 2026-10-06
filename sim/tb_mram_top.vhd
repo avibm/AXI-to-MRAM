@@ -25,6 +25,10 @@
 -- burst and a strobe hole that must split), and WREN-once mode: RDAR/WRAR
 -- set CR1 WRENS=01, skip_wren=1 sends no WREN (model WREN count), then
 -- normal mode is restored.
+-- Streaming (T16/T16b): separate single-beat 64-byte AXI writes issued
+-- right after each B must become one 4WQIO (posted B + append), a write
+-- after CS# rose starts a new one, and a write arriving while SCLK is
+-- paused with CS# low (linger) resumes the same 4WQIO.
 --
 -- Run: see sim/run_ghdl.sh
 --------------------------------------------------------------------------------
@@ -108,9 +112,11 @@ architecture sim of tb_mram_top is
     signal wr_paused2    : boolean := false; -- writer idle before / after T15
     signal wr_t15_done   : boolean := false;
     signal early_rd_done : boolean := false;
+    signal rd_t10_done   : boolean := false; -- reader idle until wr_step 4
     signal pci_finish    : boolean := false;
     signal tb_errs_p     : natural := 0;
     signal cpu_reset_n : std_logic;
+    signal wr_pending  : std_logic;
     signal boot_done   : std_logic;
     signal boot_fail   : std_logic;
 
@@ -198,6 +204,7 @@ begin
             cmd_rdid => cmd_req(I_RDID), cmd_rdar => cmd_req(I_RDAR),
             cmd_wrar => cmd_req(I_WRAR), cmd_reg_addr => cmd_reg_addr,
             cmd_wrsr_data => cmd_wrsr_data, skip_wren => skip_wren,
+            mram_wr_pending => wr_pending,
             cmd_rdsr_data => cmd_rdsr_data, cmd_rdid_data => cmd_rdid_data,
             cmd_done => cmd_done, boot_hold => boot_hold,
             rd_sample_dly => std_logic_vector(to_unsigned(G_SAMPLE_DLY, 3)),
@@ -321,6 +328,10 @@ begin
             end loop;
             bready <= '0';
             writes_done := writes_done + 1;
+            -- B is posted: wait until the data has reached the MRAM
+            while wr_pending = '1' loop
+                wait until rising_edge(aclk);
+            end loop;
             check(n_b = writes_done, "B handshakes: saw " & integer'image(n_b)
                   & ", expected " & integer'image(writes_done));
 
@@ -353,9 +364,42 @@ begin
             end loop;
         end procedure;
 
+        -- One 64-byte single-beat write, next one issued right after B; no
+        -- per-write memory check (T16 checks at the end).
+        procedure stream_write(addr : natural; d : std_logic_vector(511 downto 0)) is
+            variable aw_ok, w_ok : boolean := false;
+        begin
+            awaddr  <= std_logic_vector(to_unsigned(addr, awaddr'length));
+            awlen   <= x"00";
+            awsize  <= "110";
+            awburst <= "01";
+            awid    <= std_logic_vector(to_unsigned(3, awid'length));
+            awvalid <= '1';
+            wdata   <= d;
+            wstrb   <= (others => '1');
+            wlast   <= '1';
+            wvalid  <= '1';
+            bready  <= '1';
+            loop
+                wait until rising_edge(aclk);
+                if awvalid = '1' and awready = '1' then awvalid <= '0'; aw_ok := true; end if;
+                if wvalid = '1' and wready = '1' then wvalid <= '0'; wlast <= '0'; w_ok := true; end if;
+                exit when bvalid = '1' and bready = '1';
+            end loop;
+            check(aw_ok and w_ok and bresp = "00", "stream_write handshake / BRESP");
+            bready <= '0';
+            writes_done := writes_done + 1;
+            wait until rising_edge(aclk);
+            check(n_b = writes_done, "B handshakes: saw " & integer'image(n_b)
+                  & ", expected " & integer'image(writes_done));
+        end procedure;
+
         variable beats : beat_arr_t;
         variable strbs : strb_arr_t;
         variable n0, w0 : natural;
+        variable n_idle : natural;
+        variable t0     : time;
+        constant G_WR_LINGER : natural := 256; -- mram_top default
     begin
         wait until boot_done = '1';
         wait until rising_edge(aclk);
@@ -490,6 +534,59 @@ begin
         beats(0) := mk_beat(79); strbs(0) := (others => '1');
         axi_write(16#1AC0#, 0, 6, "01", beats, strbs, "00", true);
         check(model_wren = w0 + 1, "normal mode: expected one WREN per write");
+
+        -- T16: separate single-beat AXI writes to contiguous addresses, each
+        -- issued right after the previous B (like the PCI bridge: 32-bit
+        -- INCR len 15 = 64 bytes, packed into one 64-byte beat). With posted
+        -- B they must stream into ONE 4WQIO. Then a pause longer than the
+        -- linger time must end it, and a non-contiguous write starts anew.
+        n0 := model_wr; w0 := model_wren;
+        t0 := now;
+        for i in 0 to 5 loop
+            stream_write(16#2400# + 64 * i, mk_beat(90 + i));
+        end loop;
+        while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
+        report "T16: 384 bytes in " & time'image(now - t0 - G_WR_LINGER * T_CLK)
+               & " (excluding the final linger wait)";
+        for i in 0 to 5 loop
+            for lane in 0 to 63 loop
+                check(mem.read(16#2400# + 64 * i + lane) = mk_beat(90 + i)(8 * lane + 7 downto 8 * lane),
+                      "T16 byte 0x" & to_hstring(to_unsigned(16#2400# + 64 * i + lane, 16)));
+            end loop;
+        end loop;
+        check(model_wr = n0 + 1, "T16: 6 contiguous transactions took "
+              & integer'image(model_wr - n0) & " 4WQIO, expected 1");
+        check(model_wren = w0 + 1, "T16: expected one WREN for the stream");
+        n0 := model_wr;
+        stream_write(16#2580#, mk_beat(96));       -- contiguous, but after CS# rose
+        stream_write(16#2600#, mk_beat(97));       -- gap at 0x25C0: new write
+        while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
+        check(model_wr = n0 + 2, "T16: after the pause " & integer'image(model_wr - n0)
+              & " 4WQIO, expected 2");
+        -- T16b: the next write arrives only after the data phase ended
+        -- (SCLK stopped, CS# still low): it must resume the same 4WQIO.
+        -- Needs a quiet bus: any read or register command ends the wait.
+        if not (rd_t10_done and pci_finish) then wait until rd_t10_done and pci_finish; end if;
+        n0 := model_wr;
+        stream_write(16#2700#, mk_beat(98));
+        n_idle := 0;
+        for i in 1 to 2000 loop
+            wait until rising_edge(aclk);
+            if cs_n = '0' and sclk = '0' then n_idle := n_idle + 1; else n_idle := 0; end if;
+            exit when n_idle = 16;
+        end loop;
+        report "T16b: second write issued at " & time'image(now) & ", SCLK idle with CS# low: "
+               & boolean'image(n_idle = 16);
+        stream_write(16#2740#, mk_beat(99));
+        while wr_pending = '1' loop wait until rising_edge(aclk); end loop;
+        for i in 0 to 1 loop
+            for lane in 0 to 63 loop
+                check(mem.read(16#2700# + 64 * i + lane) = mk_beat(98 + i)(8 * lane + 7 downto 8 * lane),
+                      "T16b byte 0x" & to_hstring(to_unsigned(16#2700# + 64 * i + lane, 16)));
+            end loop;
+        end loop;
+        check(model_wr = n0 + 1, "T16b: resume after linger took " & integer'image(model_wr - n0)
+              & " 4WQIO, expected 1");
         wr_step <= 4;
 
         report "writer done, " & integer'image(writes_done) & " writes, errors=" & integer'image(errs);
@@ -610,6 +707,7 @@ begin
             axi_read(16#1000# + 64 * (i mod 2), 0, 6, "01", "00");
             axi_read(16#2004#, 0, 2, "01", "00");
         end loop;
+        rd_t10_done <= true;
         if wr_step < 4 then wait until wr_step >= 4; end if;
         for i in 0 to 7 loop
             axi_read(16#3800# + 64 * i, 0, 6, "01", "00");

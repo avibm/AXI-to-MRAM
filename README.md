@@ -55,15 +55,44 @@ clears the WREN bit when a write completes. A PCI WREN → WRSR sequence
 therefore only works while no memory writes are running: for example with
 `boot_hold` = 1, or with AXI writers idle. Check with RDSR afterwards.
 
-### Write speed: merged writes and WREN-once mode
+### Write speed: streaming, merged writes and WREN-once mode
 
-**Merged writes.** The contiguous strobe runs of one AXI write burst go to
-the MRAM as **one** D2h write, not one per beat. For example, the PCI
-bridge's 64-byte burst at a 0x20 offset arrives as 2 beats with 32 strobes
-each; it is now one 64-byte 4WQIO instead of two 32-byte ones. A gap in
-the strobes, a FIXED burst, or the end of the AXI burst still ends the MRAM
-write. Separate AXI bursts are never merged. This is automatic and needs no
-setting.
+**Streaming across AXI transactions (default on).** Contiguous writes go
+to the MRAM as **one** long D2h write, even when each arrives as a separate
+AXI transaction. On the board, the PCI bridge sends one 64-byte write at a
+time and waits for B before the next AW, so before this every 64 bytes paid
+for WREN, opcode, address and two 600 ns CS# high times. Three parts make
+it work:
+
+* **Posted B** (`G_POSTED_WRITES`): B is returned as soon as the write data
+  is held in the backend, not when it reaches the MRAM. The bridge then
+  sends the next write while the current one is still being clocked out.
+  Order is kept: a later read or register command starts only after the
+  write has finished. The new output `mram_wr_pending` is 1 while posted
+  data has not reached the MRAM yet. Check it is 0 before powering down or
+  resetting the MRAM. It can be left unconnected.
+* **Append** (`G_STREAM_WRITES`): a write starting at the next byte after
+  the one being clocked out continues the same SPI write.
+* **Linger** (`G_WR_LINGER_CYCLES`, default 256 = 1.7 µs): if the next write
+  is late, SCLK stops low and CS# stays low for up to that long. A read, a
+  register command or a non-contiguous write ends it at once.
+  **Assumption:** the datasheet pages I reviewed give only minimum SCLK
+  high/low times and no maximum CS# low time, so I assume pausing SCLK
+  inside a write is allowed. If in doubt, set the generic to 0. Streaming
+  still works whenever the next write arrives before the current one has
+  finished.
+
+Measured in simulation, back-to-back 64-byte single-beat writes: 384 bytes
+in 21.3 µs, ≈ 18 MB/s. The Identify capture of the current hardware
+(`mram_wr.vcd`) shows ≈ 5.4 µs per 64 bytes, ≈ 11.8 MB/s. The ceiling at
+37.5 MHz SCLK is 18.75 MB/s (2 SCLK per byte); going higher needs a
+faster SCLK, i.e. an aclk other than 150 MHz, since 150 / 4 = 37.5 MHz and
+150 / 2 = 75 MHz is above the 54 MHz limit.
+
+**Merged writes within a burst.** The contiguous strobe runs of one AXI
+write burst also go out as one D2h write. For example, a 64-byte burst at a
+0x20 offset arrives as 2 beats with 32 strobes each and becomes one 64-byte
+4WQIO. A gap in the strobes or a FIXED burst ends the MRAM write.
 
 **WREN-once mode** saves the WREN instruction and the 600 ns CS# high
 time after it on every write. Datasheet Table 23: CR1[1:0] WRENS = 01
@@ -92,15 +121,11 @@ Notes:
   not something I could confirm in the datasheet text. If CR2 is changed,
   `G_DUMMY_CYCLES` must match.
 
-Rough gain at the default 37.5 MHz SCLK. These are estimates from the
-cycle counts, not measured on hardware:
+With streaming, WREN-once saves only one WREN per stream, so it matters
+much less than before.
 
-| 64-byte PCI burst | Before | Merged | Merged + WREN-once |
-|---|---|---|---|
-| Time per burst | ≈ 7 µs | ≈ 5.3 µs | ≈ 4.5 µs |
-| Throughput | ≈ 9 MB/s | ≈ 12 MB/s | ≈ 14 MB/s |
-
-That is still well below the ≈ 70 MB/s that PCI can deliver. **The PCI
+Even 18 MB/s is well below what PCI can deliver: the capture shows the
+bridge FIFO reaching 191 words while the MRAM was writing. **The PCI
 bridge (`pci2ddr4`) still needs back-pressure** (target wait states or
 retry when its FIFO is full). Without it, data is still lost on large
 transfers, only later.

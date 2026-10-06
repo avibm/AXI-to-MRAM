@@ -82,13 +82,32 @@
 -- WRSR/WRAR are followed by the array-write CS# high time, the others by
 -- the read one.
 --
--- Write continuation: a write request with cont = '1' whose address is the
+-- Write continuation (streaming): a write request whose address is the
 -- next byte after the write currently being shifted out is accepted while
 -- that write is still in its data phase. Its data then follows without a
 -- new WREN/opcode/address, in the same CS# transaction (the device keeps
--- incrementing the address, "Instruction Description"). The first write's
--- bvalid is given when the second one takes over. Never across the end of
--- the 128MB die.
+-- incrementing the address, "Instruction Description"). With
+-- G_STREAM_WRITES = true this works across separate AXI transactions, not
+-- only within one burst (cont = '1'). Never across the end of the 128MB
+-- die.
+--
+-- Posted writes (G_POSTED_WRITES = true): bvalid is given one cycle after a
+-- write request is accepted, i.e. as soon as its data is held here, not
+-- when it has reached the MRAM. A master that waits for B before its next
+-- AW (the PCI bridge does) can then send the next write while this one is
+-- still being shifted out, so it can be appended. Order is kept: a later
+-- read or register command only starts after the write's CS# transaction
+-- has ended. wr_pending = '1' while accepted write data has not reached the
+-- MRAM yet (check it before power-down or a reset of the MRAM).
+--
+-- Linger (G_WR_LINGER_CYCLES > 0, posted writes only): when a write's data
+-- is done and no continuation is waiting, SCLK is stopped low with CS# kept
+-- low for up to G_WR_LINGER_CYCLES aclk cycles, waiting for the next
+-- contiguous write. A read, a non-contiguous write or a register command
+-- ends the wait at once. The datasheet (Rev. J.5) gives only minimum SCLK
+-- high/low times (tCH/tCL >= 0.45/fCLK) and no maximum CS# low time in the
+-- pages reviewed, so pausing SCLK low inside a write is assumed to be
+-- allowed; set G_WR_LINGER_CYCLES = 0 to disable it.
 --
 -- skip_wren = '1' omits the WREN transaction before array writes. Only
 -- valid after CR1[1:0] (WRENS) has been set to 01 "SRAM" (WREN not needed)
@@ -98,7 +117,7 @@
 -- Not implemented (documented scope):
 --   * RDFSR.
 --   * Driving the device RESET# pin (not on this entity's ports).
---   * Burst aggregation / prefetch across consecutive core_req calls.
+--   * Read prefetch / read streaming across consecutive core_req calls.
 --   * XIP mode (deliberately never entered: the mode byte is always Fxh).
 --   * Error/status reporting beyond core_resp.error tied low ('0').
 --
@@ -130,7 +149,10 @@ entity mram_qspi_backend is
         G_OPCODE_WRSR       : std_logic_vector(7 downto 0) := x"01"; -- WRSR,  Table 29 #10
         G_OPCODE_RDAR       : std_logic_vector(7 downto 0) := x"65"; -- RDAR,  Table 29 #9
         G_OPCODE_WRAR       : std_logic_vector(7 downto 0) := x"71"; -- WRAR,  Table 29 #11
-        G_ACLK_FREQ_HZ      : natural := 150_000_000   -- only used by the SCLK limit checks
+        G_ACLK_FREQ_HZ      : natural := 150_000_000;  -- only used by the SCLK limit checks
+        G_POSTED_WRITES     : boolean := true;   -- bvalid at acceptance (see header)
+        G_STREAM_WRITES     : boolean := true;   -- append contiguous writes across transactions
+        G_WR_LINGER_CYCLES  : natural := 256     -- CS# low wait for the next write; 0 = off
     );
     port (
         aclk    : in  std_logic;
@@ -164,7 +186,10 @@ entity mram_qspi_backend is
         rd_sample_dly : in  std_logic_vector(2 downto 0) := "010";
 
         -- '1' = no WREN before array writes (see header). Quasi-static.
-        skip_wren     : in  std_logic := '0'
+        skip_wren     : in  std_logic := '0';
+
+        -- '1' = an accepted (posted) write has not reached the MRAM yet
+        wr_pending    : out std_logic
     );
 end entity mram_qspi_backend;
 
@@ -173,7 +198,7 @@ architecture rtl of mram_qspi_backend is
     type state_t is (
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
-        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_CS_HOLD, S_DONE, S_CS_HIGH,
+        S_CS_SETUP, S_CMD, S_ADDR, S_XIP, S_DUMMY, S_DATA, S_WR_LINGER, S_CS_HOLD, S_DONE, S_CS_HIGH,
         S_REG_SETUP, S_REG_CMD, S_REG_WDATA, S_REG_DUMMY, S_REG_RDATA
     );
     signal state : state_t := S_IDLE;
@@ -256,6 +281,10 @@ architecture rtl of mram_qspi_backend is
     signal join_nbytes   : unsigned(6 downto 0);
     signal cont_ok       : std_logic;
     signal skip_q1, skip_q2 : std_logic := '0';
+    signal wr_accept     : std_logic;  -- a memory write is accepted this cycle
+
+    constant C_LINGER : boolean := G_POSTED_WRITES and G_WR_LINGER_CYCLES > 0;
+    signal linger_cnt : natural range 0 to G_WR_LINGER_CYCLES := 0;
 
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
@@ -313,13 +342,26 @@ begin
     -- Accept combinationally whenever idle (see the mram_pkg contract).
     -- A continuation is taken while the current write still has at least
     -- one rising edge to go, so it can be loaded on the final falling edge.
-    cont_ok <= '1' when state = S_DATA and req_we = '1' and req_is_reg = '0'
-                        and join_pending = '0' and clks_left >= 1
-                        and core_req.valid = '1' and core_req.we = '1' and core_req.cont = '1'
+    -- In S_WR_LINGER the SCLK is stopped after a complete write; a
+    -- continuation is taken there too.
+    cont_ok <= '1' when ((state = S_DATA and clks_left >= 1) or state = S_WR_LINGER)
+                        and req_we = '1' and req_is_reg = '0' and join_pending = '0'
+                        and core_req.valid = '1' and core_req.we = '1'
+                        and (core_req.cont = '1' or G_STREAM_WRITES)
                         and unsigned('0' & core_req.addr) = next_addr
                else '0';
 
     core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else cont_ok;
+
+    wr_accept <= '1' when (state = S_IDLE and reg_cmd_valid = '0' and core_req.valid = '1'
+                           and core_req.we = '1') or cont_ok = '1'
+                 else '0';
+
+    -- Accepted write data not yet in the MRAM: from acceptance until CS#
+    -- rises at the end of the write.
+    wr_pending <= '1' when req_is_reg = '0' and req_we = '1'
+                           and state /= S_IDLE and state /= S_CS_HIGH
+                  else '0';
     core_resp.rvalid <= resp_rvalid;
     core_resp.bvalid <= resp_bvalid;
     core_resp.rdata  <= resp_rdata;
@@ -347,6 +389,11 @@ begin
                 dly_q2   <= dly_q1;
                 skip_q1  <= skip_wren;
                 skip_q2  <= skip_q1;
+
+                -- Posted writes: respond as soon as the data is held here.
+                if G_POSTED_WRITES and wr_accept = '1' then
+                    resp_bvalid <= '1';
+                end if;
 
                 -- Accept a write continuation (see cont_ok); it is appended
                 -- on the current write's final falling edge in S_DATA.
@@ -578,7 +625,14 @@ begin
                                 clks_left    <= 2 * to_integer(join_nbytes);
                                 next_addr    <= next_addr + join_nbytes;
                                 join_pending <= '0';
-                                resp_bvalid  <= '1'; -- the previous write is complete
+                                if not G_POSTED_WRITES then
+                                    resp_bvalid <= '1'; -- the previous write is complete
+                                end if;
+                            elsif clks_left = 0 and req_we = '1' and C_LINGER then
+                                -- SCLK stops low on this edge; wait for more
+                                sclk_run   <= false;
+                                linger_cnt <= 0;
+                                state      <= S_WR_LINGER;
                             elsif clks_left = 0 then
                                 sclk_run  <= false;
                                 io_oe     <= (others => '0');
@@ -588,6 +642,28 @@ begin
                                 io_drive <= shreg(511 downto 508);
                                 shreg    <= shreg(507 downto 0) & "0000";
                             end if;
+                        end if;
+
+                    -- CS# low, SCLK stopped low after a complete write,
+                    -- waiting for a contiguous write (see header).
+                    when S_WR_LINGER =>
+                        if join_pending = '1' then
+                            -- accepted last cycle: resume, data set up half
+                            -- an SCLK period before the first rising edge
+                            io_drive     <= tx_build(511 downto 508);
+                            shreg        <= tx_build(507 downto 0) & "0000";
+                            clks_left    <= 2 * to_integer(join_nbytes);
+                            next_addr    <= next_addr + join_nbytes;
+                            join_pending <= '0';
+                            sclk_run     <= true;
+                            state        <= S_DATA;
+                        elsif cont_ok = '0' and (reg_cmd_valid = '1' or core_req.valid = '1'
+                                                 or linger_cnt >= G_WR_LINGER_CYCLES - 1) then
+                            io_oe     <= (others => '0');
+                            setup_cnt <= 0;
+                            state     <= S_CS_HOLD;
+                        else
+                            linger_cnt <= linger_cnt + 1;
                         end if;
 
                     when S_CS_HOLD =>
@@ -610,7 +686,9 @@ begin
                         if req_is_reg = '1' then
                             reg_done_i <= '1';
                         elsif req_we = '1' then
-                            resp_bvalid <= '1';
+                            if not G_POSTED_WRITES then
+                                resp_bvalid <= '1';
+                            end if;
                         else
                             -- Received bytes sit in shreg(8*n-1:0), first byte
                             -- highest. After byte_rev the first byte is in
