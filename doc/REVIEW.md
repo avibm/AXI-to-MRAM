@@ -236,6 +236,32 @@ in simulation: ≈ 18 MB/s, against ≈ 11.8 MB/s in the capture.
   * passes at 64, 128 and 512 bits and with sample delays 1–3;
   * spot checks of the `rd_sample_dly` table still match.
 
+### Rev. 9 – read capture slip on board 2
+
+Symptom (Identify, rev. 8 bitstream): every 64-bit read returned one junk
+byte (00) and then the data shifted up one lane. The MRAM bus itself was
+correct: the 16 nibbles of the 8 bytes fill exactly the data phase, and
+when SCLK stops the device already shows the next byte. The boot copy
+failed (`s_fail`, 3 retries).
+
+Cause: rev. 8 delivers each read request after counting its nibbles
+(`cap_cnt`). The count was off by 2 (one byte), and nothing ever reset it,
+so every later read stayed shifted. The 512-bit design was immune because
+it took the last nibbles of each transaction. Injecting two spurious
+capture strobes in simulation reproduces the board symptom exactly. What
+caused the miscount on the board is not known. The bitstream had Identify
+and no timing effort, so a timing failure is a plausible candidate, but
+simulation never shows it.
+
+Fix:
+* The read bookkeeping (queue and `cap_cnt`) restarts with the first read
+  of every RDQI transaction, so a miscount cannot outlive one transaction.
+* New sticky output `mram_rd_slip` reports any transaction whose count did
+  not come out even.
+
+With the same injection, the fixed backend returns correct data and sets
+`mram_rd_slip`. The testbench fails if `mram_rd_slip` is ever set.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,
