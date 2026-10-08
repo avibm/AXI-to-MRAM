@@ -150,6 +150,8 @@ entity mram_top is
         skip_wren     : in  std_logic := '0';
         -- '1' while accepted (posted) write data has not reached the MRAM
         mram_wr_pending : out std_logic;
+        -- Sticky debug flag: a read's capture count slipped (see backend)
+        mram_rd_slip    : out std_logic;
 
         cpu_reset_n : out std_logic; -- wire to the actual CPU reset input externally
         boot_done   : out std_logic;
@@ -328,7 +330,8 @@ begin
             mram_io_i  => backend_io_i,
             rd_sample_dly => rd_sample_dly,
             skip_wren     => skip_wren,
-            wr_pending    => mram_wr_pending
+            wr_pending    => mram_wr_pending,
+            rd_slip       => mram_rd_slip
         );
 
     gen_pins : for i in 0 to 3 generate

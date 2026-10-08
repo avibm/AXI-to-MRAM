@@ -203,7 +203,13 @@ entity mram_qspi_backend is
         skip_wren     : in  std_logic := '0';
 
         -- '1' = an accepted (posted) write has not reached the MRAM yet
-        wr_pending    : out std_logic
+        wr_pending    : out std_logic;
+
+        -- Sticky '1' (until aresetn): a read transaction ended with read
+        -- data not delivered as expected, i.e. the capture count did not
+        -- match the bytes clocked. That transaction's data is suspect.
+        -- Debug aid; never expected to be '1'.
+        rd_slip       : out std_logic
     );
 end entity mram_qspi_backend;
 
@@ -322,6 +328,7 @@ architecture rtl of mram_qspi_backend is
     signal chunk_done : std_logic := '0';
     signal done_nb  : unsigned(6 downto 0);
     signal done_off : unsigned(LB - 1 downto 0);
+    signal rd_slip_i : std_logic := '0';
 
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
@@ -400,6 +407,8 @@ begin
 
     -- Accepted write data not yet in the MRAM: from acceptance until CS#
     -- rises at the end of the write.
+    rd_slip <= rd_slip_i;
+
     wr_pending <= '1' when req_is_reg = '0' and req_we = '1'
                            and state /= S_IDLE and state /= S_CS_HIGH
                   else '0';
@@ -412,6 +421,7 @@ begin
         variable v_off  : natural range 0 to NB - 1;
         variable v_push : boolean;
         variable v_pop  : boolean;
+        variable v_resync : boolean;
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
@@ -428,6 +438,7 @@ begin
                 dq_cnt      <= 0;
                 cap_cnt     <= 0;
                 chunk_done  <= '0';
+                rd_slip_i   <= '0';
             else
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
@@ -458,7 +469,15 @@ begin
                 -- chunk's last nibble has been captured.
                 v_push := rd_accept = '1';
                 v_pop  := false;
-                if v_push then
+                -- The first read of a new RDQI transaction restarts the
+                -- bookkeeping, so a miscount can never carry over into
+                -- later transactions (see rd_slip).
+                v_resync := v_push and state = S_IDLE;
+                if v_resync then
+                    dq_nb(0)  <= core_req.nbytes;
+                    dq_off(0) <= unsigned(core_req.addr(LB - 1 downto 0));
+                    dq_wr     <= 1 mod C_DQ;
+                elsif v_push then
                     dq_nb(dq_wr)  <= core_req.nbytes;
                     dq_off(dq_wr) <= unsigned(core_req.addr(LB - 1 downto 0));
                     dq_wr         <= (dq_wr + 1) mod C_DQ;
@@ -486,6 +505,11 @@ begin
                     dq_cnt <= dq_cnt + 1;
                 elsif v_pop and not v_push then
                     dq_cnt <= dq_cnt - 1;
+                end if;
+                if v_resync then
+                    dq_rd   <= 0;
+                    dq_cnt  <= 1;
+                    cap_cnt <= 0;
                 end if;
 
                 -- Deliver a completed read chunk (the cycle after its last
@@ -784,7 +808,12 @@ begin
                                 resp_bvalid <= '1';
                             end if;
                         end if;
-                        -- read data is delivered per chunk (chunk_done)
+                        -- read data is delivered per chunk (chunk_done);
+                        -- by now every chunk of the transaction must have
+                        -- been delivered, else the capture count slipped
+                        if req_is_reg = '0' and req_we = '0' and (cap_cnt /= 0 or dq_cnt /= 0) then
+                            rd_slip_i <= '1';
+                        end if;
                         high_cnt <= 0;
                         state    <= S_CS_HIGH;
 

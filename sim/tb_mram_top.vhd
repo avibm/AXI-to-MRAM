@@ -124,6 +124,7 @@ architecture sim of tb_mram_top is
     signal tb_errs_p     : natural := 0;
     signal cpu_reset_n : std_logic;
     signal wr_pending  : std_logic;
+    signal rd_slip     : std_logic;
     signal boot_done   : std_logic;
     signal boot_fail   : std_logic;
 
@@ -219,7 +220,7 @@ begin
             cmd_rdid => cmd_req(I_RDID), cmd_rdar => cmd_req(I_RDAR),
             cmd_wrar => cmd_req(I_WRAR), cmd_reg_addr => cmd_reg_addr,
             cmd_wrsr_data => cmd_wrsr_data, skip_wren => skip_wren,
-            mram_wr_pending => wr_pending,
+            mram_wr_pending => wr_pending, mram_rd_slip => rd_slip,
             cmd_rdsr_data => cmd_rdsr_data, cmd_rdid_data => cmd_rdid_data,
             cmd_done => cmd_done, boot_hold => boot_hold,
             rd_sample_dly => std_logic_vector(to_unsigned(G_SAMPLE_DLY, 3)),
@@ -935,6 +936,8 @@ begin
                & " 4WQIO, " & integer'image(model_errs) & " protocol errors";
         if not (wr_finish and rd_finish and pci_finish) then
             report "TEST FAILED: timeout / boot_fail=" & std_logic'image(boot_fail) severity failure;
+        elsif rd_slip = '1' then
+            report "TEST FAILED: mram_rd_slip set" severity failure;
         elsif tb_errs_w + tb_errs_r + tb_errs_p + model_errs = 0 then
             report "TEST PASSED";
         else

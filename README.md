@@ -85,6 +85,12 @@ stays low for up to that long, waiting for the next contiguous read; any
 other access ends the wait at once. Same assumption about pausing SCLK as
 for writes, below.
 
+Debug output `mram_rd_slip` (sticky until reset): 1 = a read transaction
+ended with its capture count not matching the bytes clocked, so its data
+was wrong. The count restarts at every new read transaction, so a slip
+cannot carry over. It should never be 1. If it is, trigger Identify on its
+rising edge.
+
 Measured in simulation at 64 bits, six back-to-back 64-byte read bursts:
 384 bytes in 21.6 µs, ≈ 17.8 MB/s, as one RDQI. Without streaming, each
 8-byte beat would be its own RDQI (≈ 7 MB/s, my estimate).
