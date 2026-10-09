@@ -122,6 +122,7 @@ architecture sim of tb_mram_top is
     signal rd_t10_done   : boolean := false; -- reader idle until wr_step 4
     signal pci_finish    : boolean := false;
     signal tb_errs_p     : natural := 0;
+    signal axi_chk_errs  : natural := 0;
     signal cpu_reset_n : std_logic;
     signal wr_pending  : std_logic;
     signal rd_slip     : std_logic;
@@ -243,6 +244,70 @@ begin
             mem.write(a, x"EE"); -- stale working copy / general RAM
         end loop;
         wait;
+    end process;
+
+    ----------------------------------------------------------------------------
+    -- AXI protocol checker (slave side): handshake order and stability
+    ----------------------------------------------------------------------------
+    p_axi_chk : process (aclk)
+        type nat_q_t is array (0 to 63) of natural;
+        variable aw_n, wl_n, b_n, ar_n, r_bursts : natural := 0;
+        variable arq : nat_q_t;
+        variable ar_wr, ar_rd, r_left : natural := 0;
+        variable b_hold, r_hold : boolean := false;
+        variable bid_q : std_logic_vector(bid'range);
+        variable bresp_q : std_logic_vector(1 downto 0);
+        variable rdata_q : std_logic_vector(rdata'range);
+        variable rlast_q : std_logic;
+        variable rid_q : std_logic_vector(rid'range);
+        variable errs : natural := 0;
+        procedure bad(msg : string) is
+        begin
+            errs := errs + 1;
+            axi_chk_errs <= errs;
+            report "AXI CHECK: " & msg severity error;
+        end procedure;
+    begin
+        if rising_edge(aclk) and aresetn = '1' then
+            -- stability while valid and not ready (values from the last edge)
+            if b_hold then
+                if bvalid /= '1' then bad("BVALID dropped before BREADY"); end if;
+                if bid /= bid_q or bresp /= bresp_q then bad("BID/BRESP changed while BVALID held"); end if;
+            end if;
+            if r_hold then
+                if rvalid /= '1' then bad("RVALID dropped before RREADY"); end if;
+                if rdata /= rdata_q or rlast /= rlast_q or rid /= rid_q then
+                    bad("R payload changed while RVALID held");
+                end if;
+            end if;
+            -- B only after its AW and its last W
+            if bvalid = '1' and (b_n >= aw_n or b_n >= wl_n) then
+                bad("BVALID before AW/WLAST handshakes (aw=" & integer'image(aw_n) & " wl="
+                    & integer'image(wl_n) & " b=" & integer'image(b_n) & ")");
+            end if;
+            -- R only for an accepted AR, RLAST on the last beat
+            if rvalid = '1' and r_left = 0 and ar_wr = ar_rd then
+                bad("RVALID with no AR outstanding");
+            end if;
+            if awvalid = '1' and awready = '1' then aw_n := aw_n + 1; end if;
+            if wvalid = '1' and wready = '1' and wlast = '1' then wl_n := wl_n + 1; end if;
+            if bvalid = '1' and bready = '1' then b_n := b_n + 1; end if;
+            if arvalid = '1' and arready = '1' then
+                arq(ar_wr mod 64) := to_integer(unsigned(arlen)) + 1;
+                ar_wr := ar_wr + 1;
+            end if;
+            if rvalid = '1' and rready = '1' then
+                if r_left = 0 and ar_rd /= ar_wr then
+                    r_left := arq(ar_rd mod 64);
+                    ar_rd  := ar_rd + 1;
+                end if;
+                if (rlast = '1') /= (r_left = 1) then bad("RLAST on the wrong beat"); end if;
+                if r_left > 0 then r_left := r_left - 1; end if;
+            end if;
+            b_hold := bvalid = '1' and bready = '0';
+            r_hold := rvalid = '1' and rready = '0';
+            bid_q := bid; bresp_q := bresp; rdata_q := rdata; rlast_q := rlast; rid_q := rid;
+        end if;
     end process;
 
     -- Handshake monitor
@@ -938,7 +1003,7 @@ begin
             report "TEST FAILED: timeout / boot_fail=" & std_logic'image(boot_fail) severity failure;
         elsif rd_slip = '1' then
             report "TEST FAILED: mram_rd_slip set" severity failure;
-        elsif tb_errs_w + tb_errs_r + tb_errs_p + model_errs = 0 then
+        elsif tb_errs_w + tb_errs_r + tb_errs_p + model_errs + axi_chk_errs = 0 then
             report "TEST PASSED";
         else
             report "TEST FAILED: " & integer'image(tb_errs_w + tb_errs_r + tb_errs_p + model_errs)
