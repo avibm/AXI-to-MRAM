@@ -69,7 +69,10 @@ use work.mram_pkg.all;
 entity axi4_slave_wrapper is
     generic (
         G_ID_WIDTH        : integer := C_AXI_ID_WIDTH;
-        G_MAX_OUTSTANDING : integer := C_MAX_OUTSTANDING
+        G_MAX_OUTSTANDING : integer := C_MAX_OUTSTANDING;
+        -- false = no write continuation: each core write completes (bvalid)
+        -- before the next W beat is taken, as in the Oct 1 version
+        G_MERGE_WRITES    : boolean := true
     );
     port (
         aclk    : in  std_logic;
@@ -390,7 +393,8 @@ begin
                             wr_first_run         <= '0';
                             wr_chain             <= '0';
                             if (wr_mask and std_logic_vector(run_sum(C_AXI_STRB_WIDTH - 1 downto 0)))
-                                   = (wr_mask'range => '0') and wr_beats_left > 1 then
+                                   = (wr_mask'range => '0') and wr_beats_left > 1
+                               and G_MERGE_WRITES then
                                 wr_cand <= '1';
                             else
                                 wr_cand <= '0';

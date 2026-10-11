@@ -76,6 +76,7 @@ entity mram_top is
         G_CS_HIGH_WRITE_CYCLES : integer := 92;  -- tCS3 600ns at 150MHz
         G_POSTED_WRITES        : boolean := true; -- B as soon as the write data is held
         G_STREAM_WRITES        : boolean := true; -- one SPI write for contiguous AXI writes
+        G_MERGE_WRITES         : boolean := true; -- false = no write merging at all (Oct 1 behaviour)
         G_WR_LINGER_CYCLES     : natural := 256;  -- CS# low wait for the next write; 0 = off
         G_STREAM_READS         : boolean := true; -- one RDQI for contiguous reads
         G_RD_LINGER_CYCLES     : natural := 256   -- CS# low wait for the next read; 0 = off
@@ -242,7 +243,8 @@ begin
 
     u_axi_wrapper : entity work.axi4_slave_wrapper
         generic map (
-            G_ID_WIDTH => G_ID_WIDTH
+            G_ID_WIDTH     => G_ID_WIDTH,
+            G_MERGE_WRITES => G_MERGE_WRITES
         )
         port map (
             aclk           => aclk,
@@ -307,6 +309,7 @@ begin
             G_CS_HIGH_WRITE_CYCLES => G_CS_HIGH_WRITE_CYCLES,
             G_POSTED_WRITES        => G_POSTED_WRITES,
             G_STREAM_WRITES        => G_STREAM_WRITES,
+            G_MERGE_WRITES         => G_MERGE_WRITES,
             G_WR_LINGER_CYCLES     => G_WR_LINGER_CYCLES,
             G_STREAM_READS         => G_STREAM_READS,
             G_RD_LINGER_CYCLES     => G_RD_LINGER_CYCLES

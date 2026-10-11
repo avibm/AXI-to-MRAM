@@ -164,6 +164,7 @@ entity mram_qspi_backend is
         G_ACLK_FREQ_HZ      : natural := 150_000_000;  -- only used by the SCLK limit checks
         G_POSTED_WRITES     : boolean := true;   -- bvalid at acceptance (see header)
         G_STREAM_WRITES     : boolean := true;   -- append contiguous writes across transactions
+        G_MERGE_WRITES      : boolean := true;   -- false = no write is ever appended
         G_WR_LINGER_CYCLES  : natural := 256;    -- CS# low wait for the next write; 0 = off
         G_STREAM_READS      : boolean := true;   -- one RDQI for contiguous read requests
         G_RD_LINGER_CYCLES  : natural := 256     -- CS# low wait for the next read; 0 = off
@@ -392,7 +393,8 @@ begin
                         and req_is_reg = '0' and join_pending = '0'
                         and core_req.valid = '1' and core_req.we = req_we
                         and unsigned('0' & core_req.addr) = next_addr
-                        and ((req_we = '1' and (core_req.cont = '1' or G_STREAM_WRITES)) or
+                        and ((req_we = '1' and G_MERGE_WRITES
+                              and (core_req.cont = '1' or G_STREAM_WRITES)) or
                              (req_we = '0' and G_STREAM_READS and dq_cnt < C_DQ - 1))
                else '0';
 
