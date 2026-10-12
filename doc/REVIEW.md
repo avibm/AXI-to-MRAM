@@ -262,6 +262,24 @@ Fix:
 With the same injection, the fixed backend returns correct data and sets
 `mram_rd_slip`. The testbench fails if `mram_rd_slip` is ever set.
 
+### Rev. 10 – 512-bit board test: wrong read data inside the FPGA
+
+* With the 64-bit interconnect port, PCI writes never reached the IP. The
+  interconnect accepted them from the bridge and never forwarded them.
+  With the port back at 512 bits, the same write works end to end. The
+  64-bit interconnect configuration is the suspect, not the IP.
+* At 512 bits, the read of address 0 was correct on the MRAM pins
+  (EBh, address 0, data 12 34 56 78 93 81 81 E1 ...). The IP returned
+  12 34 A6 A5 A5 81 81 A1 ...: a bit-level mix of the new data and the
+  previous read, not a shift. That pattern points to a timing failure in
+  the wide read-data path. The build had Identify and no timing effort,
+  so this is likely but not proven.
+* Change: the read-data alignment (byte reverse plus a shift by
+  NB - nbytes - offset bytes) is now three register stages: amount, coarse
+  shift by 8-byte groups, fine shift by 0..7 bytes. The read buffer in the
+  wrapper is kept in flip-flops (syn_ramstyle = "registers"). This adds
+  two aclk of read latency. Regression passes at 64, 128 and 512 bits.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

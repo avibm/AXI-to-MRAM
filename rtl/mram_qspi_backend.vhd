@@ -331,6 +331,12 @@ architecture rtl of mram_qspi_backend is
     signal done_off : unsigned(LB - 1 downto 0);
     signal rd_slip_i : std_logic := '0';
 
+    -- Read data alignment pipeline (see chunk_done)
+    signal al_s1, al_s2 : std_logic := '0';
+    signal al_v1, al_v2 : std_logic_vector(T downto 0);
+    signal al_amt1      : natural range 0 to NB - 1;
+    signal al_amt2      : natural range 0 to 7;
+
     signal resp_rvalid : std_logic := '0';
     signal resp_bvalid : std_logic := '0';
     signal resp_rdata  : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
@@ -441,6 +447,8 @@ begin
                 cap_cnt     <= 0;
                 chunk_done  <= '0';
                 rd_slip_i   <= '0';
+                al_s1       <= '0';
+                al_s2       <= '0';
             else
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
@@ -519,10 +527,25 @@ begin
                 -- Received bytes sit in shreg(8*n-1:0), first byte highest.
                 -- After byte_rev the first byte is in lane NB-n; shift it
                 -- down to its lane.
+                -- Pipelined in three register stages so no single clock
+                -- has to do the full-width shift (at 512 bits a 64-way
+                -- byte mux plus the shift-amount arithmetic):
+                --   1: byte-reverse (wiring) and shift amount in bytes
+                --   2: coarse shift by whole groups of 8 bytes
+                --   3: fine shift by 0..7 bytes, then rvalid
+                -- Chunks arrive >= 8 aclk apart, so the stages never overlap.
+                al_s1 <= chunk_done;
                 if chunk_done = '1' then
-                    resp_rdata  <= std_logic_vector(shift_right(
-                                       unsigned(byte_rev(shreg)),
-                                       8 * (NB - to_integer(done_nb) - to_integer(done_off))));
+                    al_v1   <= byte_rev(shreg);
+                    al_amt1 <= NB - to_integer(done_nb) - to_integer(done_off);
+                end if;
+                al_s2 <= al_s1;
+                if al_s1 = '1' then
+                    al_v2   <= std_logic_vector(shift_right(unsigned(al_v1), 64 * (al_amt1 / 8)));
+                    al_amt2 <= al_amt1 mod 8;
+                end if;
+                if al_s2 = '1' then
+                    resp_rdata  <= std_logic_vector(shift_right(unsigned(al_v2), 8 * al_amt2));
                     resp_rvalid <= '1';
                 end if;
 

@@ -258,6 +258,11 @@ architecture rtl of axi4_slave_wrapper is
     constant C_RBUF : natural := 4;
     type rbuf_t is array (0 to C_RBUF - 1) of std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
     signal rbuf      : rbuf_t;
+    -- Keep the read buffer in flip-flops (Synplify): a RAM mapping of
+    -- this small, wide buffer brings nothing and adds a timing-critical
+    -- read path.
+    attribute syn_ramstyle : string;
+    attribute syn_ramstyle of rbuf : signal is "registers";
     signal rbuf_err  : std_logic_vector(C_RBUF - 1 downto 0);
     signal rb_wr, rb_rd : integer range 0 to C_RBUF - 1 := 0;
     signal rb_cnt    : integer range 0 to C_RBUF := 0;
