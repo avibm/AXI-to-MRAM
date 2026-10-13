@@ -2,3 +2,4 @@ sim/build/
 *.ghw
 *.o
 *.cf
+sim/build_dma/

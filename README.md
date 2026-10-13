@@ -209,6 +209,7 @@ from SCLK falling at the FPGA to the data arriving back at the FPGA:
 
 ```sh
 sim/run_ghdl.sh          # GHDL >= 4.x, VHDL-2008; prints TEST PASSED / FAILED
+sim/run_dma.sh           # mixed traffic: PCI DMA reads + CPU-like reads/writes
 sim/run_ghdl.sh --wave   # also writes sim/build/tb_mram_top.ghw
 sim/run_ghdl.sh -gG_MODEL_TCO_PS=20000 -gG_SAMPLE_DLY=0   # slow board, no delay: fails like the first board
 ```

@@ -280,6 +280,25 @@ With the same injection, the fixed backend returns correct data and sets
   wrapper is kept in flip-flops (syn_ramstyle = "registers"). This adds
   two aclk of read latency. Regression passes at 64, 128 and 512 bits.
 
+### Rev. 11 – reads starved by writes (fair arbitration)
+
+On the board, a PCI read of 0x6000000 to a file hung while the firmware
+was running. The new stress test `sim/tb_dma.vhd` (PCI-style DMA read
+bursts, several outstanding, RREADY stalls, interleaved with CPU-like line
+reads and a steady stream of 8-byte writes) showed why: the wrapper gave
+writes strict priority over reads, so while writes kept arriving, a
+waiting read never got the MRAM. With posted B, each write completes
+quickly on AXI, so a CPU can send writes faster and the effect is worse.
+4 KB of DMA reads took 9.3 ms instead of 0.22 ms, and a longer run did not
+finish within 20 ms.
+
+Fix: when both sides wait, the side served last keeps the MRAM, so streams
+stay together, unless the other side has waited `G_ARB_MAX_WAIT` cycles
+(default 256, ≈ 1.7 µs). The same load now takes 3.2 ms; the remaining
+time is the MRAM itself serving the writes. All data, RID, RLAST and RRESP
+checks pass; no hang. The main testbench passes at 64 and 512 bits and at
+sample delays 1–3.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

@@ -55,8 +55,11 @@
 -- read in one RDQI. R data is returned in order from the buffer.
 --
 -- Core-side arbitration: the write and read engines each hold their request
--- until accepted. Writes win when both are presented; ready is routed only
--- to the engine whose request is actually on core_req.
+-- until accepted. When both are waiting, the side served last keeps going,
+-- so a streamed read or write is not cut up, unless the other side has
+-- waited G_ARB_MAX_WAIT cycles; then it goes next. A steady stream of writes
+-- from one master therefore cannot starve another master's reads, or the
+-- reverse. ready is routed only to the engine whose request is on core_req.
 --
 -- Language: VHDL-2008
 --------------------------------------------------------------------------------
@@ -72,7 +75,10 @@ entity axi4_slave_wrapper is
         G_MAX_OUTSTANDING : integer := C_MAX_OUTSTANDING;
         -- false = no write continuation: each core write completes (bvalid)
         -- before the next W beat is taken, as in the Oct 1 version
-        G_MERGE_WRITES    : boolean := true
+        G_MERGE_WRITES    : boolean := true;
+        -- Longest time (aclk cycles) a read or write request waits while the
+        -- other side keeps the MRAM busy (see "Core-side arbitration")
+        G_ARB_MAX_WAIT    : natural := 256
     );
     port (
         aclk    : in  std_logic;
@@ -245,6 +251,9 @@ architecture rtl of axi4_slave_wrapper is
     signal rd_fifo_full  : std_logic;
     signal rd_core_req_o : core_req_t := CORE_REQ_IDLE;
     signal rd_ready      : std_logic;
+    signal sel_rd        : std_logic;          -- the read engine's request is on core_req
+    signal last_rd       : std_logic := '0';   -- the last request served was a read
+    signal rd_wait, wr_wait : natural range 0 to G_ARB_MAX_WAIT := 0; -- cycles waiting
 
     -- Issue engine
     signal is_ptr    : integer range 0 to G_MAX_OUTSTANDING - 1 := 0;
@@ -273,14 +282,46 @@ begin
     rd_fifo_full  <= '1' when rd_fifo_count = G_MAX_OUTSTANDING else '0';
 
     ----------------------------------------------------------------------------
-    -- Core request arbiter (combinational mux, fixed write priority --
-    -- writes are typically rarer/shorter-lived than reads; revisit if
-    -- profiling shows write starvation). Each engine only sees ready while
+    -- Core request arbiter (combinational mux): read and write engines take
+    -- turns when both wait (see header). Each engine only sees ready while
     -- its own request is the one on core_req.
     ----------------------------------------------------------------------------
-    core_req <= wr_core_req_o when wr_core_req_o.valid = '1' else rd_core_req_o;
-    wr_ready <= core_resp.ready and wr_core_req_o.valid;
-    rd_ready <= core_resp.ready and rd_core_req_o.valid and not wr_core_req_o.valid;
+    sel_rd   <= '0' when rd_core_req_o.valid = '0' else
+                '1' when wr_core_req_o.valid = '0' else
+                '1' when rd_wait >= G_ARB_MAX_WAIT else
+                '0' when wr_wait >= G_ARB_MAX_WAIT else
+                last_rd;
+    core_req <= rd_core_req_o when sel_rd = '1' else wr_core_req_o;
+    wr_ready <= core_resp.ready and wr_core_req_o.valid and not sel_rd;
+    rd_ready <= core_resp.ready and sel_rd;
+
+    -- Who was served last, and how long each side has been waiting.
+    process (aclk)
+    begin
+        if rising_edge(aclk) then
+            if aresetn = '0' then
+                last_rd <= '0';
+                rd_wait <= 0;
+                wr_wait <= 0;
+            else
+                if rd_ready = '1' then
+                    last_rd <= '1';
+                elsif wr_ready = '1' then
+                    last_rd <= '0';
+                end if;
+                if rd_core_req_o.valid = '0' or rd_ready = '1' then
+                    rd_wait <= 0;
+                elsif rd_wait < G_ARB_MAX_WAIT then
+                    rd_wait <= rd_wait + 1;
+                end if;
+                if wr_core_req_o.valid = '0' or wr_ready = '1' then
+                    wr_wait <= 0;
+                elsif wr_wait < G_ARB_MAX_WAIT then
+                    wr_wait <= wr_wait + 1;
+                end if;
+            end if;
+        end if;
+    end process;
 
     run_sum   <= unsigned('0' & wr_mask) + unsigned('0' & (wr_mask and std_logic_vector(
                                                          unsigned(not wr_mask) + 1)));

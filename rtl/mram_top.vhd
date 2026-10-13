@@ -77,6 +77,7 @@ entity mram_top is
         G_POSTED_WRITES        : boolean := true; -- B as soon as the write data is held
         G_STREAM_WRITES        : boolean := true; -- one SPI write for contiguous AXI writes
         G_MERGE_WRITES         : boolean := true; -- false = no write merging at all (Oct 1 behaviour)
+        G_ARB_MAX_WAIT         : natural := 256;  -- max aclk a read/write waits behind the other side
         G_WR_LINGER_CYCLES     : natural := 256;  -- CS# low wait for the next write; 0 = off
         G_STREAM_READS         : boolean := true; -- one RDQI for contiguous reads
         G_RD_LINGER_CYCLES     : natural := 256   -- CS# low wait for the next read; 0 = off
@@ -244,7 +245,8 @@ begin
     u_axi_wrapper : entity work.axi4_slave_wrapper
         generic map (
             G_ID_WIDTH     => G_ID_WIDTH,
-            G_MERGE_WRITES => G_MERGE_WRITES
+            G_MERGE_WRITES => G_MERGE_WRITES,
+            G_ARB_MAX_WAIT => G_ARB_MAX_WAIT
         )
         port map (
             aclk           => aclk,

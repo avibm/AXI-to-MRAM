@@ -618,6 +618,8 @@ begin
         -- Includes the PCI bridge's pattern: a 64-byte INCR burst at a 0x20
         -- offset (at 512 bits: 2 beats with half strobes) -> must become ONE
         -- 4WQIO of 64 bytes.
+        -- write-merge counts are checked below: no concurrent reads
+        if not rd_t10_done then wait until rd_t10_done; end if;
         wr_paused2 <= true;
         if pci_step < 3 then wait until pci_step >= 3; end if;
         wr_paused2 <= false;
