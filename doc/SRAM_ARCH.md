@@ -18,7 +18,7 @@ before or during Phase 2; they are collected in section 12.
 | 7 | PCI access | PCI may read and write SRAM through the interconnect at any time after boot. No hardware coherency; software owns shared buffers. |
 | 8 | NOEL-V caches | Unknown. Only affects the software rules in section 7. |
 | 9 | ECC | Use the ECC of `PF_SRAM_AHBL_AXI` (**OPEN**: check the option exists and how errors are reported). |
-| 10 | Compatibility | Existing `mram_top` ports kept where still meaningful. The MRAM → MRAM boot copy (`mram_boot_copy.vhd`) is removed and replaced by the SRAM boot copy, with no legacy switch. The diagnostic top `mram_top_oct1.vhd` is removed (done). |
+| 10 | Compatibility | Existing `mram_top` ports kept where still meaningful. The MRAM → MRAM boot copy (`mram_boot_copy.vhd`) is removed and replaced by the SRAM boot copy, with no legacy switch. The diagnostic top `mram_top_oct1.vhd` is removed (done). `boot_hold` is kept, with the same meaning: the copy waits after the power-up time while it is 1, and AXI access to the MRAM stays open. |
 | 11 | Branch | `mram_sram`, from `axi2mram`. |
 | A | Copy engine | Hardware copy inside `mram_top`, writing the SRAM through a **new AXI4 master port** connected as **INITIATOR2**. The CPU is released only after the copy is verified. |
 
