@@ -299,6 +299,23 @@ time is the MRAM itself serving the writes. All data, RID, RLAST and RRESP
 checks pass; no hang. The main testbench passes at 64 and 512 bits and at
 sample delays 1–3.
 
+### Rev. 12 – SRAM preparation (branch `mram_sram`)
+
+* `rtl/mram_top_oct1.vhd` removed: the Oct 1 diagnostic top is no longer
+  needed. The run script and README no longer list it.
+* AXI ID width 5 → 6 (`C_AXI_ID_WIDTH` in `mram_pkg`). With the third
+  initiator (the SRAM boot copy, INITIATOR2) the interconnect's target ID
+  is ID[5:0]; the SRAM IP was changed to 6 as well. A target narrower than
+  the interconnect's ID drops the top bit, so a response can return to the
+  wrong initiator and hang it. O15 below still says 5-bit; this supersedes
+  it.
+* Testbench: the burst IDs now set the top ID bit on every other burst, so
+  all ID bits are checked on BID and RID. Forcing the top bit of BID/RID
+  to 0 in the wrapper makes the testbench fail (454 RID and 22 BID
+  mismatches); restored, it passes. `sim/run_dma.sh` passes with no
+  errors.
+* Architecture for the SRAM execution memory: `doc/SRAM_ARCH.md`.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

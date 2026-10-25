@@ -6,7 +6,7 @@
 -- compatible AXI4 slave interface.
 --
 -- AXI address/data/ID widths are system constants that match the AXI
--- interconnect (32-bit address, 5-bit ID). The data width
+-- interconnect (32-bit address, 6-bit ID). The data width
 -- C_AXI_DATA_WIDTH is set here: 64 (default), 128, 256 or 512. Everything
 -- else (byte lanes, largest AxSIZE, request size) follows from it. The MRAM itself
 -- is addressed with C_MRAM_ADDR_WIDTH bits (128MB = one 1Gb die); the AXI
@@ -37,7 +37,7 @@ package mram_pkg is
                                          + 5 * boolean'pos(C_BEAT_BYTES = 32)
                                          + 6 * boolean'pos(C_BEAT_BYTES = 64);
     constant C_AXI_LEN_WIDTH  : integer := 8;                     -- AXI4 AWLEN/ARLEN
-    constant C_AXI_ID_WIDTH   : integer := 5;                     -- matches the AXI interconnect
+    constant C_AXI_ID_WIDTH   : integer := 6;                     -- matches the interconnect TARGET0 ID[5:0]
 
     constant C_MAX_OUTSTANDING : integer := 4; -- outstanding AXI read bursts tracked
 

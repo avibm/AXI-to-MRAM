@@ -32,6 +32,9 @@ about 1,850 register bits against about 5,900 for the previous 512-bit
 build, before TMR. The large 512-bit byte shifters shrink by a similar
 factor. Check the Libero resource report for real numbers.
 
+AXI ID width: `C_AXI_ID_WIDTH` = 6 (ID[5:0]), matching TARGET0 of the
+interconnect now that it has three initiators.
+
 Interconnect: the MRAM target port must be configured for the same width.
 The PCI bridge's 32-bit bursts are then packed into 64-bit beats, and
 NOEL-V's 64-bit port needs no conversion.

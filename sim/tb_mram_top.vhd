@@ -181,6 +181,13 @@ architecture sim of tb_mram_top is
         return (start / n) * n + beat * n;
     end function;
 
+    -- AXI ID for a burst: low bits from v, the top ID bit set for odd
+    -- lengths, so every ID bit (C_AXI_ID_WIDTH) is exercised
+    function tid(v, len : natural) return natural is
+    begin
+        return v mod 2 ** (C_AXI_ID_WIDTH - 1) + (len mod 2) * 2 ** (C_AXI_ID_WIDTH - 1);
+    end function;
+
 begin
 
     aclk    <= not aclk after T_CLK / 2;
@@ -365,7 +372,7 @@ begin
             awlen   <= std_logic_vector(to_unsigned(len, 8));
             awsize  <= std_logic_vector(to_unsigned(sz, 3));
             awburst <= burst;
-            awid    <= std_logic_vector(to_unsigned(len + 3, awid'length));
+            awid    <= std_logic_vector(to_unsigned(tid(len + 3, len), awid'length));
             awvalid <= '1';
             wdata   <= beats(0);
             wstrb   <= strbs(0);
@@ -403,7 +410,7 @@ begin
             end loop;
             check(bresp = exp_resp, "BRESP " & to_string(bresp) & " expected " & to_string(exp_resp)
                   & " at 0x" & to_hstring(to_unsigned(addr, 32)));
-            check(bid = std_logic_vector(to_unsigned(len + 3, bid'length)), "BID mismatch");
+            check(bid = std_logic_vector(to_unsigned(tid(len + 3, len), bid'length)), "BID mismatch");
             for i in 1 to 4 loop
                 wait until rising_edge(aclk);
             end loop;
@@ -743,7 +750,7 @@ begin
             arlen   <= std_logic_vector(to_unsigned(len, 8));
             arsize  <= std_logic_vector(to_unsigned(sz, 3));
             arburst <= burst;
-            arid    <= std_logic_vector(to_unsigned(len + 5, arid'length));
+            arid    <= std_logic_vector(to_unsigned(tid(len + 5, len), arid'length));
             arvalid <= '1';
             loop
                 wait until rising_edge(aclk);
@@ -763,7 +770,7 @@ begin
                 end loop;
                 check(rresp = exp_resp, "RRESP " & to_string(rresp) & " at 0x"
                       & to_hstring(to_unsigned(addr, 32)));
-                check(rid = std_logic_vector(to_unsigned(len + 5, rid'length)), "RID mismatch");
+                check(rid = std_logic_vector(to_unsigned(tid(len + 5, len), rid'length)), "RID mismatch");
                 check((rlast = '1') = (beat = len), "RLAST wrong on beat " & integer'image(beat));
                 if exp_resp = "00" then
                     ba := beat_addr(addr, sz, beat);
