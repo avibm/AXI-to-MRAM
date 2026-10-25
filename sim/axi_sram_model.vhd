@@ -21,6 +21,9 @@
 --       corrupt_always = '1': every write to corrupt_addr is corrupted
 --       stop_b   = '1': no BVALID at all (a stuck target)
 --       inj_id   : count of B responses sent with an inverted BID
+--       inj_xb / inj_xr : count of B / R responses sent while none is
+--                  outstanding (slave protocol violations)
+--       inj_rl / inj_rid : count of R beats sent with RLAST / RID inverted
 --     The counts are cumulative: raise inj_b from 0 to 1 for one error,
 --     later to 2 for another.
 --   * Backdoor: package axi_sram_mem_pkg, shared variable sram.
@@ -103,6 +106,8 @@ entity axi_sram_model is
         stop_b         : in  std_logic := '0';
         inj_b, inj_r, inj_c : in natural := 0;
         inj_id         : in  natural := 0;   -- count of B responses with a wrong BID
+        inj_xb, inj_xr : in  natural := 0;   -- count of spurious B / R (none outstanding)
+        inj_rl, inj_rid : in natural := 0;   -- count of R beats with RLAST / RID inverted
         corrupt_addr   : in  natural := 0;
         corrupt_always : in  std_logic := '0';
         n_aw, n_ar     : out natural := 0;   -- accepted bursts
@@ -132,6 +137,8 @@ begin
         variable b_h, b_c : natural := 0;
         variable w_beat, r_beat : natural := 0;
         variable nb_inj, nr_inj, nc_inj, nid_inj : natural := 0;
+        variable nxb, nxr, nrl, nrid : natural := 0;
+        variable last_bid : std_logic_vector(G_ID_WIDTH - 1 downto 0) := (others => '0');
         variable c_this : boolean := false;               -- current W burst may corrupt
         variable c_hit  : boolean := false;               -- it did corrupt corrupt_addr
         variable errs, naw, nar : natural := 0;
@@ -253,6 +260,17 @@ begin
                         s_axi_bresp <= bq(b_h)(G_ID_WIDTH + 1 downto G_ID_WIDTH);
                     end if;
                     s_axi_bvalid <= '1';
+                    last_bid := bq(b_h)(G_ID_WIDTH - 1 downto 0);
+                elsif (s_axi_bvalid = '0' or s_axi_bready = '1') and b_c = 0 and aw_c = 0
+                      and nxb < inj_xb then
+                    -- spurious B, nothing outstanding: queued as a dummy
+                    -- entry so that its handshake pops it like a real one
+                    s_axi_bid    <= last_bid;
+                    s_axi_bresp  <= "00";
+                    s_axi_bvalid <= '1';
+                    b_c := b_c + 1;           -- popped by its handshake
+                    bq(b_h) := "00" & last_bid;
+                    nxb := nxb + 1;
                 elsif s_axi_bvalid = '1' and s_axi_bready = '1' then
                     s_axi_bvalid <= '0';
                 end if;
@@ -286,6 +304,14 @@ begin
                     s_axi_rid   <= bt.id;
                     s_axi_rdata <= rd;
                     s_axi_rlast <= '1' when r_beat = bt.len else '0';
+                    if nrl < inj_rl then
+                        s_axi_rlast <= '0' when r_beat = bt.len else '1';
+                        nrl := nrl + 1;
+                    end if;
+                    if nrid < inj_rid then
+                        s_axi_rid <= not bt.id;
+                        nrid := nrid + 1;
+                    end if;
                     if bt.bad then
                         s_axi_rresp <= "10";
                     elsif nr_inj < inj_r then
@@ -295,6 +321,17 @@ begin
                         s_axi_rresp <= "00";
                     end if;
                     s_axi_rvalid <= '1';
+                elsif (s_axi_rvalid = '0' or s_axi_rready = '1') and ar_c = 0 and nxr < inj_xr then
+                    -- spurious R: one beat with RLAST, no AR outstanding
+                    s_axi_rid    <= last_bid;
+                    s_axi_rdata  <= (others => '0');
+                    s_axi_rresp  <= "00";
+                    s_axi_rlast  <= '1';
+                    s_axi_rvalid <= '1';
+                    arq((ar_h + ar_c) mod DEPTH) := (id => last_bid, addr => 0, len => 0,
+                                                     size => NB, bad => false);
+                    ar_c := ar_c + 1;         -- popped by its handshake
+                    nxr  := nxr + 1;
                 end if;
             end if;
             errors <= errs;

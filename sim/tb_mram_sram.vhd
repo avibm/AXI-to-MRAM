@@ -30,6 +30,8 @@
 --   T12 watchdog in the verify pass -> drain -> retry
 --   T13 wrong BID -> retry
 --   T14 aresetn in the middle of a copy -> clean restart
+--   T15 slave protocol violations (R with no AR, B with no write, RLAST on
+--       the wrong beat, wrong RID) -> retry, error bit 14
 --   T9  B never returned -> watchdog -> drain timeout -> stuck: boot_fail,
 --       no new AXI traffic, reload ignored, MRAM AXI port open; aresetn
 --       recovers (run last)
@@ -102,6 +104,8 @@ architecture sim of tb_mram_sram is
     -- SRAM model controls
     signal stall_all, stop_b, corrupt_always : std_logic := '0';
     signal inj_b, inj_r, inj_c, inj_id : natural := 0;
+    signal inj_xb, inj_xr, inj_rl, inj_rid : natural := 0;
+    signal resp_errs : natural;
     signal corrupt_addr : natural := 0;
     signal s_naw, s_nar, s_errs : natural;
     signal chk_errs, aw_outst, ar_outst : natural;
@@ -198,7 +202,8 @@ begin
             s_axi_rid => m_rid, s_axi_rdata => m_rdata, s_axi_rresp => m_rresp, s_axi_rlast => m_rlast,
             s_axi_rvalid => m_rvalid, s_axi_rready => m_rready,
             stall_all => stall_all, stop_b => stop_b, inj_b => inj_b, inj_r => inj_r, inj_c => inj_c,
-            inj_id => inj_id,
+            inj_id => inj_id, inj_xb => inj_xb, inj_xr => inj_xr, inj_rl => inj_rl,
+            inj_rid => inj_rid,
             corrupt_addr => corrupt_addr, corrupt_always => corrupt_always,
             n_aw => s_naw, n_ar => s_nar, errors => s_errs);
 
@@ -213,7 +218,7 @@ begin
             arid => m_arid, araddr => m_araddr, arlen => m_arlen, arsize => m_arsize,
             arburst => m_arburst, arvalid => m_arvalid, arready => m_arready,
             rlast => m_rlast, rvalid => m_rvalid, rready => m_rready,
-            quiet => quiet, errors => chk_errs, aw_outst => aw_outst, ar_outst => ar_outst);
+            quiet => quiet, errors => chk_errs, resp_errors => resp_errs, aw_outst => aw_outst, ar_outst => ar_outst);
 
     -- Preload the MRAM master copy; SRAM starts as zeros. The MRAM model
     -- stores 1MB per 32MB region (address bits 19:0), so G_COPY must not
@@ -658,6 +663,33 @@ begin
         wait_end("T14");
         check_ok("T14", 0, "0000000");
         report "T14 done (aresetn during a copy)";
+
+        ------------------------------------------------------------------------
+        -- T15: a slave that breaks the protocol: each fault -> retry, bit 14
+        ------------------------------------------------------------------------
+        reload;                                   -- R with no AR (copy pass)
+        wait until phase(boot_status) = 3 for 1 ms;
+        clk(300);
+        inj_xr <= 1;
+        wait_end("T15a");
+        check_ok("T15a", 1, "1000000");
+        reload;                                   -- B with no write (verify pass)
+        wait until phase(boot_status) = 4 for 2 ms;
+        clk(300);
+        inj_xb <= 1;
+        wait_end("T15b");
+        check_ok("T15b", 1, "1000000");
+        inj_rl <= 1;                              -- RLAST on the wrong beat
+        reload;
+        wait_end("T15c");
+        check_ok("T15c", 1, "1000000");
+        inj_rid <= 1;                             -- wrong RID
+        reload;
+        wait_end("T15d");
+        check_ok("T15d", 1, "1000000");
+        check(resp_errs = 3, "T15: checker saw " & integer'image(resp_errs)
+              & " slave violations, expected 3");
+        report "T15 done (slave protocol violations -> retry)";
 
         ------------------------------------------------------------------------
         -- T9: B never returned -> stuck; aresetn recovers

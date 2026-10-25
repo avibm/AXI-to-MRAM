@@ -602,6 +602,14 @@ begin
         beats(0) := mk_beat(9); strbs(0) := (others => '0');
         axi_write(16#3040#, 0, SZM, "01", beats, strbs, "00", true);
 
+        -- T5c: 3-beat burst whose middle beat has no strobes: beats 0 and 2
+        -- written, beat 1's bytes unchanged, one B
+        for b in 0 to 2 loop
+            beats(b) := mk_beat(20 + b); strbs(b) := (others => '1');
+        end loop;
+        strbs(1) := (others => '0');
+        axi_write(16#3080#, 2, SZM, "01", beats, strbs, "00", true);
+
         -- T6: 4-beat full-width INCR burst -> one 4WQIO
         for b in 0 to 3 loop
             beats(b) := mk_beat(10 + b); strbs(b) := (others => '1');

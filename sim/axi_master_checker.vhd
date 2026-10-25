@@ -12,8 +12,10 @@
 --   * W: beats counted against the AWLEN of the bursts in AW order; WLAST
 --     exactly on the last beat; WSTRB all ones (this master writes full
 --     beats). With G_W_AFTER_AW, no W beat before its AW is accepted.
---   * Responses: no B without a completed write burst, no R without an
---     outstanding AR (slave side, checked for completeness).
+--   * Responses (slave side, counted in resp_errors, not errors): no B
+--     without a completed write burst, no R without an outstanding AR,
+--     RLAST exactly on the last beat of each AR. A response that breaks
+--     these rules is not counted as completing anything.
 --   * quiet = '1' (the testbench drives it after boot_done): any VALID from
 --     the master is an error.
 --   * aw_outst / ar_outst: accepted AWs without B, ARs without RLAST.
@@ -50,7 +52,8 @@ entity axi_master_checker is
         arvalid, arready : in std_logic;
         rlast, rvalid, rready : in std_logic;
         quiet   : in std_logic := '0';
-        errors  : out natural := 0;
+        errors  : out natural := 0;       -- master-side violations
+        resp_errors : out natural := 0;   -- slave-side violations
         aw_outst, ar_outst : out natural := 0
     );
 end entity axi_master_checker;
@@ -59,7 +62,8 @@ architecture sim of axi_master_checker is
     constant NB : natural := G_DATA_W / 8;
 begin
     process (aclk)
-        variable errs : natural := 0;
+        variable errs, rerrs : natural := 0;
+        variable ar_h2, ar_c2, r_beat : natural := 0;
         -- previous cycle
         variable p_awv, p_awr, p_wv, p_wr, p_arv, p_arr : std_logic := '0';
         variable p_aw : std_logic_vector(G_ID_WIDTH + 32 + 8 + 3 + 2 - 1 downto 0);
@@ -68,6 +72,7 @@ begin
         -- AWLEN of accepted bursts, in order, for the W beat count
         type len_q_t is array (0 to 63) of natural;
         variable lens : len_q_t;
+        variable arlens : len_q_t;
         variable l_h, l_c : natural := 0;
         variable w_beat : natural := 0;
         variable w_done, n_b, n_aw, n_ar, n_rl : natural := 0;
@@ -102,7 +107,7 @@ begin
                 p_awv := '0'; p_wv := '0'; p_arv := '0';
                 p_awr := '0'; p_wr := '0'; p_arr := '0';
                 l_h := 0; l_c := 0; w_beat := 0; w_done := 0; n_b := 0; n_aw := 0;
-                n_ar := 0; n_rl := 0;
+                n_ar := 0; n_rl := 0; ar_h2 := 0; ar_c2 := 0; r_beat := 0;
             else
                 if not (is01(awvalid) and is01(wvalid) and is01(arvalid) and is01(bready)
                         and is01(rready) and is01(awready) and is01(wready) and is01(arready)
@@ -157,16 +162,37 @@ begin
                     end if;
                 end if;
                 if bvalid = '1' and bready = '1' then
-                    n_b := n_b + 1;
-                    if n_b > w_done then bad("B before its write burst completed"); end if;
+                    if n_b >= w_done then
+                        rerrs := rerrs + 1;
+                        report G_NAME & " slave: B before its write burst completed" severity note;
+                    else
+                        n_b := n_b + 1;
+                    end if;
                 end if;
                 if arvalid = '1' and arready = '1' then
                     check_addr("AR", araddr, arlen, arsize, arburst);
-                    n_ar := n_ar + 1;
+                    arlens((ar_h2 + ar_c2) mod 64) := to_integer(unsigned(arlen));
+                    ar_c2 := ar_c2 + 1;
+                    n_ar  := n_ar + 1;
                 end if;
                 if rvalid = '1' and rready = '1' then
-                    if n_rl >= n_ar then bad("R beat with no outstanding AR"); end if;
-                    if rlast = '1' then n_rl := n_rl + 1; end if;
+                    if ar_c2 = 0 then
+                        rerrs := rerrs + 1;
+                        report G_NAME & " slave: R beat with no outstanding AR" severity note;
+                    else
+                        if (rlast = '1') /= (r_beat = arlens(ar_h2)) then
+                            rerrs := rerrs + 1;
+                            report G_NAME & " slave: RLAST on the wrong beat" severity note;
+                        end if;
+                        if r_beat = arlens(ar_h2) then
+                            r_beat := 0;
+                            ar_h2  := (ar_h2 + 1) mod 64;
+                            ar_c2  := ar_c2 - 1;
+                            n_rl   := n_rl + 1;
+                        else
+                            r_beat := r_beat + 1;
+                        end if;
+                    end if;
                 end if;
 
                 p_awv := awvalid; p_awr := awready; p_aw := aw_v;
@@ -174,6 +200,7 @@ begin
                 p_wv  := wvalid;  p_wr  := wready;  p_w  := wlast & wstrb & wdata;
             end if;
             errors   <= errs;
+            resp_errors <= rerrs;
             aw_outst <= n_aw - n_b;
             ar_outst <= n_ar - n_rl;
         end if;
