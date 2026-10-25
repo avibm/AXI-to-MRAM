@@ -1,0 +1,307 @@
+# SRAM execution memory – architecture (draft for approval)
+
+Status: **Phase 1 draft, not approved.** No RTL has been written for this
+yet. Every figure marked *estimate* is a hand calculation, not a
+measurement. Items marked **OPEN** need an answer or a check in Libero
+before or during Phase 2; they are collected in section 12.
+
+## 1. Decisions taken (from the requirements discussion)
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Purpose | 1 MB on-chip SRAM is execution and working memory for NOEL-V. No cache in front of the MRAM. |
+| 2 | Type | On-chip, Microchip `PF_SRAM_AHBL_AXI`, already connected to the CoreAXI4Interconnect as the second target (TARGET1) and tested on the board (read and write). |
+| 3 | Address map | SRAM at AXI address 0x0 (the CPU reset vector). The MRAM moves to a new base address. |
+| 4 | Boot copy | Copy MRAM 0x6000000 (master firmware) → SRAM 0x0. The old MRAM → MRAM 0x0 copy is no longer done. |
+| 5 | Copy size | Always 1 MB. |
+| 6 | Persistence | Nothing in SRAM must survive power loss. No hardware write-back to MRAM. |
+| 7 | PCI access | PCI may read and write SRAM through the interconnect at any time after boot. No hardware coherency; software owns shared buffers. |
+| 8 | NOEL-V caches | Unknown. Only affects the software rules in section 7. |
+| 9 | ECC | Use the ECC of `PF_SRAM_AHBL_AXI` (**OPEN**: check the option exists and how errors are reported). |
+| 10 | Compatibility | Keep the existing `mram_top` ports, generics and behaviour. Additions only. |
+| 11 | Branch | `mram_sram`, from `axi2mram`. |
+| A | Copy engine | Hardware copy inside `mram_top`, writing the SRAM through a **new AXI4 master port** connected as **INITIATOR2**. The CPU is released only after the copy is verified. |
+
+## 2. Block diagram
+
+```
+                        PCI host (32-bit / 33 MHz)
+                               |
+                        +-------------+
+                        |  pci2mram   |  PCI bridge (CorePCIF), AXI master, 150 MHz
+                        +-------------+
+                               | INITIATOR0 (150 MHz)
+                               v
+  NOEL-V (50 MHz)    +-----------------------------+
+  64-bit AXI ------->|     CoreAXI4Interconnect    |<------ INITIATOR2 (NEW, 150 MHz)
+  INITIATOR1 (CDC    |  decode, arbitration, CDC   |        m_axi_* of mram_top
+  inside the         +-----------------------------+                ^
+  interconnect)         | TARGET0          | TARGET1                |
+                        | (150 MHz)        | (150 MHz)              |
+                        v                  v                        |
+  +---------------------------------+   +--------------------+      |
+  | mram_top                        |   | PF_SRAM_AHBL_AXI   |      |
+  |                                 |   | 1 MB LSRAM, ECC    |      |
+  |  s_axi_* -> axi4_slave_wrapper  |   +--------------------+      |
+  |                 |               |                               |
+  |                 v               |                               |
+  |   +-------- mux (axi_owns) <-------- sram_boot_copy (NEW) ------+
+  |   |                             |      reads MRAM via core_req,  |
+  |   v                             |      writes/reads SRAM via     |
+  |  mram_write_guard               |      m_axi_* ; drives          |
+  |   |                             |      cpu_reset_n, boot_done,   |
+  |   v                             |      boot_fail, boot_status    |
+  |  mram_qspi_backend <-- mram_cmd_ctrl (PCI register commands)    |
+  |   |                             |
+  +---|-----------------------------+
+      v
+   AS302G208 die 1 (QSPI, 37.5 MHz SCLK, 128 MB)
+```
+
+`sram_boot_copy` replaces `mram_boot_copy` in the build when the new
+generic `G_BOOT_TO_SRAM` = true. With `G_BOOT_TO_SRAM` = false (the
+default, for backward compatibility) `mram_top` is unchanged: it builds
+`mram_boot_copy` as now and the `m_axi_*` outputs are held idle. The board
+top level sets `G_BOOT_TO_SRAM` = true.
+
+## 3. Address map
+
+AXI addresses as seen by both initiators (identity addressing, as now).
+
+| Region | AXI address | Size | Target | Notes |
+|--------|-------------|------|--------|-------|
+| SRAM | 0x0000_0000 – 0x000F_FFFF | 1 MB | TARGET1 | CPU reset vector, code, data, stack, heap |
+| MRAM | **OPEN**, proposed 0x0800_0000 – 0x0FFF_FFFF | 128 MB | TARGET0 | Base must be 128 MB-aligned (see below) |
+| MRAM master firmware | MRAM base + 0x0600_0000 (proposed 0x0E00_0000) | 32 MB region, first 1 MB used | TARGET0 | Write-protected by `mram_write_guard` unless `key_ok` |
+
+* `mram_top` uses only AxADDR[26:0] (REVIEW O15). That is correct whether
+  the interconnect passes the full address or the offset, **as long as the
+  MRAM base is 128 MB-aligned**. All MRAM offsets inside `mram_top`
+  (boot source 0x6000000, protected region 0x6000000–0x7FFFFFF) stay MRAM
+  offsets and do not change.
+* **OPEN:** the actual address map of the interconnect (other targets,
+  if any), and whether the SRAM IP decodes the full address or an offset.
+* **Consequences of moving the MRAM** (outside this RTL):
+  * Firmware: it was linked for 0x0 and still runs at 0x0, so code
+    addresses do not change. Any absolute MRAM address in the firmware
+    (persistent data, the master copy) must add the new MRAM base.
+  * PCI host software: MRAM accesses through the 64 MB window (base
+    register at BAR + 0x80) must use the new MRAM base. Reprogramming the
+    master copy now means writing AXI 0x0E00_0000 onward (with the
+    proposed base) instead of 0x0600_0000.
+  * The firmware image (code + initialised data) at MRAM 0x6000000 must
+    be ≤ 1 MB, and code + data + bss + stack + heap must fit in 1 MB.
+
+## 4. Clocking and CDC
+
+* `sram_boot_copy`, its `m_axi_*` port and INITIATOR2 all run on `aclk`
+  (150 MHz). TARGET1 is at 150 MHz. **No new clock domain crossing in
+  this RTL.**
+* The CPU's 50 MHz port is crossed inside the interconnect, as now.
+* `cpu_reset_n` is an `aclk` register, as now. It goes into the CPU's
+  50 MHz domain; the CPU-side reset synchronizer that exists today must
+  stay (**OPEN**: confirm one exists, or I add a note to the SDC section
+  in Phase 3).
+* PCI register inputs (`boot_hold`, `cmd_*`, `key_ok`) keep their
+  existing synchronizers.
+
+## 5. Data flow per master
+
+**Boot copy engine (INITIATOR2), only between reset and `boot_done`:**
+
+1. Waits for the MRAM power-up time (25 ms, as now) and while
+   `boot_hold` = 1.
+2. **Copy pass:** reads MRAM 0x6000000 … 0x60FFFFF through the core
+   interface as one continuous stream of beat reads. Data goes into a
+   small FIFO (proposed 2 × 64-byte blocks, **estimate** of a sufficient
+   depth). Each full 64-byte block is written to SRAM as one AXI INCR
+   burst (8 beats at 64 bits, all strobes on, AWSIZE = bus width, never
+   crossing 4 KB). Because the writes no longer use the MRAM, the MRAM
+   read never pauses and stays one long RDQI.
+3. **Verify pass:** reads the MRAM source again (one stream) into the
+   FIFO. For each block that is complete in the FIFO, it issues one AXI
+   read burst of the same SRAM block and compares each R beat with the
+   FIFO. Re-reading the MRAM, rather than using a checksum of the first
+   pass, also catches an MRAM read error in the copy pass.
+4. Pass → `boot_done` = 1, `cpu_reset_n` = 1, `m_axi_*` idle for good.
+   Fail → retry the whole copy, up to `G_MAX_RETRIES` (3), then
+   `boot_fail` = 1 with the CPU held in reset.
+
+Failure causes: compare mismatch, BRESP or RRESP ≠ OKAY, core error from
+the MRAM, watchdog (no progress for `G_WATCHDOG_LIMIT` cycles). The cause
+and retry count go to a new `boot_status` output (for a PCI register or
+Identify).
+
+**NOEL-V (INITIATOR1):** fetches code and accesses data, stack and heap
+in SRAM (TARGET1). Persistent data goes to MRAM (TARGET0) at the new base,
+at MRAM speed. Held in reset until `boot_done`.
+
+**PCI bridge (INITIATOR0):** reaches SRAM and MRAM through the 64 MB
+window. During the boot copy:
+* MRAM accesses stall at the interconnect, as now (the AXI wrapper is in
+  reset until the copy ends). The stall is now about 0.15 s instead of
+  about 9 s (*estimate*, section 9).
+* SRAM accesses are **not** blocked: TARGET1 is outside `mram_top`. A PCI
+  write to SRAM during the copy would race it, and a PCI write after the
+  verify of that block would not be detected. **Rule: the host must not
+  access the SRAM before `boot_done`** (readable through whatever PCI
+  status register carries it today).
+
+## 6. Boot flow
+
+```
+aresetn released
+   |
+   v
+power-up wait (25 ms) --boot_hold=1--> held: MRAM AXI port open, copy not started
+   |
+   v
+copy pass:   MRAM 0x6000000..+1MB  --> FIFO --> AXI write bursts --> SRAM 0x0..+1MB
+   |
+   v
+verify pass: MRAM again --> FIFO ; SRAM read bursts --> compare
+   |
+   +-- error / mismatch / timeout --> drain outstanding --> retry (max 3) --> boot_fail
+   |
+   v
+boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
+```
+
+* The full 1 MB is written before the CPU runs, so every ECC word in the
+  SRAM is initialised. Reads of uninitialised memory cannot cause false
+  ECC errors.
+* **Abort and retry follow AXI rules** (lesson 1): once AWVALID, WVALID or
+  ARVALID is raised it stays raised until accepted; BREADY and RREADY are
+  held high during the whole boot and while draining; a retry starts only
+  when every issued burst has received its B or its last R beat and every
+  MRAM request has completed. This also closes REVIEW O7 for the new
+  engine. If the drain itself does not finish within a timeout (the
+  fabric is stuck), the engine goes to `boot_fail` without starting new
+  traffic. It cannot legally withdraw a raised VALID, so recovery then
+  needs a reset.
+* Like today, the copy runs on `aresetn` only (REVIEW O13). **OPEN:** a
+  CPU-only reset (for example a CPU watchdog) does not reload the SRAM, so
+  `.data` would start with modified values. Is a CPU-only reset used? If
+  yes, either the system asserts `aresetn` for it, or the firmware must
+  not rely on load-time `.data` values after a warm reset.
+
+## 7. Coherency and persistence rules
+
+* **Persistence:** SRAM is volatile. No hardware writes SRAM back to MRAM.
+  Data that must survive power loss is written by firmware to MRAM
+  (TARGET0). `mram_wr_pending` = 0 means posted MRAM writes have reached
+  the device.
+* **SRAM is one AXI target** reached by both masters through the
+  interconnect, so the memory itself is coherent: each access sees the
+  last completed write. Ordering between PCI and the CPU is software's job
+  (flags, mailboxes, a write followed by a read-back before signalling).
+* **NOEL-V caches (OPEN, unknown):** if the D-cache is write-back, PCI
+  does not see CPU writes still in the cache and the CPU may read stale
+  cached data after PCI writes. Rules for the firmware:
+  * place PCI-shared buffers in a region the CPU treats as non-cacheable;
+    or flush/invalidate around each transfer;
+  * if PCI ever writes code into SRAM at run time, the CPU must execute
+    `FENCE.I` before running it.
+  At boot this does not arise: the copy finishes before the CPU leaves
+  reset.
+* No exclusive accesses or atomics are provided by this RTL; whether
+  `PF_SRAM_AHBL_AXI` supports AXI exclusive access is a property of the
+  IP (**OPEN**, only relevant if the firmware uses LR/SC or AMOs on SRAM
+  through AXI).
+
+## 8. Interconnect and IP settings (to check in Libero, not guessed)
+
+| Item | Needed | What to check |
+|------|--------|---------------|
+| INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64) | How many initiators the configurator allows; its ID width for that port (sets `G_M_ID_WIDTH`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
+| TARGET1 width | Same width as SRAM IP's AXI port | The configured width, and REVIEW Rev. 10: the 64-bit TARGET0 configuration once lost PCI writes. The SRAM path already works on the board, so I take its current settings as given. |
+| `PF_SRAM_AHBL_AXI` | AXI4 slave, 1 MB, ECC on | Bus width; burst types supported (INCR is all the copy engine uses); whether ECC is an option and how single/double errors are reported (ports, or SLVERR); how it handles narrow and partial-strobe writes with ECC |
+
+The copy engine uses only: INCR bursts of 64 bytes (AWLEN/ARLEN =
+64/beat bytes − 1), full-width beats, all WSTRB bits set, one AXI ID,
+AxLOCK = 0, AxCACHE = 0000 (**OPEN** if the interconnect requires another
+value), AxPROT = 000, no 4 KB crossing. Up to 2 write bursts and 1 read
+burst outstanding (*proposed*).
+
+## 9. Throughput estimates (all *estimates*)
+
+| Path | Figure | Basis |
+|------|--------|-------|
+| Boot: power-up wait | 25 ms | existing `G_POWERUP_CYCLES` |
+| Boot: copy pass, 1 MB | ≈ 58 ms | 1 MB at ≈ 18 MB/s (measured MRAM stream rate); SRAM writes overlap |
+| Boot: verify pass | ≈ 58 ms | same MRAM read rate; SRAM reads overlap |
+| Boot total, no retry | **≈ 0.14 s** | vs ≈ 9 s for today's 32 MB MRAM → MRAM copy |
+| Boot worst case, 3 retries | ≈ 0.5 s | 4 × 116 ms + 25 ms |
+| CPU ↔ SRAM peak | ≤ 400 MB/s | 64 bits × 50 MHz at the CPU port; real value depends on interconnect CDC latency, SRAM IP latency and NOEL-V. **Measure.** |
+| PCI ↔ SRAM | limited by PCI | 32 × 33 MHz = 133 MB/s bus maximum; ≈ 70 MB/s seen from the bridge (REVIEW Rev. 6). The SRAM will not be the bottleneck, but the bridge still needs back-pressure for MRAM-bound writes. |
+| CPU / PCI ↔ MRAM | unchanged | ≈ 18 MB/s streamed; 4–5 µs per 64-byte read |
+
+## 10. Resource estimates (all *estimates*)
+
+* `PF_SRAM_AHBL_AXI`, 1 MB: already in the build. **Read the real number
+  from the current Libero resource report.** For scale: 8 Mbit / 20 Kbit
+  ≈ 410 LSRAM blocks without ECC overhead; more with ECC and the chosen
+  width.
+* `sram_boot_copy`:
+  * FIFO 2 blocks = 16 × 64-bit beats ≈ 1,024 flip-flops if kept in
+    registers (lesson 4), or a few uSRAM blocks if inferred as RAM with a
+    registered output. Proposed: registers, with a generic to change it.
+  * Control, counters, AXI master, watchdog: roughly 300–600 flip-flops.
+* `mram_boot_copy` (its 64-byte buffer, ≈ 512 flip-flops) is not built
+  when `G_BOOT_TO_SRAM` = true.
+* Net change: roughly +1,000 flip-flops before TMR. Phase 2 will report a
+  GHDL synthesis count; only the Libero report is authoritative.
+* Timing: the FIFO read port and the 64-bit compare are registered. No
+  combinational path from any input VALID to an output READY.
+
+## 11. Verification plan
+
+New testbench `sim/tb_mram_sram.vhd`, run by `sim/run_sram.sh`, all
+GHDL 4.1 / VHDL-2008:
+
+* **DUT:** `mram_top` with `G_BOOT_TO_SRAM` = true, the existing
+  `qspi_mram_model`, and a new behavioural AXI4 slave SRAM model
+  (`sim/axi_sram_model.vhd`) on `m_axi_*`.
+* **AXI master protocol checker** on `m_axi_*`: VALID stays high and the
+  payload stays stable until READY; WLAST on the right beat; beat count
+  per burst; no 4 KB crossing; INCR only; one B per AW and ARLEN+1 R
+  beats per AR; no outstanding transaction left at `boot_done`; no new
+  transaction after `boot_done`.
+* **Scoreboard:** after `boot_done`, the SRAM model contents equal the
+  MRAM model's source region byte for byte; `cpu_reset_n` rises only
+  after the last verify compare.
+* **Stall patterns (lesson 3):** random and long stalls on AWREADY,
+  WREADY, ARREADY, BVALID, RVALID, from a seeded generator; zero-stall
+  run; a run with READY low for thousands of cycles.
+* **Error injection:**
+  * one corrupted byte stored by the SRAM model → verify fails → retry
+    succeeds;
+  * a permanently corrupted location → `boot_fail`, CPU held in reset;
+  * BRESP / RRESP = SLVERR → retry;
+  * B never returned → watchdog → drain timeout → `boot_fail`, with no
+    protocol violation and no new traffic.
+* **Other:** `boot_hold`; MRAM AXI port stalled during the copy and
+  working after it (accesses at the new base); reduced copy size for
+  speed in the regression (for example 16 KB), plus one optional full
+  1 MB run (long simulation).
+* **Regression:** `sim/run_ghdl.sh` and `sim/run_dma.sh` must still pass
+  unchanged with `G_BOOT_TO_SRAM` = false.
+* **Mutation checks:** disable the verify compare, drop the drain, break
+  WLAST: each must make the testbench fail.
+
+Limits: the SRAM model is generic AXI4, **not** `PF_SRAM_AHBL_AXI`, and
+there is no CoreAXI4Interconnect model. Board tests remain necessary;
+Phase 3 lists the Identify probes for them.
+
+## 12. Open items
+
+| # | Item | Needed by |
+|---|------|-----------|
+| OA1 | New MRAM base address (proposed 0x0800_0000) and the full interconnect address map | Phase 2 testbench addresses, Phase 3 |
+| OA2 | `PF_SRAM_AHBL_AXI` configuration: AXI width, ID width, ECC option and error reporting, partial-write handling | Phase 2 (width), Phase 3 |
+| OA3 | INITIATOR2: allowed by the configurator? ID width; target visibility; AxCACHE requirements | Phase 2 port widths |
+| OA4 | NOEL-V caches and their policy, cacheable regions | Firmware rules only |
+| OA5 | Is a CPU-only reset used? (SRAM is not reloaded by it) | Phase 2 if a reload input is wanted |
+| OA6 | CPU-side reset synchronizer for `cpu_reset_n` | Phase 3 |
+| OA7 | Earlier questions still open: bridge name (`pci2mram` vs `pci2ddr4` in the README), why the 64-bit TARGET0 port lost PCI writes (REVIEW Rev. 10), uSRAM total (I recall ≈ 3.4 Mbit, not 13 Mbit; please check the datasheet) | Documentation |
+| OA8 | Image check: read-back verify only. A corrupted master image is still copied and "verified" (REVIEW O6). CRC can be added later. | Later |
