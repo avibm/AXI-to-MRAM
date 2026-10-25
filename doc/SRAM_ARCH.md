@@ -18,7 +18,7 @@ before or during Phase 2; they are collected in section 12.
 | 7 | PCI access | PCI may read and write SRAM through the interconnect at any time after boot. No hardware coherency; software owns shared buffers. |
 | 8 | NOEL-V caches | Unknown. Only affects the software rules in section 7. |
 | 9 | ECC | Use the ECC of `PF_SRAM_AHBL_AXI` (**OPEN**: check the option exists and how errors are reported). |
-| 10 | Compatibility | Keep the existing `mram_top` ports, generics and behaviour. Additions only. |
+| 10 | Compatibility | Existing `mram_top` ports kept where still meaningful. The MRAM → MRAM boot copy (`mram_boot_copy.vhd`) is removed and replaced by the SRAM boot copy, with no legacy switch. The diagnostic top `mram_top_oct1.vhd` is removed (done). |
 | 11 | Branch | `mram_sram`, from `axi2mram`. |
 | A | Copy engine | Hardware copy inside `mram_top`, writing the SRAM through a **new AXI4 master port** connected as **INITIATOR2**. The CPU is released only after the copy is verified. |
 
@@ -58,11 +58,11 @@ before or during Phase 2; they are collected in section 12.
    AS302G208 die 1 (QSPI, 37.5 MHz SCLK, 128 MB)
 ```
 
-`sram_boot_copy` replaces `mram_boot_copy` in the build when the new
-generic `G_BOOT_TO_SRAM` = true. With `G_BOOT_TO_SRAM` = false (the
-default, for backward compatibility) `mram_top` is unchanged: it builds
-`mram_boot_copy` as now and the `m_axi_*` outputs are held idle. The board
-top level sets `G_BOOT_TO_SRAM` = true.
+`sram_boot_copy` replaces `mram_boot_copy`, which is deleted in Phase 2.
+There is no switch back to the MRAM → MRAM copy. `mram_top` keeps its
+existing ports and gains the `m_axi_*` master port and `boot_status`.
+The generics `G_BOOT_DST_BASE` and `G_BOOT_COPY_SIZE` of the old copy are
+replaced by the SRAM destination address and the 1 MB size.
 
 ## 3. Address map
 
@@ -260,8 +260,7 @@ burst outstanding (*proposed*).
     registers (lesson 4), or a few uSRAM blocks if inferred as RAM with a
     registered output. Proposed: registers, with a generic to change it.
   * Control, counters, AXI master, watchdog: roughly 300–600 flip-flops.
-* `mram_boot_copy` (its 64-byte buffer, ≈ 512 flip-flops) is not built
-  when `G_BOOT_TO_SRAM` = true.
+* `mram_boot_copy` (its 64-byte buffer, ≈ 512 flip-flops) is removed.
 * Net change: roughly +1,000 flip-flops before TMR. Phase 2 will report a
   GHDL synthesis count; only the Libero report is authoritative.
 * Timing: the FIFO read port and the 64-bit compare are registered. No
@@ -272,7 +271,7 @@ burst outstanding (*proposed*).
 New testbench `sim/tb_mram_sram.vhd`, run by `sim/run_sram.sh`, all
 GHDL 4.1 / VHDL-2008:
 
-* **DUT:** `mram_top` with `G_BOOT_TO_SRAM` = true, the existing
+* **DUT:** `mram_top`, the existing
   `qspi_mram_model`, and a new behavioural AXI4 slave SRAM model
   (`sim/axi_sram_model.vhd`) on `m_axi_*`.
 * **AXI master protocol checker** on `m_axi_*`: VALID stays high and the
@@ -297,8 +296,11 @@ GHDL 4.1 / VHDL-2008:
   working after it (accesses at AXI 0x0010_0000 and up); reduced copy size for
   speed in the regression (for example 16 KB), plus one optional full
   1 MB run (long simulation).
-* **Regression:** `sim/run_ghdl.sh` and `sim/run_dma.sh` must still pass
-  unchanged with `G_BOOT_TO_SRAM` = false.
+* **Regression:** `sim/tb_mram_top.vhd` and `sim/tb_dma.vhd` currently
+  rely on the MRAM → MRAM boot copy (T12 and the boot verify checks).
+  They are moved to the SRAM boot (an AXI SRAM model on `m_axi_*`), their
+  MRAM-copy checks replaced by the SRAM checks above; all other AXI-slave
+  tests stay as they are and must still pass.
 * **Mutation checks:** disable the verify compare, drop the drain, break
   WLAST: each must make the testbench fail.
 

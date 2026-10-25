@@ -15,7 +15,6 @@ guard for the protected region.
 | `rtl/mram_write_guard.vhd` | Blocks writes to the protected region unless `key_ok` |
 | `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous reads and writes streamed) |
 | `rtl/mram_top.vhd` | Top level |
-| `rtl/mram_top_oct1.vhd` | Diagnostic top level: the current IP behind the exact Oct 1 port list, all later features off (see the file header) |
 | `sim/` | Behavioural QSPI MRAM model, self-checking testbench, GHDL run script |
 | `doc/MRAM_Subsystem_IP_Specification.pdf` | IP specification |
 | `doc/REVIEW.md` | Design review: bugs found and fixed, open items, spec errata |
