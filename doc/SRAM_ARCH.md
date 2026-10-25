@@ -353,7 +353,9 @@ do the adapted `tb_mram_top` and `tb_dma`. Stall rates 0–95 %, data widths
 64/128/512, six mutation checks: see `doc/REVIEW.md`, Rev. 13. The
 reduced-size (16 KB) boot takes 1.749–1.752 ms of simulated time at every
 stall rate. The full 1 MB boot (T0–T2) passes in 111.9 ms of simulated
-time.
+time. The pre-compile round (`doc/REVIEW.md`, Rev. 14) added tests T10–T15,
+a randomized soak test, code coverage and an unbounded formal proof of the
+copy engine's AXI and hand-over properties.
 
 ## 12. Open items
 

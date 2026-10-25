@@ -19,8 +19,8 @@ WORK="$ROOT/formal/build/b${BLOCKS}_d${DEPTH}_${2:-ok}"
 mkdir -p "$WORK"
 cd "$WORK"
 if yosys -q -m ghdl -l "$WORK/formal.log" -p "
-  ghdl --std=08 $ROOT/rtl/mram_pkg.vhd $ROOT/rtl/sram_boot_copy.vhd \
-       $ROOT/formal/fv_sram_boot_copy.vhd -gG_BLOCKS=$BLOCKS -e fv_sram_boot_copy;
+  ghdl --std=08 -gG_BLOCKS=$BLOCKS $ROOT/rtl/mram_pkg.vhd $ROOT/rtl/sram_boot_copy.vhd \
+       $ROOT/formal/fv_sram_boot_copy.vhd -e fv_sram_boot_copy;
   prep -top fv_sram_boot_copy; flatten; memory_map; opt -fast;
   async2sync; dffunmap;
   sat -verify -seq $DEPTH -prove $PROVE -set env_ok 1 -set-init-zero -timeout 6000 -dump_vcd $WORK/cex.vcd

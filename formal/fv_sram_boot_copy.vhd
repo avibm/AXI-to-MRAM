@@ -28,6 +28,8 @@
 --       wrapper reported idle; ownership given up only with no MRAM read
 --       outstanding
 --   A10 boot_done and boot_fail never both 1
+--   A11 after a good boot (boot_done = 1) and in the failed state (phase 6)
+--       the MRAM is back with the AXI side: mram_hold = 0, mram_own = 0
 --------------------------------------------------------------------------------
 
 library ieee;
@@ -56,6 +58,9 @@ entity fv_sram_boot_copy is
         -- env_ok has been 1 so far; probe_* show that the checks are not
         -- vacuous (states that must be reachable)
         ok, env_ok       : out std_logic;
+        -- for unbounded checking (PDR): 1 = a property fails while the
+        -- environment contract has held in every cycle so far
+        bad              : out std_logic;
         probe_done, probe_fail, probe_redone : out std_logic
     );
 end entity fv_sram_boot_copy;
@@ -72,6 +77,7 @@ architecture formal of fv_sram_boot_copy is
     signal awvalid, wvalid, wlast, arvalid, bready, rready : std_logic;
     signal wdata : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
     signal cpu_reset_n, boot_done, boot_fail : std_logic;
+    signal status : std_logic_vector(15 downto 0);
 
     -- previous-cycle copies
     signal p_awvalid, p_awready, p_wvalid, p_wready, p_arvalid, p_arready : std_logic := '0';
@@ -85,12 +91,16 @@ architecture formal of fv_sram_boot_copy is
     -- bookkeeping
     signal outst    : unsigned(3 downto 0) := (others => '0'); -- MRAM reads not answered
     signal p_outst  : unsigned(3 downto 0) := (others => '0');
-    signal aw_acc   : unsigned(3 downto 0) := (others => '0'); -- AW handshakes since reset
-    signal w_beats  : unsigned(4 downto 0) := (others => '0'); -- W handshakes since reset
+    -- W beats allowed by accepted AWs and not yet sent (+BPB per AW, -1 per
+    -- W). Bounded by the design's 2 outstanding writes; 6 bits cannot wrap
+    -- unless the design misbehaves, which A4 reports first.
+    signal w_credit : unsigned(5 downto 0) := (others => '0');
     signal w_idx    : unsigned(1 downto 0) := (others => '0');
 
-    signal ok_a1, ok_a2, ok_a3, ok_a4, ok_a5, ok_a6, ok_a7, ok_a8, ok_a10 : std_logic;
+    signal ok_a1, ok_a2, ok_a3, ok_a4, ok_a5, ok_a6, ok_a7, ok_a8, ok_a10, ok_a11 : std_logic;
     signal done_seen, refall : std_logic := '0';
+    signal env_seen : std_logic := '0';   -- the contract was broken in an earlier cycle
+    signal ok_i, env_i : std_logic;
 begin
     -- reset in the first cycle only
     process (aclk)
@@ -135,7 +145,7 @@ begin
             m_axi_rlast => i_rlast, m_axi_rvalid => i_rvalid_s, m_axi_rready => rready,
             reload => i_reload, boot_hold => i_hold,
             cpu_reset_n => cpu_reset_n, boot_done => boot_done, boot_fail => boot_fail,
-            powerup_done => open, boot_held => open, boot_status => open);
+            powerup_done => open, boot_held => open, boot_status => status);
 
     process (aclk)
         variable v_out : unsigned(3 downto 0);
@@ -152,16 +162,22 @@ begin
             if resp.rvalid = '1' then v_out := v_out - 1; end if;
             outst <= v_out;
 
-            if awvalid = '1' and i_awready = '1' then aw_acc <= aw_acc + 1; end if;
+            if (awvalid = '1' and i_awready = '1') and not (wvalid = '1' and i_wready = '1') then
+                w_credit <= w_credit + BPB;
+            elsif (awvalid = '1' and i_awready = '1') and (wvalid = '1' and i_wready = '1') then
+                w_credit <= w_credit + BPB - 1;
+            elsif wvalid = '1' and i_wready = '1' then
+                w_credit <= w_credit - 1;
+            end if;
             if wvalid = '1' and i_wready = '1' then
-                w_beats <= w_beats + 1;
-                w_idx   <= (w_idx + 1) mod BPB;
+                w_idx <= (w_idx + 1) mod BPB;
             end if;
         end if;
     end process;
 
     -- Environment contract: read data only for an outstanding read
-    env_ok <= '1' when not (i_rvalid = '1' and own = '1' and outst = 0) else '0';
+    env_i  <= '1' when not (i_rvalid = '1' and own = '1' and outst = 0) else '0';
+    env_ok <= env_i;
 
     ok_a1 <= '0' when armed = '1' and p_awvalid = '1' and p_awready = '0'
                       and (awvalid = '0' or awaddr /= p_awaddr) else '1';
@@ -170,8 +186,7 @@ begin
     ok_a3 <= '0' when armed = '1' and p_arvalid = '1' and p_arready = '0'
                       and (arvalid = '0' or araddr /= p_araddr) else '1';
     ok_a4 <= '0' when armed = '1' and wvalid = '1'
-                      and ((wlast = '1') /= (w_idx = BPB - 1)
-                           or resize(w_beats, 6) >= resize(aw_acc, 6) * BPB) else '1';
+                      and ((wlast = '1') /= (w_idx = BPB - 1) or w_credit = 0) else '1';
     ok_a5 <= '0' when armed = '1' and p_cvalid = '1' and p_cready = '0'
                       and (req.valid = '0' or req.addr /= p_caddr) else '1';
     ok_a6 <= '0' when armed = '1' and boot_done = '1'
@@ -182,8 +197,19 @@ begin
                                      or (p_own = '0' and own = '1' and p_idle = '0')
                                      or (p_own = '1' and own = '0' and p_outst /= 0)) else '1';
     ok_a10 <= '0' when armed = '1' and boot_done = '1' and boot_fail = '1' else '1';
+    ok_a11 <= '0' when armed = '1' and (boot_done = '1' or status(2 downto 0) = "110")
+                       and (hold = '1' or own = '1') else '1';
 
-    ok <= ok_a1 and ok_a2 and ok_a3 and ok_a4 and ok_a5 and ok_a6 and ok_a7 and ok_a8 and ok_a10;
+    ok_i <= ok_a1 and ok_a2 and ok_a3 and ok_a4 and ok_a5 and ok_a6 and ok_a7 and ok_a8
+            and ok_a10 and ok_a11;
+    ok   <= ok_i;
+    process (aclk)
+    begin
+        if rising_edge(aclk) then
+            if env_i = '0' then env_seen <= '1'; end if;
+        end if;
+    end process;
+    bad <= (not ok_i) and env_i and not env_seen;
 
     -- reachability probes
     process (aclk)

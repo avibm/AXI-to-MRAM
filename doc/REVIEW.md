@@ -381,6 +381,93 @@ Limits: the SRAM model is generic AXI4, not `PF_SRAM_AHBL_AXI`, and there
 is no interconnect model. Not synthesized in Libero, not timing-closed,
 not run on hardware.
 
+### Rev. 14 – pre-compile verification of the SRAM boot copy
+
+A Libero run takes hours, so this round looks for problems before it.
+Checklist for the run itself: `doc/PRECOMPILE_CHECKLIST.md`.
+
+**RTL changes from a line-by-line review** (no functional change; all
+regressions re-run afterwards):
+
+| # | File | Change | Why |
+|---|------|--------|-----|
+| V1 | `sram_boot_copy` | The next MRAM read request is built from registers only; the backend's combinational `ready` is used only as a register enable. `valid` drops for one cycle after each acceptance. | Before, `ready` fed an 18-bit increment, an 18-bit compare and a 27-bit address adder on the existing long accept path (O11 a, lesson 4). An MRAM beat takes about 64 cycles, so the bubble costs nothing: the 16 KB boot time is unchanged to the picosecond. |
+| V2 | `sram_boot_copy` | Verify compare result registered before the error and state logic. | A 64-bit compare (about 4 LUT levels) fed the state decode in the same cycle. |
+| V3 | `sram_boot_copy` | No signal-assigning procedure inside the process (a flag instead). | Legal VHDL, but I could not confirm every Synplify version accepts it. |
+| V4 | `mram_top` | Ownership masking written as concurrent assignments instead of `process (all)`. | Same reason as V3. |
+
+**New and extended tests:**
+* `tb_mram_sram` T10–T15: reload while a slow PCI write burst is half done
+  (the copy waits in phase 2 until the burst completes); reload ignored
+  while copying and while stuck; watchdog in the verify pass; wrong BID;
+  `aresetn` in the middle of a copy; slave protocol violations (R with no
+  AR, B with no write, RLAST on the wrong beat, wrong RID), each giving a
+  retry and error bit 14. T0 now releases `boot_hold` while PCI reads are in
+  flight.
+* `tb_mram_top` T5c: a 3-beat burst whose middle beat has no strobes. This
+  is an older wrapper path that no test reached; it works.
+* The SRAM model gained the fault injections above; the master checker now
+  counts R beats per AR and reports slave violations separately.
+* `sim/tb_sram_soak.vhd` (`sim/run_soak.sh`): random scenario per reload
+  (single faults, SRAM stalls of 0.5–1.9 × the watchdog, master image
+  update through PCI with `key_ok`, `aresetn` mid-copy, wrong BID) with
+  random PCI reads and writes to the MRAM in the background, including
+  writes to the protected copy without the key (SLVERR, no change). Seeds
+  2–5, 120 iterations each (480 reloads, about 870 checked PCI operations):
+  all pass, 0 checker, SRAM-model and PCI errors.
+
+**Code coverage** (ghdl-gcc + gcovr, all testbenches): line coverage of
+`sram_boot_copy` 98 %, `mram_top`, `axi4_slave_wrapper`, `mram_write_guard`,
+`mram_cmd_ctrl` 100 %. The lines not reached in `sram_boot_copy` cannot be
+reached from outside: an MRAM read error (the backend never reports one),
+a write response to the copy (it never writes the MRAM), and the illegal
+FSM state branch. The backend's unreached lines (96 % covered) are branches
+for non-default generics, the read-slip fault flag and illegal-state
+recovery, all older code.
+
+**Formal verification** (`formal/`, Yosys 0.33 + GHDL plugin + ABC):
+* Harness `formal/fv_sram_boot_copy.vhd`: all inputs of `sram_boot_copy`
+  free, including AXI slaves that break the protocol; only the backend
+  contract is assumed (read data only for an accepted read). Properties:
+  VALID and payload held until READY on AW, W, AR and the MRAM request;
+  WLAST on the right beat and no W beat without its AW; no master traffic
+  and the CPU released only with `boot_done`; MRAM requests only while
+  owning the MRAM, ownership only while holding the AXI side, taken only
+  when it was idle, given back only with no MRAM read outstanding;
+  `boot_done` and `boot_fail` exclusive; after `boot_done` and in the
+  failed state the MRAM is back with the AXI side.
+* `formal/run_pdr.sh`: **unbounded proof** (ABC PDR) that no property can
+  ever fail, with 1, 2 and 3 bursts per pass.
+* Mutation checks: AW dropped on abort, MRAM request dropped on abort,
+  ownership taken without idle, WLAST on the wrong beat, drain skipped,
+  `mram_hold` kept after `boot_done` – each gives a counterexample.
+* Reachability (`formal/run_formal.sh depth probe_X`, bounded): `boot_done`
+  is reached within 64 cycles (1 and 2 bursts), `boot_done` again after a
+  reload within 90 cycles, and `boot_fail` within 80 cycles. So the states
+  the proof covers include completed boots, reloads and failures; the
+  proof is not vacuous.
+* Two mistakes of mine were found and fixed during this work, recorded so
+  the results can be judged: (1) the first bounded-check script did not
+  pass `-verify` to Yosys's `sat`, so it reported every run as proved; the
+  reachability probes exposed it, and no result from before the fix is
+  used. (2) The `G_BLOCKS` generic was placed after the file names and
+  ignored; fixed, and the runs were repeated. A first PDR counterexample at
+  cycle 212 came from a 4-bit counter in the harness wrapping; replaced by
+  a counter that cannot wrap.
+
+**Found during this round, not changed (system decisions):**
+* An `aresetn` in the middle of an MRAM access raises CS# at once (older
+  backend behaviour); the MRAM model reports it as a protocol error. The
+  soak test counts these separately (3 in 480 reloads, all within 10
+  cycles of a deliberate reset). Check in the AS302G208 datasheet that an
+  aborted command is harmless; an aborted write leaves that write
+  incomplete, as with any reset.
+* A stall of the SRAM side longer than watchdog + drain limit (2 ×
+  `G_BOOT_WATCHDOG`, about 13 ms with the default) is declared "stuck"
+  permanently, as specified; only `aresetn` recovers, even if the fabric
+  answers later. An automatic retry once the fabric drains would be
+  possible; it is your call.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

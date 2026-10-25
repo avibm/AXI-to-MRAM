@@ -15,7 +15,8 @@ interconnect settings, SDC, Identify probes).
 | `sim/run_sram.sh` | SRAM boot copy, reload, all fault cases (T0–T15) | `TEST PASSED` |
 | `sim/run_sram.sh -gG_STALL_PCT=0`, `=50 -gG_SEED=3`, `=80 -gG_SEED=7`, `=95 -gG_SEED=11` | Same under different SRAM stall patterns | `TEST PASSED` each |
 | `sim/run_soak.sh -gG_ITER=120 -gG_SEED=n` | Randomized scenarios with background PCI traffic | `TEST PASSED` |
-| `formal/run_formal.sh 40` (and the deeper runs in `doc/REVIEW.md` Rev. 14) | AXI master and hand-over properties for every input sequence (bounded) | `PROVED` |
+| `formal/run_pdr.sh`, `BLOCKS=1 formal/run_pdr.sh`, `BLOCKS=3 formal/run_pdr.sh` | AXI master and hand-over properties of `sram_boot_copy`, unbounded, for every input sequence | `PROVED (unbounded)` |
+| `BLOCKS=1 formal/run_formal.sh 90 probe_redone` (and the other probes in Rev. 14) | The proof is not vacuous: boot, reload and failure are reachable | `COUNTEREXAMPLE` (= reachable) |
 
 Results of these runs at the time of writing are recorded in
 `doc/REVIEW.md`, Rev. 14.

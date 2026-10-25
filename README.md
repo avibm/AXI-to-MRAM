@@ -263,9 +263,14 @@ sim/run_dma.sh           # mixed traffic: PCI DMA reads + CPU-like reads/writes
 sim/run_sram.sh          # SRAM boot copy, reload, fault injection, AXI master checker
 sim/run_sram.sh -gG_STALL_PCT=80 -gG_SEED=7                 # heavier SRAM stalls
 sim/run_sram.sh -gG_COPY=1048576 -gG_ONLY_BOOT=true         # full 1 MB boot (slow)
+sim/run_soak.sh -gG_ITER=120 -gG_SEED=2                     # randomized scenarios + PCI traffic
+formal/run_pdr.sh                                           # unbounded proof of the copy engine's AXI/hand-over properties
+formal/run_formal.sh 40                                     # bounded check; with a probe_* argument: reachability
 sim/run_ghdl.sh --wave   # also writes sim/build/tb_mram_top.ghw
 sim/run_ghdl.sh -gG_MODEL_TCO_PS=20000 -gG_SAMPLE_DLY=0   # slow board, no delay: fails like the first board
 ```
+
+Before a Libero run, go through `doc/PRECOMPILE_CHECKLIST.md`.
 
 ## Status
 
