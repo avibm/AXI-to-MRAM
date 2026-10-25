@@ -29,9 +29,9 @@
 -- like the real device. WP# pin protection of the status register is
 -- modelled (WP#EN = 1 and IO2 low blocks WRSR).
 --
--- Storage is folded to keep the model small: 4 x 16KB windows selected by
+-- Storage is folded to keep the model small: 4 x 1MB windows selected by
 -- address bits 26:25 (so 0x0000000 and 0x6000000 are different windows),
--- offset = address bits 13:0. Tests must keep offsets below 16KB.
+-- offset = address bits 19:0. Tests must keep offsets below 1MB.
 --------------------------------------------------------------------------------
 
 library ieee;
@@ -52,11 +52,11 @@ package body qspi_mram_mem_pkg is
     function mem_index(addr : natural) return natural is
         variable a : unsigned(31 downto 0) := to_unsigned(addr, 32);
     begin
-        return to_integer(a(26 downto 25) & a(13 downto 0));
+        return to_integer(a(26 downto 25) & a(19 downto 0));
     end function;
 
     type mem_pt is protected body
-        type arr_t is array (0 to 65535) of std_logic_vector(7 downto 0);
+        type arr_t is array (0 to 4 * 1048576 - 1) of std_logic_vector(7 downto 0);
         variable m : arr_t := (others => x"00");
         procedure write(addr : natural; data : std_logic_vector(7 downto 0)) is
         begin

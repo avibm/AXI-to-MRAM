@@ -42,7 +42,7 @@
 -- Device timing honoured here (Tables 10, 39, 41, 43), in aclk cycles, so
 -- the defaults assume a 150MHz aclk -- rescale for another clock:
 --   fCLK <= 54MHz SDR      -> G_SCLK_HALF_PERIOD >= 2 (37.5MHz at 150MHz)
---   tPU  >= 25ms           -> enforced by mram_boot_copy (G_POWERUP_CYCLES),
+--   tPU  >= 25ms           -> enforced by sram_boot_copy (G_POWERUP_CYCLES),
 --                             which always issues the first request
 --   tCSS >= 5ns, tCSH >= 4ns -> G_CS_SETUP_CYCLES (setup and hold)
 --   tCS1 >= 20ns after read -> G_CS_HIGH_READ_CYCLES
@@ -941,7 +941,7 @@ begin
                         -- a VHDL-level backstop; it does not by itself
                         -- guarantee recovery without your synthesis tool's
                         -- illegal-state-recovery ("safe FSM") support -- see
-                        -- mram_boot_copy.vhd's header note.
+                        -- doc/REVIEW.md, O12.
                         mram_cs_n <= '1';
                         sclk_run  <= false;
                         io_oe     <= (others => '0');

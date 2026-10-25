@@ -2,22 +2,24 @@
 
 AXI4 slave front end for the Avalanche AS302G208 Quad-SPI MRAM on RT PolarFire
 (RTPF500TCG1509), shared by the NOEL-V CPU and a PCI master through the AXI
-interconnect. Includes a boot-copy sequencer, which refreshes the working boot
-image at address 0 from a protected master copy at 0x6000000, and a write
-guard for the protected region.
+interconnect. Includes a boot-copy sequencer, which copies the 1 MB firmware
+from a protected master copy at MRAM 0x6000000 into the on-chip SRAM at
+address 0 (the CPU's execution memory) and releases the CPU only after
+verifying it, and a write guard for the protected region.
 
 | Path | Contents |
 |------|----------|
 | `rtl/mram_pkg.vhd` | Shared constants and the internal `core_req` / `core_resp` interface |
 | `rtl/axi4_slave_wrapper.vhd` | AXI4 slave: bursts → core requests (INCR, narrow and full-width beats, WSTRB); reads issued ahead for streaming |
-| `rtl/mram_boot_copy.vhd` | Copies and verifies the boot image, holds the CPU in reset until done |
+| `rtl/sram_boot_copy.vhd` | Copies the firmware MRAM → SRAM through its own AXI4 master port, verifies it, holds the CPU in reset until done; reload on request |
 | `rtl/mram_cmd_ctrl.vhd` | PCI-driven MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID, RDAR, WRAR) with clock-domain crossing |
 | `rtl/mram_write_guard.vhd` | Blocks writes to the protected region unless `key_ok` |
 | `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous reads and writes streamed) |
 | `rtl/mram_top.vhd` | Top level |
-| `sim/` | Behavioural QSPI MRAM model, self-checking testbench, GHDL run script |
+| `sim/` | Behavioural QSPI MRAM model, AXI4 SRAM model, AXI master protocol checker, self-checking testbenches, GHDL run scripts |
 | `doc/MRAM_Subsystem_IP_Specification.pdf` | IP specification |
 | `doc/REVIEW.md` | Design review: bugs found and fixed, open items, spec errata |
+| `doc/SRAM_ARCH.md` | Architecture of the SRAM execution memory: address map, boot flow, reload, verification |
 
 ## Data width
 
@@ -38,6 +40,49 @@ interconnect now that it has three initiators.
 Interconnect: the MRAM target port must be configured for the same width.
 The PCI bridge's 32-bit bursts are then packed into 64-bit beats, and
 NOEL-V's 64-bit port needs no conversion.
+
+## SRAM boot copy and reload
+
+The CPU executes from the 1 MB on-chip SRAM (`PF_SRAM_AHBL_AXI`, TARGET1,
+AXI 0x0000_0000–0x000F_FFFF). The MRAM is TARGET0 from AXI 0x0010_0000; MRAM
+offsets 0x0–0xFFFFF are shadowed by the SRAM. Details and the reasoning:
+`doc/SRAM_ARCH.md`.
+
+`sram_boot_copy` (inside `mram_top`) runs after every `aresetn` and on every
+rising edge of `sram_reload`:
+
+1. After reset only: the 25 ms MRAM power-up wait, then `boot_hold` as before.
+2. It takes the MRAM backend from the AXI side without resetting it: the
+   wrapper stops accepting new AW/AR, finishes what it has accepted, and
+   reports idle. MRAM accesses from PCI or the CPU stall during the copy.
+3. Copy pass: MRAM 0x6000000 + 1 MB → SRAM 0x0 as 64-byte INCR write bursts
+   on `m_axi_*`. The MRAM read is one continuous stream.
+4. Verify pass: MRAM read again, SRAM read back, every beat compared.
+5. Pass → `cpu_reset_n` = 1, `boot_done` = 1, MRAM back to the AXI side.
+   Fail → retry, at most 3 times, then `boot_fail` = 1 with the CPU in reset.
+
+| Port | Dir | Meaning |
+|------|-----|---------|
+| `m_axi_*` | | AXI4 master to the SRAM: interconnect INITIATOR2, 150 MHz, ID width `G_M_ID_WIDTH` (4). Only 64-byte INCR bursts of full-width beats, all strobes, AxCACHE = 0000, AxPROT = 000, AxLOCK = 0 |
+| `sram_reload` | in | Rising edge = put the CPU into reset and copy + verify again (no power-up wait). Synchronized inside, may be asynchronous. Acted on after `boot_done` or `boot_fail`, ignored while a copy runs |
+| `boot_status[15:0]` | out | `aclk` register: [2:0] phase (0 done, 1 power-up/held, 2 waiting for the MRAM port, 3 copy, 4 verify, 5 drain/retry, 6 failed, 7 stuck), [7:4] retries, [8] mismatch, [9] BRESP error, [10] RRESP error, [11] MRAM error, [12] watchdog, [13] drain timeout (fabric stuck), [14] wrong ID/RLAST or unexpected response. Bits 8–14 are sticky from the start of the boot or reload |
+
+Rules:
+* The host must not access the SRAM before `boot_done`: the SRAM is outside
+  `mram_top`, so a PCI access during the copy is not blocked and races it.
+* A reload resets the CPU while it may have AXI transactions in flight.
+  Whether NOEL-V and the interconnect handle that cleanly is a system
+  question this RTL cannot answer.
+* If nothing progresses for `G_BOOT_WATCHDOG` cycles, the copy stops issuing,
+  completes every handshake already started (all W beats of accepted AWs,
+  every B and R) and retries. If that drain does not finish either, the
+  fabric is taken as stuck (phase 7, `boot_fail` = 1); only `aresetn`
+  recovers. The MRAM side is handed back to AXI so PCI can still inspect it.
+
+Boot time (simulation, not measured on the board): a 16 KB copy takes
+1.75 ms after the power-up wait, at every SRAM stall rate from 0 % to 95 %,
+so the MRAM read stream (≈ 18.7 MB/s) sets the pace. For 1 MB that scales
+to about 0.11 s (copy + verify), plus the 25 ms power-up wait after reset.
 
 ## MRAM register commands (bring-up / debug)
 
@@ -62,15 +107,16 @@ Handshake for each command:
 4. Wait for `cmd_done` = 0 before the next command.
 
 AXI access to the MRAM window is open after `boot_done`, after `boot_fail`
-(the CPU stays in reset), and while `boot_hold` = 1. Release `boot_hold` only
-when no AXI access to the MRAM is in flight; the boot copy then starts and
-AXI stalls until it finishes. `boot_hold` is sampled when the 25 ms power-up
-wait ends, so for bring-up its source should already be 1 at reset.
+(the CPU stays in reset), and while `boot_hold` = 1. When `boot_hold` is
+released, the boot copy waits until the AXI side has finished what it
+accepted, then takes the MRAM; new AXI accesses stall until the copy
+finishes. `boot_hold` is sampled when the 25 ms power-up wait ends, so for
+bring-up its source should already be 1 at reset.
 
 One command runs per request, and WRSR does not send WREN itself. Commands
 wait for the 25 ms power-up time and run between memory accesses.
 
-**Caution:** every AXI or boot-copy write sends its own WREN, and the device
+**Caution:** every AXI write sends its own WREN, and the device
 clears the WREN bit when a write completes. A PCI WREN → WRSR sequence
 therefore only works while no memory writes are running: for example with
 `boot_hold` = 1, or with AXI writers idle. Check with RDSR afterwards.
@@ -151,7 +197,8 @@ To undo: set `skip_wren` = 0 first, then WREN plus WRAR 02h with WRENS = 00.
 
 Notes:
 * `skip_wren` must be 0 whenever CR1 might be at WRENS = 00, i.e. after
-  power-up/reset: the boot copy runs before PCI can set CR1. With
+  power-up/reset (the boot copy only reads the MRAM, but every AXI write
+  depends on it). With
   `skip_wren` = 1 and WRENS = 00, every write is **silently dropped** by
   the device.
 * The datasheet pages I reviewed do not say whether CR1 is volatile, so
@@ -212,6 +259,9 @@ from SCLK falling at the FPGA to the data arriving back at the FPGA:
 ```sh
 sim/run_ghdl.sh          # GHDL >= 4.x, VHDL-2008; prints TEST PASSED / FAILED
 sim/run_dma.sh           # mixed traffic: PCI DMA reads + CPU-like reads/writes
+sim/run_sram.sh          # SRAM boot copy, reload, fault injection, AXI master checker
+sim/run_sram.sh -gG_STALL_PCT=80 -gG_SEED=7                 # heavier SRAM stalls
+sim/run_sram.sh -gG_COPY=1048576 -gG_ONLY_BOOT=true         # full 1 MB boot (slow)
 sim/run_ghdl.sh --wave   # also writes sim/build/tb_mram_top.ghw
 sim/run_ghdl.sh -gG_MODEL_TCO_PS=20000 -gG_SAMPLE_DLY=0   # slow board, no delay: fails like the first board
 ```

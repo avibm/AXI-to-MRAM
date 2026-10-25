@@ -16,6 +16,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 use work.mram_pkg.all;
 use work.qspi_mram_mem_pkg.all;
+use work.axi_sram_mem_pkg.all;
 
 entity tb_dma is
     generic (G_SZ : natural := 2; G_LEN : natural := 15; G_NBURST : natural := 64;
@@ -38,6 +39,16 @@ architecture sim of tb_dma is
     signal cs_n, sclk : std_logic;
     signal io : std_logic_vector(3 downto 0);
     signal boot_done : std_logic := '0';
+    -- boot copy AXI master -> behavioural SRAM (axi_sram_model)
+    signal m_awid, m_arid, m_bid, m_rid : std_logic_vector(3 downto 0);
+    signal m_awaddr, m_araddr : std_logic_vector(31 downto 0);
+    signal m_awlen, m_arlen   : std_logic_vector(7 downto 0);
+    signal m_awsize, m_arsize : std_logic_vector(2 downto 0);
+    signal m_awburst, m_arburst, m_bresp, m_rresp : std_logic_vector(1 downto 0);
+    signal m_awvalid, m_awready, m_wvalid, m_wready, m_wlast, m_bvalid, m_bready : std_logic;
+    signal m_arvalid, m_arready, m_rvalid, m_rready, m_rlast : std_logic;
+    signal m_wdata, m_rdata : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    signal m_wstrb : std_logic_vector(C_AXI_STRB_WIDTH - 1 downto 0);
     signal merrs, mrd, mwr : natural;
     signal ar_q : natural := 0;    -- ARs issued
     signal r_done_n : natural := 0; -- bursts fully received
@@ -75,13 +86,47 @@ begin
             cmd_rdid => '0', cmd_wrsr_data => x"00", cmd_rdsr_data => open, cmd_rdid_data => open,
             cmd_done => open, boot_hold => '0', mram_wr_pending => open, mram_rd_slip => open,
             cpu_reset_n => open, boot_done => boot_done, boot_fail => open,
+            m_axi_awid => m_awid, m_axi_awaddr => m_awaddr, m_axi_awlen => m_awlen,
+            m_axi_awsize => m_awsize, m_axi_awburst => m_awburst, m_axi_awlock => open,
+            m_axi_awcache => open, m_axi_awprot => open,
+            m_axi_awvalid => m_awvalid, m_axi_awready => m_awready,
+            m_axi_wdata => m_wdata, m_axi_wstrb => m_wstrb, m_axi_wlast => m_wlast,
+            m_axi_wvalid => m_wvalid, m_axi_wready => m_wready,
+            m_axi_bid => m_bid, m_axi_bresp => m_bresp, m_axi_bvalid => m_bvalid, m_axi_bready => m_bready,
+            m_axi_arid => m_arid, m_axi_araddr => m_araddr, m_axi_arlen => m_arlen,
+            m_axi_arsize => m_arsize, m_axi_arburst => m_arburst, m_axi_arlock => open,
+            m_axi_arcache => open, m_axi_arprot => open,
+            m_axi_arvalid => m_arvalid, m_axi_arready => m_arready,
+            m_axi_rid => m_rid, m_axi_rdata => m_rdata, m_axi_rresp => m_rresp, m_axi_rlast => m_rlast,
+            m_axi_rvalid => m_rvalid, m_axi_rready => m_rready, boot_status => open,
             mram_cs_n => cs_n, mram_sclk => sclk, mram_io => io);
+    sram_mdl : entity work.axi_sram_model
+        generic map (G_ID_WIDTH => 4, G_DATA_W => C_AXI_DATA_WIDTH, G_STALL_PCT => 20)
+        port map (
+            aclk => aclk, aresetn => aresetn,
+            s_axi_awid => m_awid, s_axi_awaddr => m_awaddr, s_axi_awlen => m_awlen,
+            s_axi_awsize => m_awsize, s_axi_awburst => m_awburst,
+            s_axi_awvalid => m_awvalid, s_axi_awready => m_awready,
+            s_axi_wdata => m_wdata, s_axi_wstrb => m_wstrb, s_axi_wlast => m_wlast,
+            s_axi_wvalid => m_wvalid, s_axi_wready => m_wready,
+            s_axi_bid => m_bid, s_axi_bresp => m_bresp, s_axi_bvalid => m_bvalid, s_axi_bready => m_bready,
+            s_axi_arid => m_arid, s_axi_araddr => m_araddr, s_axi_arlen => m_arlen,
+            s_axi_arsize => m_arsize, s_axi_arburst => m_arburst,
+            s_axi_arvalid => m_arvalid, s_axi_arready => m_arready,
+            s_axi_rid => m_rid, s_axi_rdata => m_rdata, s_axi_rresp => m_rresp, s_axi_rlast => m_rlast,
+            s_axi_rvalid => m_rvalid, s_axi_rready => m_rready);
+
     mdl : entity work.qspi_mram_model
         generic map (G_TPU => 10 us)
         port map (cs_n => cs_n, sclk => sclk, io => io, errors => merrs, n_rd => mrd, n_wr => mwr);
 
     process begin
-        for a in 0 to 16383 loop mem.write(16#6000000# + a, pat(a)); mem.write(a, x"EE"); end loop;
+        -- master copy, and the CPU line-read area 0x0-0xFFF (with the SRAM
+        -- boot copy nothing is copied there any more); CPU writes go to 0x1000..
+        for a in 0 to 16383 loop
+            mem.write(16#6000000# + a, pat(a));
+            if a < 4096 then mem.write(a, pat(a)); else mem.write(a, x"EE"); end if;
+        end loop;
         wait;
     end process;
 

@@ -61,6 +61,13 @@
 -- from one master therefore cannot starve another master's reads, or the
 -- reverse. ready is routed only to the engine whose request is on core_req.
 --
+-- Hold / idle (hand-over of the MRAM backend to the SRAM boot copy, see
+-- mram_top): while hold = '1' no new AW or AR is accepted (AWREADY and
+-- ARREADY stay low, a legal stall); bursts already accepted run to
+-- completion, including their B and every R beat. idle = '1' when nothing
+-- is accepted or in flight on either side, so the backend can change hands
+-- without resetting this block and without dropping a handshake.
+--
 -- Language: VHDL-2008
 --------------------------------------------------------------------------------
 
@@ -83,6 +90,10 @@ entity axi4_slave_wrapper is
     port (
         aclk    : in  std_logic;
         aresetn : in  std_logic;
+
+        -- '1' = accept no new AW/AR; '1' on idle = nothing accepted or in flight
+        hold    : in  std_logic := '0';
+        idle    : out std_logic;
 
         -- Write address channel
         s_axi_awid     : in  std_logic_vector(G_ID_WIDTH - 1 downto 0);
@@ -364,7 +375,7 @@ begin
                 case wr_state is
 
                     when WR_IDLE =>
-                        if s_axi_awvalid = '1' then
+                        if s_axi_awvalid = '1' and hold = '0' then
                             s_axi_awready <= '1'; -- AW handshake completes next cycle
                             wr_id         <= s_axi_awid;
                             wr_addr       <= unsigned(s_axi_awaddr);
@@ -479,10 +490,16 @@ begin
     -- Read side: one process handles AR-accept (push) and R-drain (pop) so
     -- rd_fifo / rd_fifo_count have a single driver.
     ----------------------------------------------------------------------------
-    -- Gated by aresetn: mram_top holds this block in reset during the boot
-    -- copy while the PCI master may already be issuing AR requests, and an
-    -- AR accepted during reset would be lost.
-    s_axi_arready <= not rd_fifo_full and aresetn;
+    -- Gated by aresetn (an AR accepted during reset would be lost) and by
+    -- hold (no new burst while the backend is being handed over). hold is a
+    -- register in mram_top, so there is no path from a VALID to this READY.
+    s_axi_arready <= not rd_fifo_full and aresetn and not hold;
+
+    idle <= '1' when wr_state = WR_IDLE and wr_outst = 0 and wr_core_req_o.valid = '0'
+                     and rd_fifo_count = 0 and is_avail = 0 and is_active = '0'
+                     and rd_infl = 0 and rb_cnt = 0 and rd_core_req_o.valid = '0'
+                     and s_axi_rvalid = '0'
+            else '0';
 
     process (aclk)
         variable v_push  : boolean;  -- AR accepted into the FIFO

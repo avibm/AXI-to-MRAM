@@ -1,14 +1,16 @@
 --------------------------------------------------------------------------------
 -- tb_mram_top.vhd  (simulation only)
 --
--- Self-checking testbench for mram_top against qspi_mram_model. Works for
+-- Self-checking testbench for mram_top against qspi_mram_model, with
+-- axi_sram_model on the boot copy's AXI master port (the SRAM). Works for
 -- any C_AXI_DATA_WIDTH in mram_pkg (64, 128, 256, 512): 64-byte transfers
 -- are full-width INCR bursts of 64 / C_BEAT_BYTES beats. Uses a
--- 512-byte boot image so the boot copy finishes quickly. Every write is
+-- 512-byte boot image so the boot copy finishes quickly; the SRAM boot copy
+-- itself is tested in depth by tb_mram_sram. Every write is
 -- checked byte-by-byte through the model's backdoor (including bytes that
 -- must NOT change), and every read is compared with the backdoor.
 --
--- Covered: boot copy + verify, an AXI read issued while boot_hold keeps
+-- Covered: boot copy MRAM -> SRAM + verify, an AXI read issued while boot_hold keeps
 -- the copy waiting (served during the hold), 64-byte / narrow / unaligned /
 -- sparse-strobe writes, INCR bursts, write-guard blocking and unlocking,
 -- FIXED-burst rejection, reads concurrent with writes, randomized
@@ -42,6 +44,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 use work.mram_pkg.all;
 use work.qspi_mram_mem_pkg.all;
+use work.axi_sram_mem_pkg.all;
 
 entity tb_mram_top is
     generic (
@@ -128,6 +131,16 @@ architecture sim of tb_mram_top is
     signal rd_slip     : std_logic;
     signal boot_done   : std_logic;
     signal boot_fail   : std_logic;
+    -- boot copy AXI master -> behavioural SRAM (axi_sram_model)
+    signal m_awid, m_arid, m_bid, m_rid : std_logic_vector(3 downto 0);
+    signal m_awaddr, m_araddr : std_logic_vector(31 downto 0);
+    signal m_awlen, m_arlen   : std_logic_vector(7 downto 0);
+    signal m_awsize, m_arsize : std_logic_vector(2 downto 0);
+    signal m_awburst, m_arburst, m_bresp, m_rresp : std_logic_vector(1 downto 0);
+    signal m_awvalid, m_awready, m_wvalid, m_wready, m_wlast, m_bvalid, m_bready : std_logic;
+    signal m_arvalid, m_arready, m_rvalid, m_rready, m_rlast : std_logic;
+    signal m_wdata, m_rdata : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    signal m_wstrb : std_logic_vector(C_AXI_STRB_WIDTH - 1 downto 0);
 
     signal cs_n, sclk : std_logic;
     signal io         : std_logic_vector(3 downto 0);
@@ -234,8 +247,37 @@ begin
             rd_sample_dly => std_logic_vector(to_unsigned(G_SAMPLE_DLY, 3)),
             key_ok => key_ok, cpu_reset_n => cpu_reset_n, boot_done => boot_done,
             boot_fail => boot_fail,
+            m_axi_awid => m_awid, m_axi_awaddr => m_awaddr, m_axi_awlen => m_awlen,
+            m_axi_awsize => m_awsize, m_axi_awburst => m_awburst, m_axi_awlock => open,
+            m_axi_awcache => open, m_axi_awprot => open,
+            m_axi_awvalid => m_awvalid, m_axi_awready => m_awready,
+            m_axi_wdata => m_wdata, m_axi_wstrb => m_wstrb, m_axi_wlast => m_wlast,
+            m_axi_wvalid => m_wvalid, m_axi_wready => m_wready,
+            m_axi_bid => m_bid, m_axi_bresp => m_bresp, m_axi_bvalid => m_bvalid, m_axi_bready => m_bready,
+            m_axi_arid => m_arid, m_axi_araddr => m_araddr, m_axi_arlen => m_arlen,
+            m_axi_arsize => m_arsize, m_axi_arburst => m_arburst, m_axi_arlock => open,
+            m_axi_arcache => open, m_axi_arprot => open,
+            m_axi_arvalid => m_arvalid, m_axi_arready => m_arready,
+            m_axi_rid => m_rid, m_axi_rdata => m_rdata, m_axi_rresp => m_rresp, m_axi_rlast => m_rlast,
+            m_axi_rvalid => m_rvalid, m_axi_rready => m_rready, boot_status => open,
             mram_cs_n => cs_n, mram_sclk => sclk, mram_io => io
         );
+
+    sram_mdl : entity work.axi_sram_model
+        generic map (G_ID_WIDTH => 4, G_DATA_W => C_AXI_DATA_WIDTH, G_STALL_PCT => 20)
+        port map (
+            aclk => aclk, aresetn => aresetn,
+            s_axi_awid => m_awid, s_axi_awaddr => m_awaddr, s_axi_awlen => m_awlen,
+            s_axi_awsize => m_awsize, s_axi_awburst => m_awburst,
+            s_axi_awvalid => m_awvalid, s_axi_awready => m_awready,
+            s_axi_wdata => m_wdata, s_axi_wstrb => m_wstrb, s_axi_wlast => m_wlast,
+            s_axi_wvalid => m_wvalid, s_axi_wready => m_wready,
+            s_axi_bid => m_bid, s_axi_bresp => m_bresp, s_axi_bvalid => m_bvalid, s_axi_bready => m_bready,
+            s_axi_arid => m_arid, s_axi_araddr => m_araddr, s_axi_arlen => m_arlen,
+            s_axi_arsize => m_arsize, s_axi_arburst => m_arburst,
+            s_axi_arvalid => m_arvalid, s_axi_arready => m_arready,
+            s_axi_rid => m_rid, s_axi_rdata => m_rdata, s_axi_rresp => m_rresp, s_axi_rlast => m_rlast,
+            s_axi_rvalid => m_rvalid, s_axi_rready => m_rready);
 
     mdl : entity work.qspi_mram_model
         generic map (G_TPU => 10 us, G_DEVICE_ID => DEVICE_ID, G_TCO => G_MODEL_TCO_PS * 1 ps)
@@ -538,9 +580,10 @@ begin
         check(cpu_reset_n = '1', "cpu_reset_n not released");
         check(boot_fail = '0', "boot_fail set");
         for a in 0 to BOOT_BYTES - 1 loop
-            check(mem.read(a) = pattern(SRC_BASE + a), "working copy byte " & integer'image(a) & " wrong");
+            check(sram.read(a) = pattern(SRC_BASE + a), "SRAM byte " & integer'image(a) & " wrong");
         end loop;
-        check(mem.read(BOOT_BYTES) = x"EE", "boot copy wrote past its end");
+        check(sram.read(BOOT_BYTES) = x"00", "boot copy wrote past its end");
+        check(mem.read(0) = x"EE", "boot copy wrote the MRAM");
         wr_step <= 1;
 
         -- T3: 64-byte write (one beat at 512 bits, a burst on a narrower bus)

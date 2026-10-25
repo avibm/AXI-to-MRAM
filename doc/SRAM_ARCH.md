@@ -1,9 +1,12 @@
-# SRAM execution memory – architecture (draft for approval)
+# SRAM execution memory – architecture
 
-Status: **Phase 1 draft, not approved.** No RTL has been written for this
-yet. Every figure marked *estimate* is a hand calculation, not a
-measurement. Items marked **OPEN** need an answer or a check in Libero
-before or during Phase 2; they are collected in section 12.
+Status: **implemented (Phase 2).** Implementation was requested on
+2026-10-25 together with the reload input (section 6). The RTL is
+`rtl/sram_boot_copy.vhd` plus changes to `mram_top` and
+`axi4_slave_wrapper`; simulation results are in section 11. Every figure
+marked *estimate* is a hand calculation or a simulation, not a board
+measurement. Items marked **OPEN** need an answer or a check in Libero;
+they are collected in section 12.
 
 ## 1. Decisions taken (from the requirements discussion)
 
@@ -45,7 +48,7 @@ before or during Phase 2; they are collected in section 12.
   |  s_axi_* -> axi4_slave_wrapper  |   +--------------------+      |
   |                 |               |                               |
   |                 v               |                               |
-  |   +-------- mux (axi_owns) <-------- sram_boot_copy (NEW) ------+
+  |   +-------- mux (boot_own) <-------- sram_boot_copy (NEW) ------+
   |   |                             |      reads MRAM via core_req,  |
   |   v                             |      writes/reads SRAM via     |
   |  mram_write_guard               |      m_axi_* ; drives          |
@@ -58,11 +61,12 @@ before or during Phase 2; they are collected in section 12.
    AS302G208 die 1 (QSPI, 37.5 MHz SCLK, 128 MB)
 ```
 
-`sram_boot_copy` replaces `mram_boot_copy`, which is deleted in Phase 2.
-There is no switch back to the MRAM → MRAM copy. `mram_top` keeps its
-existing ports and gains the `m_axi_*` master port and `boot_status`.
-The generics `G_BOOT_DST_BASE` and `G_BOOT_COPY_SIZE` of the old copy are
-replaced by the SRAM destination address and the 1 MB size.
+`sram_boot_copy` replaces `mram_boot_copy`, which is deleted. There is no
+switch back to the MRAM → MRAM copy. `mram_top` keeps its existing ports
+and gains the `m_axi_*` master port, `sram_reload` and `boot_status`.
+Generics: `G_BOOT_DST_BASE` is replaced by `G_BOOT_DST_ADDR` (AXI address
+of the SRAM, 0); `G_BOOT_COPY_SIZE` now defaults to 1 MB; new
+`G_BOOT_FIFO_BLOCKS` (2), `G_M_ID_WIDTH` (4) and `G_M_ID` (0).
 
 ## 3. Address map
 
@@ -120,14 +124,16 @@ protected region (0x6000000–0x7FFFFFF) are MRAM offsets.
 
 ## 5. Data flow per master
 
-**Boot copy engine (INITIATOR2), only between reset and `boot_done`:**
+**Boot copy engine (INITIATOR2), after reset and on each reload, until
+`boot_done` or `boot_fail`:**
 
 1. Waits for the MRAM power-up time (25 ms, as now) and while
    `boot_hold` = 1.
 2. **Copy pass:** reads MRAM 0x6000000 … 0x60FFFFF through the core
    interface as one continuous stream of beat reads. Data goes into a
-   small FIFO (proposed 2 × 64-byte blocks, **estimate** of a sufficient
-   depth). Each full 64-byte block is written to SRAM as one AXI INCR
+   small FIFO (`G_BOOT_FIFO_BLOCKS` = 2 × 64-byte blocks, in flip-flops).
+   Simulation shows this depth keeps the MRAM stream unbroken even with
+   95 % random stalls on the SRAM side (section 11). Each full 64-byte block is written to SRAM as one AXI INCR
    burst (8 beats at 64 bits, all strobes on, AWSIZE = bus width, never
    crossing 4 KB). Because the writes no longer use the MRAM, the MRAM
    read never pauses and stays one long RDQI.
@@ -151,9 +157,9 @@ at MRAM speed. Held in reset until `boot_done`.
 
 **PCI bridge (INITIATOR0):** reaches SRAM and MRAM through the 64 MB
 window. During the boot copy:
-* MRAM accesses stall at the interconnect, as now (the AXI wrapper is in
-  reset until the copy ends). The stall is now about 0.15 s instead of
-  about 9 s (*estimate*, section 9).
+* MRAM accesses stall at the interconnect: the AXI wrapper accepts no new
+  AW/AR while the copy owns the MRAM (it is no longer held in reset). The
+  stall is now about 0.12 s instead of about 9 s (section 9).
 * SRAM accesses are **not** blocked: TARGET1 is outside `mram_top`. A PCI
   write to SRAM during the copy would race it, and a PCI write after the
   verify of that block would not be detected. **Rule: the host must not
@@ -192,35 +198,30 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
   fabric is stuck), the engine goes to `boot_fail` without starting new
   traffic. It cannot legally withdraw a raised VALID, so recovery then
   needs a reset.
-* **CPU watchdog reset (proposed, OPEN OA5).** The CPU can be reset by a
-  watchdog without `aresetn`. After a watchdog reset the SRAM cannot be
-  trusted: `.data` holds modified values, and a runaway CPU may have
-  overwritten code (nothing write-protects the SRAM). So the watchdog
-  reset must reload the SRAM before the CPU runs again:
-  * The watchdog reset request goes **into `mram_top`** (new input
-    `reload_req`), not straight to the CPU. `cpu_reset_n` stays the only
-    CPU reset output, so the CPU cannot leave reset before the reload is
-    verified.
-  * On `reload_req`: `cpu_reset_n` = 0 and `boot_done` = 0 at once; skip
-    the power-up wait (the MRAM is already powered); run the same copy and
-    verify (≈ 0.12 s, *estimate*); release the CPU.
-  * **The AXI side of the MRAM must not be reset** for a reload: PCI may
-    have a transfer in flight, and dropping it would break the AXI
-    handshake (lesson 1). Instead the wrapper stops accepting new AW/AR
-    (AWREADY/ARREADY low, which is a legal stall), finishes every burst
-    already accepted, and only then hands the backend to the copy engine.
-    MRAM access from PCI stalls for the length of the reload. This needs a
-    small change in `axi4_slave_wrapper` (a hold input and an idle
-    output).
+* **Reload (`sram_reload`, implemented).** A rising edge on `sram_reload`
+  (synchronized into `aclk` and edge-detected inside `mram_top`, so it may
+  come straight from a PCI register bit) runs the copy again. The CPU
+  watchdog itself is not connected to it; which source drives
+  `sram_reload` is a system decision.
+  * Acted on in the done or failed state: `cpu_reset_n` = 0 and
+    `boot_done` = 0 (and `boot_fail` = 0) at once; no power-up wait; the
+    same copy and verify as at boot; then the CPU is released. A reload
+    from the failed state is how the host retries after reprogramming the
+    master copy. Ignored while a copy is running and in the stuck state.
+  * **The AXI side of the MRAM is not reset.** `sram_boot_copy` raises
+    `mram_hold`; the wrapper (new `hold` input) stops accepting new AW/AR
+    (AWREADY/ARREADY low, a legal stall), finishes every burst already
+    accepted, and reports `idle`. Only then does the copy take the backend
+    (`mram_own`). Backend responses are routed only to the owner. A PCI
+    burst in flight therefore always completes. The same mechanism is
+    used after power-up and after `boot_hold` is released, so releasing
+    `boot_hold` with AXI accesses in flight is now safe.
   * PCI access to the SRAM during a reload races the copy, as at boot.
     The host sees `boot_done` = 0 while it runs.
   * Not controllable from this RTL: AXI transactions the CPU had
-    outstanding when it was reset. Whether NOEL-V and the interconnect
-    complete or drop those cleanly is a system question (lesson 1).
-  * OPEN: where the watchdog is (inside NOEL-V or external), the signal
-    name, polarity, pulse length and clock domain. `reload_req` will be
-    synchronized into `aclk` and edge-detected, so any pulse of at least
-    two `aclk` periods (*assumption*) is enough.
+    outstanding when it was put into reset. Whether NOEL-V and the
+    interconnect complete or drop those cleanly is a system question
+    (lesson 1).
 
 ## 7. Coherency and persistence rules
 
@@ -267,8 +268,10 @@ keeps BREADY and RREADY high.
 The copy engine uses only: INCR bursts of 64 bytes (AWLEN/ARLEN =
 64/beat bytes − 1), full-width beats, all WSTRB bits set, one AXI ID,
 AxLOCK = 0, AxCACHE = 0000 (**OPEN** if the interconnect requires another
-value), AxPROT = 000, no 4 KB crossing. Up to 2 write bursts and 1 read
-burst outstanding (*proposed*).
+value), AxPROT = 000, no 4 KB crossing. Up to 2 write bursts and 2 read
+bursts outstanding (generics `G_MAX_WR_OUTST`, `G_MAX_RD_OUTST` of
+`sram_boot_copy`). AxQOS/AxREGION/AxUSER are not driven by this block; tie
+them off in SmartDesign if INITIATOR2 has them (Phase 3).
 
 ## 9. Throughput estimates (all *estimates*)
 
@@ -295,12 +298,14 @@ burst outstanding (*proposed*).
     registered output. Proposed: registers, with a generic to change it.
   * Control, counters, AXI master, watchdog: roughly 300–600 flip-flops.
 * `mram_boot_copy` (its 64-byte buffer, ≈ 512 flip-flops) is removed.
-* Net change: roughly +1,000 flip-flops before TMR. Phase 2 will report a
-  GHDL synthesis count; only the Libero report is authoritative.
+* GHDL synthesis count (Phase 2, rough, not Libero, before TMR):
+  `sram_boot_copy` ≈ 1,600 register bits (575 plus the 1,024-bit FIFO);
+  whole `mram_top` ≈ 3,230 against ≈ 2,340 before, so about +900. Only the
+  Libero report is authoritative.
 * Timing: the FIFO read port and the 64-bit compare are registered. No
   combinational path from any input VALID to an output READY.
 
-## 11. Verification plan
+## 11. Verification plan and results
 
 New testbench `sim/tb_mram_sram.vhd`, run by `sim/run_sram.sh`, all
 GHDL 4.1 / VHDL-2008:
@@ -342,6 +347,13 @@ Limits: the SRAM model is generic AXI4, **not** `PF_SRAM_AHBL_AXI`, and
 there is no CoreAXI4Interconnect model. Board tests remain necessary;
 Phase 3 lists the Identify probes for them.
 
+**Results (Phase 2):** all of the above is implemented in
+`sim/tb_mram_sram.vhd` (tests T0–T9, listed in its header) and passes, as
+do the adapted `tb_mram_top` and `tb_dma`. Stall rates 0–95 %, data widths
+64/128/512, six mutation checks: see `doc/REVIEW.md`, Rev. 13. The
+reduced-size (16 KB) boot takes 1.749–1.752 ms of simulated time at every
+stall rate.
+
 ## 12. Open items
 
 | # | Item | Needed by |
@@ -350,7 +362,7 @@ Phase 3 lists the Identify probes for them.
 | OA2 | `PF_SRAM_AHBL_AXI`: width 64, ID 5, address 32 confirmed from the configurator. Still open: enable ECC (currently Disabled) and how errors are reported; partial-write handling with ECC; meaning of the write/read timeout counts (80) and of "High reliability" | ECC decision before the board build; the rest Phase 3 |
 | OA3 | INITIATOR2: ID width 4 (ID[3:0]) confirmed. Still open: target visibility; AxCACHE requirements | Phase 3 |
 | OA4 | NOEL-V caches and their policy, cacheable regions | Firmware rules only |
-| OA5 | A CPU watchdog reset exists. Proposed: reload input (section 6). Open: watchdog location, signal, polarity, pulse length, clock | Phase 2 |
+| OA5 | ~~CPU watchdog reset~~ – implemented as the `sram_reload` input (section 6); the watchdog itself is not connected to it (system decision) | Done |
 | OA6 | CPU-side reset synchronizer for `cpu_reset_n` | Phase 3 |
 | OA7 | Earlier questions still open: bridge name (`pci2mram` vs `pci2ddr4` in the README), why the 64-bit TARGET0 port lost PCI writes (REVIEW Rev. 10), uSRAM total (I recall ≈ 3.4 Mbit, not 13 Mbit; please check the datasheet) | Documentation |
 | OA8 | Image check: read-back verify only. A corrupted master image is still copied and "verified" (REVIEW O6). CRC can be added later. | Later |

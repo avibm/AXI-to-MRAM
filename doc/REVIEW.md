@@ -316,6 +316,69 @@ sample delays 1–3.
   errors.
 * Architecture for the SRAM execution memory: `doc/SRAM_ARCH.md`.
 
+### Rev. 13 – SRAM execution memory: boot copy MRAM → SRAM, reload
+
+Architecture: `doc/SRAM_ARCH.md`. The CPU now executes from the 1 MB
+on-chip SRAM (`PF_SRAM_AHBL_AXI`, interconnect TARGET1 at AXI 0x0); the
+MRAM is TARGET0 from AXI 0x0010_0000.
+
+| # | File | Change | Why |
+|---|------|--------|-----|
+| S1 | `rtl/sram_boot_copy.vhd` (new) | Copies 1 MB from MRAM 0x6000000 to the SRAM through its own AXI4 master port, verifies it by reading both again, retries up to 3 times, then releases `cpu_reset_n`. 64-byte INCR bursts, AWVALID only when the whole block is buffered, W beats without gaps, BREADY/RREADY always 1. Watchdog → stop issuing, complete every started handshake, retry; drain timeout → "stuck" (`boot_fail`). `boot_status` reports phase, retries and the cause of each failure. | The MRAM is too slow for execution. Lessons 1–3: never abandon a handshake, never depend on the other side's timing. |
+| S2 | `rtl/mram_boot_copy.vhd` (deleted) | Replaced by S1. No legacy switch. | Requested. |
+| S3 | `rtl/axi4_slave_wrapper.vhd` | New `hold` input: no new AW/AR accepted (READY low). New `idle` output: nothing accepted or in flight. | The backend changes hands for a reload without resetting the AXI side, so a PCI burst in flight always completes. Before, the wrapper was held in reset during the boot copy, which is only safe at power-up. |
+| S4 | `rtl/mram_top.vhd` | New ports `m_axi_*` (INITIATOR2), `sram_reload` (synchronized, rising edge), `boot_status`. Ownership mux driven by the copy engine; backend responses are masked to the side that does not own it. New generics `G_BOOT_DST_ADDR`, `G_BOOT_FIFO_BLOCKS`, `G_M_ID_WIDTH`, `G_M_ID`; `G_BOOT_DST_BASE` removed; `G_BOOT_COPY_SIZE` default 1 MB. | S1, S3. |
+| S5 | `rtl/mram_qspi_backend.vhd` | Comments only (references to the deleted file). | — |
+
+Consequences:
+* Releasing `boot_hold` with AXI accesses in flight is now safe (S3); the
+  README caveat is removed.
+* The old open items O7 (watchdog retry without waiting for the request
+  in flight) and O8 (≈ 9 s PCI stall during boot) are addressed for the
+  new engine: the drain waits for every response, and the stall is now
+  about 0.12 s for 1 MB (estimate from simulation, not measured).
+* O13 (copy only on `aresetn`): a reload can now be requested with
+  `sram_reload`.
+* The response mask adds one AND gate to the combinational accept path
+  wrapper → mux → guard → backend → back (O11 a). Check it in SmartTime.
+* Known limitation: if a PCI write burst was accepted by the wrapper and
+  the bridge never sends the rest of its W data, the reload waits in phase
+  2 ("waiting for the MRAM port") until it does. It cannot take the MRAM
+  without breaking that burst.
+
+Verification (GHDL 4.1, all at 64 bits unless noted):
+* New `sim/tb_mram_sram.vhd` (`sim/run_sram.sh`), with a behavioural AXI4
+  SRAM model (`sim/axi_sram_model.vhd`, random stalls and fault injection)
+  and an AXI master protocol checker (`sim/axi_master_checker.vhd`) on
+  `m_axi_*`. Tests T0–T9: `boot_hold`; boot with byte-for-byte scoreboard;
+  MRAM access after boot; reload while PCI-style MRAM reads stream (all
+  reads correct, no AW/AR accepted on the MRAM port while the copy owns
+  it); one corrupted byte, one BRESP SLVERR, one RRESP SLVERR (one retry
+  each); permanent corruption → `boot_fail`, then reload; all SRAM channels
+  stalled past the watchdog → drain → retry; B never returned → stuck, no
+  new traffic, MRAM handed back, `aresetn` recovers.
+* Passes with SRAM stall rates 0 %, 30 %, 50 %, 80 % and 95 % (several
+  seeds), and at 128 and 512 bits. With a 16 KB copy the boot takes
+  1.749–1.752 ms of simulated time at every stall rate, so the MRAM stream
+  is the bottleneck, not the SRAM side.
+* Mutation checks, each made the testbench fail: verify compare removed;
+  drain skipped; WLAST on the wrong beat; CPU released after the copy pass
+  without verify; wrapper ignoring `hold` on AR (caught after adding a
+  direct check — the first version only checked the outcome, which the
+  response mask already kept correct); response mask removed.
+* `sim/tb_mram_top.vhd` and `sim/tb_dma.vhd` now boot through the SRAM
+  model; their MRAM-copy checks became SRAM checks. Both pass at 64, 128
+  and 512 bits. `tb_dma` gives the same 3.2017 ms as before the change.
+* The MRAM model's backdoor storage grew from 4 × 16 KB to 4 × 1 MB
+  windows so a full 1 MB copy can be scoreboarded.
+* Rough register count (GHDL synthesis, not Libero, before TMR):
+  `mram_top` ≈ 3,230 bits including the 1,024-bit copy FIFO and the
+  260-bit read buffer, against ≈ 2,340 before; `sram_boot_copy` ≈ 1,600.
+
+Limits: the SRAM model is generic AXI4, not `PF_SRAM_AHBL_AXI`, and there
+is no interconnect model. Not synthesized in Libero, not timing-closed,
+not run on hardware.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,
