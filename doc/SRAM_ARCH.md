@@ -192,11 +192,35 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
   fabric is stuck), the engine goes to `boot_fail` without starting new
   traffic. It cannot legally withdraw a raised VALID, so recovery then
   needs a reset.
-* Like today, the copy runs on `aresetn` only (REVIEW O13). **OPEN:** a
-  CPU-only reset (for example a CPU watchdog) does not reload the SRAM, so
-  `.data` would start with modified values. Is a CPU-only reset used? If
-  yes, either the system asserts `aresetn` for it, or the firmware must
-  not rely on load-time `.data` values after a warm reset.
+* **CPU watchdog reset (proposed, OPEN OA5).** The CPU can be reset by a
+  watchdog without `aresetn`. After a watchdog reset the SRAM cannot be
+  trusted: `.data` holds modified values, and a runaway CPU may have
+  overwritten code (nothing write-protects the SRAM). So the watchdog
+  reset must reload the SRAM before the CPU runs again:
+  * The watchdog reset request goes **into `mram_top`** (new input
+    `reload_req`), not straight to the CPU. `cpu_reset_n` stays the only
+    CPU reset output, so the CPU cannot leave reset before the reload is
+    verified.
+  * On `reload_req`: `cpu_reset_n` = 0 and `boot_done` = 0 at once; skip
+    the power-up wait (the MRAM is already powered); run the same copy and
+    verify (≈ 0.12 s, *estimate*); release the CPU.
+  * **The AXI side of the MRAM must not be reset** for a reload: PCI may
+    have a transfer in flight, and dropping it would break the AXI
+    handshake (lesson 1). Instead the wrapper stops accepting new AW/AR
+    (AWREADY/ARREADY low, which is a legal stall), finishes every burst
+    already accepted, and only then hands the backend to the copy engine.
+    MRAM access from PCI stalls for the length of the reload. This needs a
+    small change in `axi4_slave_wrapper` (a hold input and an idle
+    output).
+  * PCI access to the SRAM during a reload races the copy, as at boot.
+    The host sees `boot_done` = 0 while it runs.
+  * Not controllable from this RTL: AXI transactions the CPU had
+    outstanding when it was reset. Whether NOEL-V and the interconnect
+    complete or drop those cleanly is a system question (lesson 1).
+  * OPEN: where the watchdog is (inside NOEL-V or external), the signal
+    name, polarity, pulse length and clock domain. `reload_req` will be
+    synchronized into `aclk` and edge-detected, so any pulse of at least
+    two `aclk` periods (*assumption*) is enough.
 
 ## 7. Coherency and persistence rules
 
@@ -226,8 +250,8 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
 
 | Item | Needed | What to check |
 |------|--------|---------------|
-| INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64) | How many initiators the configurator allows; its ID width for that port (sets `G_M_ID_WIDTH`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
-| TARGET1 width | Same width as SRAM IP's AXI port | The configured width, and REVIEW Rev. 10: the 64-bit TARGET0 configuration once lost PCI writes. The SRAM path already works on the board, so I take its current settings as given. |
+| INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64), **ID 4 bits (ID[3:0], from the interconnect configuration)**; the engine drives a constant ID | How many initiators the configurator allows; its ID width for that port (sets `G_M_ID_WIDTH`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
+| TARGET1 width | Same width as SRAM IP's AXI port. **TARGET1 ID is 6 bits (ID[5:0]) in the interconnect, but the SRAM IP is configured with ID width 5** (OPEN OA9) | The configured width, and REVIEW Rev. 10: the 64-bit TARGET0 configuration once lost PCI writes. The SRAM path already works on the board, so I take its current settings as given. |
 | `PF_SRAM_AHBL_AXI` | AXI4 slave, 1 MB, ECC on | Configured (screenshot of the configurator, version 1.2.116): LSRAM; depth 131072 words × 64 bits = 1 MB; native interface off; read port "Pipelined (Address pipeline and Data pipeline)"; **ECC Disabled**; fabric interface AXI; data width 64; reset Asynchronous; "High reliability" on; AXI address width 32; ID width 5; write and read interfaces on, write and read timeout count 80. Still to check in the IP handbook: what ECC options exist and how errors are reported; how narrow/partial-strobe writes are handled with ECC; what "High reliability" does; **what the timeout counts do** (see below) |
 
 **Timeout counts (OPEN, OA2).** I do not know what the IP does when the
@@ -324,9 +348,10 @@ Phase 3 lists the Identify probes for them.
 |---|------|-----------|
 | OA1 | Address map fixed (SRAM 0x0–0xFFFFF, MRAM 0x100000–0x7FFFFFF). Still to confirm: the interconnect passes the full address to TARGET0 (board test in section 3) | Before board test |
 | OA2 | `PF_SRAM_AHBL_AXI`: width 64, ID 5, address 32 confirmed from the configurator. Still open: enable ECC (currently Disabled) and how errors are reported; partial-write handling with ECC; meaning of the write/read timeout counts (80) and of "High reliability" | ECC decision before the board build; the rest Phase 3 |
-| OA3 | INITIATOR2: allowed by the configurator? ID width; target visibility; AxCACHE requirements | Phase 2 port widths |
+| OA3 | INITIATOR2: ID width 4 (ID[3:0]) confirmed. Still open: target visibility; AxCACHE requirements | Phase 3 |
 | OA4 | NOEL-V caches and their policy, cacheable regions | Firmware rules only |
-| OA5 | Is a CPU-only reset used? (SRAM is not reloaded by it) | Phase 2 if a reload input is wanted |
+| OA5 | A CPU watchdog reset exists. Proposed: reload input (section 6). Open: watchdog location, signal, polarity, pulse length, clock | Phase 2 |
 | OA6 | CPU-side reset synchronizer for `cpu_reset_n` | Phase 3 |
 | OA7 | Earlier questions still open: bridge name (`pci2mram` vs `pci2ddr4` in the README), why the 64-bit TARGET0 port lost PCI writes (REVIEW Rev. 10), uSRAM total (I recall ≈ 3.4 Mbit, not 13 Mbit; please check the datasheet) | Documentation |
 | OA8 | Image check: read-back verify only. A corrupted master image is still copied and "verified" (REVIEW O6). CRC can be added later. | Later |
+| OA9 | ID width mismatch: TARGET1 is ID[5:0] (6 bits) in the interconnect, `PF_SRAM_AHBL_AXI` has "Width of ID" = 5. If the top ID bit is not carried, a response can come back with the wrong ID and reach the wrong initiator or none, which hangs that initiator. Set the SRAM IP ID width to 6, or confirm how the extra bit is connected. TARGET0 ID width to be checked too: `mram_top` uses `G_ID_WIDTH` = 5 by default and can be set to 6 | Before the board build |
