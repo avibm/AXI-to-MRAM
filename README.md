@@ -20,6 +20,10 @@ verifying it, and a write guard for the protected region.
 | `doc/MRAM_Subsystem_IP_Specification.pdf` | IP specification |
 | `doc/REVIEW.md` | Design review: bugs found and fixed, open items, spec errata |
 | `doc/SRAM_ARCH.md` | Architecture of the SRAM execution memory: address map, boot flow, reload, verification |
+| `doc/LIBERO_INTEGRATION.md` | Libero integration: port list, connections, interconnect and SRAM IP settings, constraints, Identify probes, expected figures |
+| `doc/PRECOMPILE_CHECKLIST.md` | What to check before and early in a Libero run |
+| `constraints/mram_top.sdc` | Timing constraints template for `mram_top` |
+| `formal/` | Formal harness and scripts for `sram_boot_copy` (Yosys + GHDL plugin + ABC) |
 
 ## Data width
 

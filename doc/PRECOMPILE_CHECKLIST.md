@@ -3,8 +3,9 @@
 A Libero run takes hours, so every item that can be checked before or early
 in it is listed here. Items marked **(check in Libero)** depend on tool
 menus or reports I cannot see; I do not name options I have not verified.
-Phase 3 will expand this into full integration notes (port list,
-interconnect settings, SDC, Identify probes).
+Full integration notes (port list, interconnect settings, constraints,
+Identify probes): `doc/LIBERO_INTEGRATION.md`; constraints template:
+`constraints/mram_top.sdc`.
 
 ## 1. Simulation and formal (all must pass before compiling)
 
