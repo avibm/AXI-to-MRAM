@@ -11,7 +11,7 @@ before or during Phase 2; they are collected in section 12.
 |---|-------|----------|
 | 1 | Purpose | 1 MB on-chip SRAM is execution and working memory for NOEL-V. No cache in front of the MRAM. |
 | 2 | Type | On-chip, Microchip `PF_SRAM_AHBL_AXI`, already connected to the CoreAXI4Interconnect as the second target (TARGET1) and tested on the board (read and write). |
-| 3 | Address map | SRAM at AXI address 0x0 (the CPU reset vector). The MRAM moves to a new base address. |
+| 3 | Address map | SRAM at AXI 0x0000_0000–0x000F_FFFF (the CPU reset vector is in it). MRAM continues at AXI 0x0010_0000–0x07FF_FFFF (configured and accepted by the interconnect). |
 | 4 | Boot copy | Copy MRAM 0x6000000 (master firmware) → SRAM 0x0. The old MRAM → MRAM 0x0 copy is no longer done. |
 | 5 | Copy size | Always 1 MB. |
 | 6 | Persistence | Nothing in SRAM must survive power loss. No hardware write-back to MRAM. |
@@ -66,31 +66,44 @@ top level sets `G_BOOT_TO_SRAM` = true.
 
 ## 3. Address map
 
-AXI addresses as seen by both initiators (identity addressing, as now).
+AXI addresses as seen by both initiators, as configured in the
+CoreAXI4Interconnect:
 
 | Region | AXI address | Size | Target | Notes |
 |--------|-------------|------|--------|-------|
 | SRAM | 0x0000_0000 – 0x000F_FFFF | 1 MB | TARGET1 | CPU reset vector, code, data, stack, heap |
-| MRAM | **OPEN**, proposed 0x0800_0000 – 0x0FFF_FFFF | 128 MB | TARGET0 | Base must be 128 MB-aligned (see below) |
-| MRAM master firmware | MRAM base + 0x0600_0000 (proposed 0x0E00_0000) | 32 MB region, first 1 MB used | TARGET0 | Write-protected by `mram_write_guard` unless `key_ok` |
+| MRAM | 0x0010_0000 – 0x07FF_FFFF | 127 MB | TARGET0 | MRAM offsets 0x0–0xFFFFF are not reachable (shadowed by the SRAM) |
+| MRAM master firmware | 0x0600_0000 – 0x060F_FFFF used (region to 0x07FF_FFFF) | 1 MB used of 32 MB | TARGET0 | Write-protected by `mram_write_guard` unless `key_ok` |
 
-* `mram_top` uses only AxADDR[26:0] (REVIEW O15). That is correct whether
-  the interconnect passes the full address or the offset, **as long as the
-  MRAM base is 128 MB-aligned**. All MRAM offsets inside `mram_top`
-  (boot source 0x6000000, protected region 0x6000000–0x7FFFFFF) stay MRAM
-  offsets and do not change.
-* **OPEN:** the actual address map of the interconnect (other targets,
-  if any), and whether the SRAM IP decodes the full address or an offset.
-* **Consequences of moving the MRAM** (outside this RTL):
-  * Firmware: it was linked for 0x0 and still runs at 0x0, so code
-    addresses do not change. Any absolute MRAM address in the firmware
-    (persistent data, the master copy) must add the new MRAM base.
-  * PCI host software: MRAM accesses through the 64 MB window (base
-    register at BAR + 0x80) must use the new MRAM base. Reprogramming the
-    master copy now means writing AXI 0x0E00_0000 onward (with the
-    proposed base) instead of 0x0600_0000.
-  * The firmware image (code + initialised data) at MRAM 0x6000000 must
-    be ≤ 1 MB, and code + data + bss + stack + heap must fit in 1 MB.
+This map is identity addressing **only if the interconnect passes the full
+AXI address to TARGET0** (not the address minus the 0x0010_0000 base).
+`mram_top` uses AxADDR[26:0], and its boot source (0x6000000) and
+protected region (0x6000000–0x7FFFFFF) are MRAM offsets.
+
+* **Full address passed (assumed, OPEN OA1):** AXI address = MRAM offset
+  for everything from 0x0010_0000 up. No RTL change, and the master copy
+  stays at AXI 0x0600_0000 for the PCI host. The 1 MB of MRAM at offsets
+  0x0–0xFFFFF is simply unused.
+* **Offset passed:** every MRAM offset would be 1 MB lower than its AXI
+  address; the guard and boot source would be misplaced relative to what
+  the host expects, and the last 1 MB of MRAM would be unreachable. This
+  would need a base-offset generic in `mram_top`; not planned unless the
+  board test below shows it is needed.
+* **Board test for OA1:** with `key_ok` = 0, write one word from PCI to
+  AXI 0x0600_0010. SLVERR → full address passed (the guard blocked it).
+  OKAY → offset passed (the write went to MRAM 0x5F00010, general memory,
+  not the master copy). Alternatively, probe `s_axi_awaddr` in Identify.
+* The SRAM is at base 0, so for TARGET1 full address and offset are the
+  same.
+* **Consequences** (outside this RTL):
+  * Firmware: still linked for and running at 0x0, now in SRAM. MRAM
+    addresses ≥ 0x0010_0000 are unchanged. Anything the firmware kept at
+    MRAM addresses below 0x0010_0000 and expects to survive power-off now
+    lands in volatile SRAM and must move to 0x0010_0000 or above.
+  * PCI host software: MRAM addresses unchanged (≥ 0x0010_0000); the
+    first 1 MB of the window now reaches SRAM.
+  * The firmware image at MRAM 0x6000000 must be ≤ 1 MB, and code + data
+    + bss + stack + heap must fit in 1 MB.
 
 ## 4. Clocking and CDC
 
@@ -133,7 +146,7 @@ and retry count go to a new `boot_status` output (for a PCI register or
 Identify).
 
 **NOEL-V (INITIATOR1):** fetches code and accesses data, stack and heap
-in SRAM (TARGET1). Persistent data goes to MRAM (TARGET0) at the new base,
+in SRAM (TARGET1). Persistent data goes to MRAM (TARGET0) at AXI 0x0010_0000 and up,
 at MRAM speed. Held in reset until `boot_done`.
 
 **PCI bridge (INITIATOR0):** reaches SRAM and MRAM through the 64 MB
@@ -281,7 +294,7 @@ GHDL 4.1 / VHDL-2008:
   * B never returned → watchdog → drain timeout → `boot_fail`, with no
     protocol violation and no new traffic.
 * **Other:** `boot_hold`; MRAM AXI port stalled during the copy and
-  working after it (accesses at the new base); reduced copy size for
+  working after it (accesses at AXI 0x0010_0000 and up); reduced copy size for
   speed in the regression (for example 16 KB), plus one optional full
   1 MB run (long simulation).
 * **Regression:** `sim/run_ghdl.sh` and `sim/run_dma.sh` must still pass
@@ -297,7 +310,7 @@ Phase 3 lists the Identify probes for them.
 
 | # | Item | Needed by |
 |---|------|-----------|
-| OA1 | New MRAM base address (proposed 0x0800_0000) and the full interconnect address map | Phase 2 testbench addresses, Phase 3 |
+| OA1 | Address map fixed (SRAM 0x0–0xFFFFF, MRAM 0x100000–0x7FFFFFF). Still to confirm: the interconnect passes the full address to TARGET0 (board test in section 3) | Before board test |
 | OA2 | `PF_SRAM_AHBL_AXI` configuration: AXI width, ID width, ECC option and error reporting, partial-write handling | Phase 2 (width), Phase 3 |
 | OA3 | INITIATOR2: allowed by the configurator? ID width; target visibility; AxCACHE requirements | Phase 2 port widths |
 | OA4 | NOEL-V caches and their policy, cacheable regions | Firmware rules only |
