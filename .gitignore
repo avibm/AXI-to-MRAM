@@ -3,3 +3,4 @@ sim/build/
 *.o
 *.cf
 sim/build_dma/
+formal/build/
