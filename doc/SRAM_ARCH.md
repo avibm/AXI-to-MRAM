@@ -278,10 +278,10 @@ them off in SmartDesign if INITIATOR2 has them (Phase 3).
 | Path | Figure | Basis |
 |------|--------|-------|
 | Boot: power-up wait | 25 ms | existing `G_POWERUP_CYCLES` |
-| Boot: copy pass, 1 MB | ≈ 58 ms | 1 MB at ≈ 18 MB/s (measured MRAM stream rate); SRAM writes overlap |
-| Boot: verify pass | ≈ 58 ms | same MRAM read rate; SRAM reads overlap |
-| Boot total, no retry | **≈ 0.14 s** | vs ≈ 9 s for today's 32 MB MRAM → MRAM copy |
-| Boot worst case, 3 retries | ≈ 0.5 s | 4 × 116 ms + 25 ms |
+| Boot: copy + verify, 1 MB | **111.9 ms (simulated)** | full-size simulation: 2 MB of MRAM reads at ≈ 18.75 MB/s; SRAM writes and reads overlap |
+| Boot total after reset, no retry | **≈ 0.14 s** | 25 ms power-up + 112 ms; vs ≈ 9 s for the old 32 MB MRAM → MRAM copy |
+| Reload (no power-up wait) | ≈ 0.11 s | same copy + verify |
+| Boot worst case, 3 retries | ≈ 0.47 s | 4 × 112 ms + 25 ms (estimate) |
 | CPU ↔ SRAM peak | ≤ 400 MB/s | 64 bits × 50 MHz at the CPU port; real value depends on interconnect CDC latency, SRAM IP latency and NOEL-V. **Measure.** |
 | PCI ↔ SRAM | limited by PCI | 32 × 33 MHz = 133 MB/s bus maximum; ≈ 70 MB/s seen from the bridge (REVIEW Rev. 6). The SRAM will not be the bottleneck, but the bridge still needs back-pressure for MRAM-bound writes. |
 | CPU / PCI ↔ MRAM | unchanged | ≈ 18 MB/s streamed; 4–5 µs per 64-byte read |
@@ -352,7 +352,8 @@ Phase 3 lists the Identify probes for them.
 do the adapted `tb_mram_top` and `tb_dma`. Stall rates 0–95 %, data widths
 64/128/512, six mutation checks: see `doc/REVIEW.md`, Rev. 13. The
 reduced-size (16 KB) boot takes 1.749–1.752 ms of simulated time at every
-stall rate.
+stall rate. The full 1 MB boot (T0–T2) passes in 111.9 ms of simulated
+time.
 
 ## 12. Open items
 

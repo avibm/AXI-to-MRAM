@@ -81,8 +81,9 @@ Rules:
 
 Boot time (simulation, not measured on the board): a 16 KB copy takes
 1.75 ms after the power-up wait, at every SRAM stall rate from 0 % to 95 %,
-so the MRAM read stream (≈ 18.7 MB/s) sets the pace. For 1 MB that scales
-to about 0.11 s (copy + verify), plus the 25 ms power-up wait after reset.
+so the MRAM read stream sets the pace. The full 1 MB boot was simulated
+too: 111.9 ms for copy + verify (2 MB of MRAM reads, ≈ 18.75 MB/s, the SPI
+ceiling at 37.5 MHz), plus the 25 ms power-up wait after reset.
 
 ## MRAM register commands (bring-up / debug)
 

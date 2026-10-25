@@ -370,7 +370,9 @@ Verification (GHDL 4.1, all at 64 bits unless noted):
   model; their MRAM-copy checks became SRAM checks. Both pass at 64, 128
   and 512 bits. `tb_dma` gives the same 3.2017 ms as before the change.
 * The MRAM model's backdoor storage grew from 4 × 16 KB to 4 × 1 MB
-  windows so a full 1 MB copy can be scoreboarded.
+  windows so a full 1 MB copy can be scoreboarded. Full-size run
+  (`-gG_COPY=1048576 -gG_ONLY_BOOT=true`, T0–T2): passes; copy + verify of
+  1 MB took 111.9 ms of simulated time (≈ 18.75 MB/s MRAM read rate).
 * Rough register count (GHDL synthesis, not Libero, before TMR):
   `mram_top` ≈ 3,230 bits including the 1,024-bit copy FIFO and the
   260-bit read buffer, against ≈ 2,340 before; `sram_boot_copy` ≈ 1,600.
