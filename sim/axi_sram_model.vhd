@@ -20,6 +20,7 @@
 --                  is stored corrupted (XOR 5Ah)
 --       corrupt_always = '1': every write to corrupt_addr is corrupted
 --       stop_b   = '1': no BVALID at all (a stuck target)
+--       inj_id   : count of B responses sent with an inverted BID
 --     The counts are cumulative: raise inj_b from 0 to 1 for one error,
 --     later to 2 for another.
 --   * Backdoor: package axi_sram_mem_pkg, shared variable sram.
@@ -101,6 +102,7 @@ entity axi_sram_model is
         stall_all      : in  std_logic := '0';
         stop_b         : in  std_logic := '0';
         inj_b, inj_r, inj_c : in natural := 0;
+        inj_id         : in  natural := 0;   -- count of B responses with a wrong BID
         corrupt_addr   : in  natural := 0;
         corrupt_always : in  std_logic := '0';
         n_aw, n_ar     : out natural := 0;   -- accepted bursts
@@ -129,7 +131,7 @@ begin
         variable bq  : bq_t;
         variable b_h, b_c : natural := 0;
         variable w_beat, r_beat : natural := 0;
-        variable nb_inj, nr_inj, nc_inj : natural := 0;
+        variable nb_inj, nr_inj, nc_inj, nid_inj : natural := 0;
         variable c_this : boolean := false;               -- current W burst may corrupt
         variable c_hit  : boolean := false;               -- it did corrupt corrupt_addr
         variable errs, naw, nar : natural := 0;
@@ -240,6 +242,10 @@ begin
                 if (s_axi_bvalid = '0' or s_axi_bready = '1') and b_c > 0 and stop_b = '0'
                    and not stall then
                     s_axi_bid <= bq(b_h)(G_ID_WIDTH - 1 downto 0);
+                    if nid_inj < inj_id then
+                        s_axi_bid <= not bq(b_h)(G_ID_WIDTH - 1 downto 0);
+                        nid_inj := nid_inj + 1;
+                    end if;
                     if nb_inj < inj_b then
                         s_axi_bresp <= "10";
                         nb_inj := nb_inj + 1;

@@ -25,7 +25,7 @@
 --      beats follow without gaps, and BREADY is always '1'.
 --   4. Verify pass: the MRAM source is read again; each SRAM block is read
 --      back (ARVALID only when the matching MRAM block is in the FIFO,
---      RREADY always '1') and compared beat by beat. Re-reading the MRAM
+--      RREADY always '1') and compared beat by beat (two register stages). Re-reading the MRAM
 --      also catches an MRAM read error in the copy pass.
 --   5. Pass: cpu_reset_n = '1', boot_done = '1', the backend goes back to
 --      the AXI side. Fail (mismatch, BRESP/RRESP not OKAY, MRAM error, wrong
@@ -158,6 +158,7 @@ architecture rtl of sram_boot_copy is
 
     -- Counters for the current pass
     signal m_iss  : natural range 0 to NBEAT := 0;   -- MRAM reads accepted
+    signal iss_addr : unsigned(C_MRAM_ADDR_WIDTH - 1 downto 0);  -- next MRAM read address
     signal m_rx   : natural range 0 to NBEAT := 0;   -- MRAM read data received
     signal cons   : natural range 0 to NBEAT := 0;   -- FIFO beats consumed (W loaded / R compared)
     signal aw_n   : natural range 0 to NBLK := 0;    -- AW handshakes
@@ -175,9 +176,12 @@ architecture rtl of sram_boot_copy is
     attribute syn_ramstyle of fifo : signal is "registers";
     signal wptr, rptr : natural range 0 to FDEPTH - 1 := 0;
 
-    -- Verify compare pipeline
+    -- Verify compare pipeline: R data and FIFO data registered (cmp_*),
+    -- then the compare result registered (mis_*) before it reaches the
+    -- error and state logic.
     signal cmp_v      : std_logic := '0';
     signal cmp_d, cmp_e : std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
+    signal mis_v, mis : std_logic := '0';
 
     signal abort      : std_logic := '0';  -- stop issuing, finish what is in flight
     signal att_err    : std_logic := '0';  -- an error in the current attempt
@@ -248,23 +252,11 @@ begin
     m_axi_arvalid <= arvalid;
 
     process (aclk)
-        variable v_iss    : natural range 0 to NBEAT;
         variable v_issue  : boolean;  -- new MRAM reads, AWs and ARs allowed
         variable v_prog   : boolean;  -- something moved this cycle
         variable v_err    : std_logic_vector(14 downto 8);
         variable v_drained : boolean;
-
-        -- Start a pass (copy or verify) from a clean slate. Only called when
-        -- nothing is in flight.
-        procedure new_pass is
-        begin
-            m_iss <= 0; m_rx <= 0; cons <= 0;
-            aw_n  <= 0; b_n  <= 0; ar_n <= 0; r_n <= 0; r_blk <= 0;
-            r_idx <= 0; w_idx <= 0;
-            wptr  <= 0; rptr <= 0;
-            abort <= '0';
-            wd_cnt <= 0;
-        end procedure;
+        variable v_new_pass : boolean;  -- start a pass from a clean slate (nothing in flight)
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
@@ -279,6 +271,7 @@ begin
                 wlast       <= '0';
                 arvalid     <= '0';
                 cmp_v       <= '0';
+                mis_v       <= '0';
                 att_err     <= '0';
                 retries     <= 0;
                 st_retries  <= (others => '0');
@@ -286,33 +279,41 @@ begin
                 cpu_reset_n <= '0';
                 boot_done   <= '0';
                 boot_fail   <= '0';
-                new_pass;
+                m_iss <= 0; m_rx <= 0; cons <= 0;
+                iss_addr <= to_unsigned(G_SRC_BASE, C_MRAM_ADDR_WIDTH);
+                aw_n  <= 0; b_n  <= 0; ar_n <= 0; r_n <= 0; r_blk <= 0;
+                r_idx <= 0; w_idx <= 0;
+                wptr  <= 0; rptr <= 0;
+                abort <= '0';
+                wd_cnt <= 0;
             else
                 v_issue := (state = S_COPY or state = S_VERIFY) and abort = '0';
                 v_prog  := false;
                 v_err   := (others => '0');
+                v_new_pass := false;
 
                 ----------------------------------------------------------------
                 -- MRAM reads: hold valid until accepted; a new read only if
-                -- its data has a free FIFO slot.
+                -- its data has a free FIFO slot. core_resp.ready is
+                -- combinational from the backend, so it only enables
+                -- registers here: after each acceptance valid drops for one
+                -- cycle and the next request is built from registers alone
+                -- (an MRAM beat takes about 64 cycles, so the bubble costs
+                -- nothing).
                 ----------------------------------------------------------------
-                v_iss := m_iss;
-                if req.valid = '1' and core_resp.ready = '1' then
-                    v_iss  := v_iss + 1;
-                    v_prog := true;
-                end if;
-                m_iss <= v_iss;
-                if req.valid = '1' and core_resp.ready = '0' then
-                    null;                           -- keep the request as it is
-                elsif v_issue and v_iss < NBEAT and v_iss - cons < FDEPTH then
+                if req.valid = '1' then
+                    if core_resp.ready = '1' then
+                        req.valid <= '0';
+                        m_iss     <= m_iss + 1;
+                        iss_addr  <= iss_addr + NB;
+                        v_prog    := true;
+                    end if;
+                elsif v_issue and m_iss < NBEAT and m_iss - cons < FDEPTH then
                     req.valid  <= '1';
                     req.we     <= '0';
                     req.cont   <= '0';
                     req.nbytes <= to_unsigned(NB, 7);
-                    req.addr   <= std_logic_vector(to_unsigned(G_SRC_BASE + v_iss * NB,
-                                                               C_MRAM_ADDR_WIDTH));
-                else
-                    req.valid  <= '0';
+                    req.addr   <= std_logic_vector(iss_addr);
                 end if;
 
                 if core_resp.rvalid = '1' then
@@ -431,7 +432,12 @@ begin
                         v_err(14) := '1';
                     end if;
                 end if;
-                if cmp_v = '1' and cmp_d /= cmp_e then
+                mis_v <= cmp_v;
+                mis   <= '0';
+                if cmp_d /= cmp_e then
+                    mis <= '1';
+                end if;
+                if mis_v = '1' and mis = '1' then
                     v_err(8) := '1';
                 end if;
 
@@ -443,10 +449,11 @@ begin
                 -- Nothing issued and not yet answered, on either side: no
                 -- pending request or VALID, every W beat of every accepted AW
                 -- sent (in a copy pass cons counts the W beats; in a verify
-                -- pass aw_n = 0), every B and R received, compare flushed.
+                -- pass aw_n = 0), every B and R received, compare pipeline
+                -- flushed.
                 v_drained := req.valid = '0' and m_iss = m_rx and awvalid = '0' and arvalid = '0'
                              and wvalid = '0' and cons >= aw_n * BPB and b_n = aw_n
-                             and r_n = ar_n * BPB and cmp_v = '0';
+                             and r_n = ar_n * BPB and cmp_v = '0' and mis_v = '0';
 
                 ----------------------------------------------------------------
                 -- Watchdog: no progress for G_WATCHDOG_LIMIT cycles in a pass;
@@ -488,7 +495,7 @@ begin
                         if mram_idle = '1' then
                             own     <= '1';
                             att_err <= '0';
-                            new_pass;
+                            v_new_pass := true;
                             state   <= S_COPY;
                         end if;
 
@@ -502,7 +509,7 @@ begin
                             if att_err = '1' or v_err /= (v_err'range => '0') then
                                 state <= S_RETRY;
                             else
-                                new_pass;
+                                v_new_pass := true;
                                 state <= S_VERIFY;
                             end if;
                         end if;
@@ -514,7 +521,7 @@ begin
                             wd_cnt <= 0;
                             state  <= S_DRAIN;
                         elsif r_n = NBEAT and v_drained then
-                            -- cmp_v = '0': the last compare is in v_err already
+                            -- cmp_v = mis_v = '0': the last compare is in v_err already
                             if att_err = '1' or v_err /= (v_err'range => '0') then
                                 state <= S_RETRY;
                             else
@@ -547,7 +554,7 @@ begin
                                 st_retries <= st_retries + 1;
                             end if;
                             att_err <= '0';
-                            new_pass;
+                            v_new_pass := true;
                             state   <= S_COPY;
                         end if;
 
@@ -579,6 +586,18 @@ begin
                         state  <= S_DRAIN;
 
                 end case;
+
+                -- Start of a new pass. Last in the process, so it overrides
+                -- the counter updates above (all of them idle at this point).
+                if v_new_pass then
+                    m_iss <= 0; m_rx <= 0; cons <= 0;
+                    iss_addr <= to_unsigned(G_SRC_BASE, C_MRAM_ADDR_WIDTH);
+                    aw_n  <= 0; b_n  <= 0; ar_n <= 0; r_n <= 0; r_blk <= 0;
+                    r_idx <= 0; w_idx <= 0;
+                    wptr  <= 0; rptr <= 0;
+                    abort <= '0';
+                    wd_cnt <= 0;
+                end if;
             end if;
         end if;
     end process;

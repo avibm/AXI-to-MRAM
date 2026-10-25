@@ -387,20 +387,16 @@ begin
     -- side has a request in flight. Responses go only to the owner.
     muxed_req <= boot_req when boot_own = '1' else axi_req;
 
-    process (all)
-    begin
-        boot_resp <= guard_resp;
-        axi_resp  <= guard_resp;
-        if boot_own = '1' then
-            axi_resp.ready  <= '0';
-            axi_resp.rvalid <= '0';
-            axi_resp.bvalid <= '0';
-        else
-            boot_resp.ready  <= '0';
-            boot_resp.rvalid <= '0';
-            boot_resp.bvalid <= '0';
-        end if;
-    end process;
+    boot_resp.ready  <= guard_resp.ready  and boot_own;
+    boot_resp.rvalid <= guard_resp.rvalid and boot_own;
+    boot_resp.bvalid <= guard_resp.bvalid and boot_own;
+    boot_resp.rdata  <= guard_resp.rdata;
+    boot_resp.error  <= guard_resp.error;
+    axi_resp.ready   <= guard_resp.ready  and not boot_own;
+    axi_resp.rvalid  <= guard_resp.rvalid and not boot_own;
+    axi_resp.bvalid  <= guard_resp.bvalid and not boot_own;
+    axi_resp.rdata   <= guard_resp.rdata;
+    axi_resp.error   <= guard_resp.error;
 
     u_write_guard : entity work.mram_write_guard
         generic map (

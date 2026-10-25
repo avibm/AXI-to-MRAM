@@ -8,7 +8,8 @@
 -- not depend on the size.
 --
 --   T0  boot_hold = 1: the copy waits after power-up, the MRAM AXI port
---       works, no SRAM traffic; then boot_hold is released
+--       works, no SRAM traffic; then boot_hold is released while PCI reads
+--       stream from the MRAM (all of them correct)
 --   T1  boot: SRAM = MRAM master copy byte for byte, nothing written past
 --       the end, cpu_reset_n only together with boot_done, boot_status
 --       clean, no master traffic after boot_done (checker "quiet")
@@ -23,8 +24,15 @@
 --   T7  permanent corruption -> boot_fail after 3 retries, CPU kept in
 --       reset, MRAM AXI port open; reload after the fault is gone -> boot
 --   T8  every SRAM channel stalled past the watchdog -> drain -> retry
+--   T10 reload while a slow PCI write burst is half done: the copy waits
+--       until the burst completes, then runs; the write data is correct
+--   T11 sram_reload during a running copy is ignored
+--   T12 watchdog in the verify pass -> drain -> retry
+--   T13 wrong BID -> retry
+--   T14 aresetn in the middle of a copy -> clean restart
 --   T9  B never returned -> watchdog -> drain timeout -> stuck: boot_fail,
---       no new AXI traffic, MRAM AXI port open; aresetn recovers
+--       no new AXI traffic, reload ignored, MRAM AXI port open; aresetn
+--       recovers (run last)
 --   Throughout: AXI protocol checker on m_axi_* (0 errors), SRAM model
 --   errors 0, MRAM model protocol errors 0, mram_rd_slip 0.
 --
@@ -93,19 +101,20 @@ architecture sim of tb_mram_sram is
 
     -- SRAM model controls
     signal stall_all, stop_b, corrupt_always : std_logic := '0';
-    signal inj_b, inj_r, inj_c : natural := 0;
+    signal inj_b, inj_r, inj_c, inj_id : natural := 0;
     signal corrupt_addr : natural := 0;
     signal s_naw, s_nar, s_errs : natural;
     signal chk_errs, aw_outst, ar_outst : natural;
     signal quiet : std_logic;
 
     -- PCI-side command interface (one process drives s_axi)
-    type pci_op_t is (P_NONE, P_READ, P_WRITE, P_STREAM);
+    type pci_op_t is (P_NONE, P_READ, P_WRITE, P_WRSLOW, P_STREAM);
     signal pci_op   : pci_op_t := P_NONE;
     signal pci_addr : natural := 0;
     signal pci_req, pci_ack : boolean := false;
     signal pci_stop : boolean := false;
     signal pci_reads, pci_errs : natural := 0;
+    signal pci_aw_n, pci_b_n   : natural := 0;   -- PCI AW accepted / B received
     signal pci_done_when_booted : boolean := false;
 
     signal errs : natural := 0;
@@ -189,6 +198,7 @@ begin
             s_axi_rid => m_rid, s_axi_rdata => m_rdata, s_axi_rresp => m_rresp, s_axi_rlast => m_rlast,
             s_axi_rvalid => m_rvalid, s_axi_rready => m_rready,
             stall_all => stall_all, stop_b => stop_b, inj_b => inj_b, inj_r => inj_r, inj_c => inj_c,
+            inj_id => inj_id,
             corrupt_addr => corrupt_addr, corrupt_always => corrupt_always,
             n_aw => s_naw, n_ar => s_nar, errors => s_errs);
 
@@ -287,7 +297,7 @@ begin
             rready <= '0';
         end procedure;
 
-        procedure wr64(addr : natural) is
+        procedure wr64(addr : natural; gap : natural := 0) is
         begin
             id      := (id + 1) mod 2 ** C_AXI_ID_WIDTH;
             awaddr  <= std_logic_vector(to_unsigned(addr, 32));
@@ -296,7 +306,13 @@ begin
             awvalid <= '1';
             loop wait until rising_edge(aclk); exit when awready = '1'; end loop;
             awvalid <= '0';
+            pci_aw_n <= pci_aw_n + 1;
             for b in 0 to nbeat - 1 loop
+                -- a slow bridge: W beats with gaps (no WVALID in between)
+                if gap > 0 then
+                    wvalid <= '0';
+                    for g in 1 to gap loop wait until rising_edge(aclk); end loop;
+                end if;
                 for i in 0 to BB - 1 loop
                     wdata(8 * i + 7 downto 8 * i) <= pat(addr + b * BB + i + 77);
                 end loop;
@@ -309,6 +325,7 @@ begin
             bready <= '1';
             loop wait until rising_edge(aclk); exit when bvalid = '1'; end loop;
             bready <= '0';
+            pci_b_n <= pci_b_n + 1;
             if bresp /= "00" or unsigned(bid) /= id then
                 e := e + 1;
                 report "PCI write: BRESP/BID wrong" severity error;
@@ -328,6 +345,7 @@ begin
             case pci_op is
                 when P_READ  => rd64(pci_addr);
                 when P_WRITE => wr64(pci_addr);
+                when P_WRSLOW => wr64(pci_addr, 3000);
                 when P_STREAM =>
                     a := 0;
                     while not pci_stop loop
@@ -442,6 +460,12 @@ begin
         pci(P_READ, SRC + 128);
         pci(P_WRITE, 16#0010_0040#);
         check(s_naw = 0 and s_nar = 0, "T0: SRAM traffic while held");
+        -- release boot_hold while PCI reads stream from the MRAM
+        pci_stop <= false;
+        pci_op   <= P_STREAM;
+        pci_req  <= not pci_req;
+        clk(2000);
+        check(pci_reads > 0, "T0: PCI stream not running");
         report "T0 done (boot_hold)";
         boot_hold <= '0';
 
@@ -452,6 +476,9 @@ begin
         wait_end("T1");
         report "T1 boot took " & time'image(now - t0) & " for " & integer'image(G_COPY) & " bytes";
         check_ok("T1", 0, "0000000");
+        pci_stop <= true;
+        wait until pci_ack = pci_req;
+        check(pci_errs = 0, "T1: PCI read errors around the boot_hold release");
         check(s_naw = G_COPY / 64 and s_nar = G_COPY / 64,
               "T1: " & integer'image(s_naw) & " AW / " & integer'image(s_nar) & " AR, expected "
               & integer'image(G_COPY / 64) & " each");
@@ -555,6 +582,84 @@ begin
         report "T8 done (watchdog -> drain -> retry)";
 
         ------------------------------------------------------------------------
+        -- T10: reload while a slow PCI write burst is half done: the copy
+        -- waits (phase 2) until the burst has completed, then runs
+        ------------------------------------------------------------------------
+        n := pci_b_n;
+        pci_op   <= P_WRSLOW;
+        pci_addr <= 16#0010_0100#;
+        pci_req  <= not pci_req;
+        wait until pci_aw_n'event for 1 ms;
+        clk(100);                       -- AW accepted, first W beats pending
+        reload;
+        clk(200);
+        check(phase(boot_status) = 2, "T10: copy did not wait for the PCI write burst (phase "
+              & integer'image(phase(boot_status)) & ")");
+        check(pci_b_n = n, "T10: PCI write finished too early for the test");
+        wait until phase(boot_status) = 3 for 2 ms;
+        check(pci_b_n = n + 1, "T10: copy took the MRAM before the PCI write burst completed");
+        wait_end("T10");
+        check_ok("T10", 0, "0000000");
+        wait until pci_ack = pci_req for 1 ms;
+        check(pci_ack = pci_req and pci_errs = 0, "T10: PCI write data wrong or not finished");
+        report "T10 done (reload waits for a slow PCI write burst)";
+
+        ------------------------------------------------------------------------
+        -- T11: sram_reload during a running copy is ignored (one copy only)
+        ------------------------------------------------------------------------
+        n := s_naw;
+        reload;
+        wait until phase(boot_status) = 3 for 1 ms;
+        clk(500);
+        reload;
+        wait_end("T11");
+        check_ok("T11", 0, "0000000");
+        clk(5000);
+        check(boot_done = '1' and phase(boot_status) = 0, "T11: a second copy started");
+        check(s_naw = n + G_COPY / 64, "T11: " & integer'image(s_naw - n) & " AW, expected "
+              & integer'image(G_COPY / 64));
+        report "T11 done (reload ignored while copying)";
+
+        ------------------------------------------------------------------------
+        -- T12: watchdog in the verify pass
+        ------------------------------------------------------------------------
+        reload;
+        wait until phase(boot_status) = 4 for 2 ms;
+        check(phase(boot_status) = 4, "T12: verify pass not reached");
+        clk(200);
+        stall_all <= '1';
+        wait until phase(boot_status) = 5 for 2 ms;
+        check(phase(boot_status) = 5, "T12: watchdog did not fire in the verify pass");
+        clk(G_WATCHDOG / 4);
+        stall_all <= '0';
+        wait_end("T12");
+        check_ok("T12", 1, "0010000");
+        report "T12 done (watchdog in the verify pass)";
+
+        ------------------------------------------------------------------------
+        -- T13: wrong BID -> retry
+        ------------------------------------------------------------------------
+        inj_id <= 1;
+        reload;
+        wait_end("T13");
+        check_ok("T13", 1, "1000000");
+        report "T13 done (wrong BID -> retry)";
+
+        ------------------------------------------------------------------------
+        -- T14: aresetn in the middle of a copy -> clean restart
+        ------------------------------------------------------------------------
+        reload;
+        wait until phase(boot_status) = 3 for 1 ms;
+        clk(1000);
+        aresetn <= '0';
+        clk(20);
+        check(boot_done = '0' and cpu_reset_n = '0', "T14: reset did not clear boot_done");
+        aresetn <= '1';
+        wait_end("T14");
+        check_ok("T14", 0, "0000000");
+        report "T14 done (aresetn during a copy)";
+
+        ------------------------------------------------------------------------
         -- T9: B never returned -> stuck; aresetn recovers
         ------------------------------------------------------------------------
         stop_b <= '1';
@@ -566,6 +671,9 @@ begin
         n := s_naw;
         clk(5000);
         check(s_naw = n, "T9: new AW after the fabric was declared stuck");
+        reload;                        -- must be ignored while stuck
+        clk(2000);
+        check(phase(boot_status) = 7 and s_naw = n, "T9: reload acted on in the stuck state");
         pci(P_READ, SRC + 2048);       -- MRAM side handed back
         check(pci_errs = 0, "T9: PCI read while stuck");
         stop_b  <= '0';
