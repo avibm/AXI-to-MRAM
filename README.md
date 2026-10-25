@@ -67,7 +67,7 @@ rising edge of `sram_reload`:
 
 | Port | Dir | Meaning |
 |------|-----|---------|
-| `m_axi_*` | | AXI4 master to the SRAM: interconnect INITIATOR2, 150 MHz, ID width `G_M_ID_WIDTH` (4). Only 64-byte INCR bursts of full-width beats, all strobes, AxCACHE = 0000, AxPROT = 000, AxLOCK = 0 |
+| `m_axi_*` | | AXI4 master to the SRAM: interconnect INITIATOR2, 150 MHz, ID width `C_M_AXI_ID_WIDTH` (4, in `mram_pkg`). Only 64-byte INCR bursts of full-width beats, all strobes, AxCACHE = 0000, AxPROT = 000, AxLOCK = 0 |
 | `sram_reload` | in | Rising edge = put the CPU into reset and copy + verify again (no power-up wait). Synchronized inside, may be asynchronous. Acted on after `boot_done` or `boot_fail`, ignored while a copy runs |
 | `boot_status[15:0]` | out | `aclk` register: [2:0] phase (0 done, 1 power-up/held, 2 waiting for the MRAM port, 3 copy, 4 verify, 5 drain/retry, 6 failed, 7 stuck), [7:4] retries, [8] mismatch, [9] BRESP error, [10] RRESP error, [11] MRAM error, [12] watchdog, [13] drain timeout (fabric stuck), [14] wrong ID/RLAST or unexpected response. Bits 8–14 are sticky from the start of the boot or reload |
 

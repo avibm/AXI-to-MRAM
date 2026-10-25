@@ -66,7 +66,8 @@ switch back to the MRAM → MRAM copy. `mram_top` keeps its existing ports
 and gains the `m_axi_*` master port, `sram_reload` and `boot_status`.
 Generics: `G_BOOT_DST_BASE` is replaced by `G_BOOT_DST_ADDR` (AXI address
 of the SRAM, 0); `G_BOOT_COPY_SIZE` now defaults to 1 MB; new
-`G_BOOT_FIFO_BLOCKS` (2), `G_M_ID_WIDTH` (4) and `G_M_ID` (0).
+`G_BOOT_FIFO_BLOCKS` (2) and `G_M_ID` (0). The master's ID width is the
+package constant `C_M_AXI_ID_WIDTH` (4) in `mram_pkg`.
 
 ## 3. Address map
 
@@ -253,7 +254,7 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
 
 | Item | Needed | What to check |
 |------|--------|---------------|
-| INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64), **ID 4 bits (ID[3:0], from the interconnect configuration)**; the engine drives a constant ID | How many initiators the configurator allows; its ID width for that port (sets `G_M_ID_WIDTH`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
+| INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64), **ID 4 bits (ID[3:0], from the interconnect configuration)**; the engine drives a constant ID | How many initiators the configurator allows; its ID width for that port (sets `C_M_AXI_ID_WIDTH` in `mram_pkg`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
 | TARGET1 width | Same width as SRAM IP's AXI port. TARGET1 ID is 6 bits (ID[5:0]); the SRAM IP ID width was changed from 5 to 6 to match. TARGET0 is also ID[5:0]: `mram_top` now uses `C_AXI_ID_WIDTH` = 6 | The configured width, and REVIEW Rev. 10: the 64-bit TARGET0 configuration once lost PCI writes. The SRAM path already works on the board, so I take its current settings as given. |
 | `PF_SRAM_AHBL_AXI` | AXI4 slave, 1 MB, ECC on | Configured (screenshot of the configurator, version 1.2.116): LSRAM; depth 131072 words × 64 bits = 1 MB; native interface off; read port "Pipelined (Address pipeline and Data pipeline)"; **ECC Disabled**; fabric interface AXI; data width 64; reset Asynchronous; "High reliability" on; AXI address width 32; ID width 5 (since changed to 6); write and read interfaces on, write and read timeout count 80. Still to check in the IP handbook: what ECC options exist and how errors are reported; how narrow/partial-strobe writes are handled with ECC; what "High reliability" does; **what the timeout counts do** (see below) |
 

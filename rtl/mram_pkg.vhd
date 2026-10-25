@@ -38,6 +38,7 @@ package mram_pkg is
                                          + 6 * boolean'pos(C_BEAT_BYTES = 64);
     constant C_AXI_LEN_WIDTH  : integer := 8;                     -- AXI4 AWLEN/ARLEN
     constant C_AXI_ID_WIDTH   : integer := 6;                     -- matches the interconnect TARGET0 ID[5:0]
+    constant C_M_AXI_ID_WIDTH : integer := 4;                     -- boot copy master: interconnect INITIATOR2 ID[3:0]
 
     constant C_MAX_OUTSTANDING : integer := 4; -- outstanding AXI read bursts tracked
 

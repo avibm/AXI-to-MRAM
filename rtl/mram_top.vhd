@@ -58,8 +58,7 @@ entity mram_top is
         G_BOOT_FIFO_BLOCKS : natural := 2;
         G_BOOT_MAX_RETRIES : natural := 3;
         G_BOOT_WATCHDOG    : natural := 1_000_000;
-        G_M_ID_WIDTH       : natural := 4;      -- interconnect INITIATOR2 ID[3:0]
-        G_M_ID             : natural := 0;
+        G_M_ID             : natural := 0;      -- AXI ID of the boot copy (C_M_AXI_ID_WIDTH bits)
         G_POWERUP_CYCLES   : natural := 3_750_000;  -- MRAM tPU 25ms at 150MHz
         -- Write guard (defaults: protect 0x6000000..0x7FFFFFF)
         G_PROTECT_BASE     : natural := 100663296;
@@ -115,7 +114,7 @@ entity mram_top is
 
         -- AXI4 master of the boot copy, to the SRAM through the interconnect.
         -- Only bursts of 64 bytes, INCR, full-width beats, all strobes.
-        m_axi_awid    : out std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_awid    : out std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_awaddr  : out std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0);
         m_axi_awlen   : out std_logic_vector(C_AXI_LEN_WIDTH - 1 downto 0);
         m_axi_awsize  : out std_logic_vector(2 downto 0);
@@ -130,11 +129,11 @@ entity mram_top is
         m_axi_wlast   : out std_logic;
         m_axi_wvalid  : out std_logic;
         m_axi_wready  : in  std_logic;
-        m_axi_bid     : in  std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_bid     : in  std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_bresp   : in  std_logic_vector(1 downto 0);
         m_axi_bvalid  : in  std_logic;
         m_axi_bready  : out std_logic;
-        m_axi_arid    : out std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_arid    : out std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_araddr  : out std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0);
         m_axi_arlen   : out std_logic_vector(C_AXI_LEN_WIDTH - 1 downto 0);
         m_axi_arsize  : out std_logic_vector(2 downto 0);
@@ -144,7 +143,7 @@ entity mram_top is
         m_axi_arprot  : out std_logic_vector(2 downto 0);
         m_axi_arvalid : out std_logic;
         m_axi_arready : in  std_logic;
-        m_axi_rid     : in  std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_rid     : in  std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_rdata   : in  std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
         m_axi_rresp   : in  std_logic_vector(1 downto 0);
         m_axi_rlast   : in  std_logic;
@@ -254,7 +253,6 @@ begin
             G_MAX_RETRIES    => G_BOOT_MAX_RETRIES,
             G_WATCHDOG_LIMIT => G_BOOT_WATCHDOG,
             G_POWERUP_CYCLES => G_POWERUP_CYCLES,
-            G_M_ID_WIDTH     => G_M_ID_WIDTH,
             G_M_ID           => G_M_ID
         )
         port map (

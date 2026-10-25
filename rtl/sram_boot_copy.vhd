@@ -83,7 +83,6 @@ entity sram_boot_copy is
         G_MAX_RETRIES    : natural := 3;
         G_WATCHDOG_LIMIT : natural := 1_000_000;   -- aclk cycles without progress = hang
         G_POWERUP_CYCLES : natural := 3_750_000;   -- MRAM tPU, 25ms at 150MHz
-        G_M_ID_WIDTH     : natural := 4;
         G_M_ID           : natural := 0
     );
     port (
@@ -98,7 +97,7 @@ entity sram_boot_copy is
         mram_own  : out std_logic;    -- '1' = this block drives the backend
 
         -- AXI4 master to the SRAM (through the interconnect)
-        m_axi_awid    : out std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_awid    : out std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_awaddr  : out std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0);
         m_axi_awlen   : out std_logic_vector(C_AXI_LEN_WIDTH - 1 downto 0);
         m_axi_awsize  : out std_logic_vector(2 downto 0);
@@ -113,11 +112,11 @@ entity sram_boot_copy is
         m_axi_wlast   : out std_logic;
         m_axi_wvalid  : out std_logic;
         m_axi_wready  : in  std_logic;
-        m_axi_bid     : in  std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_bid     : in  std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_bresp   : in  std_logic_vector(1 downto 0);
         m_axi_bvalid  : in  std_logic;
         m_axi_bready  : out std_logic;
-        m_axi_arid    : out std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_arid    : out std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_araddr  : out std_logic_vector(C_AXI_ADDR_WIDTH - 1 downto 0);
         m_axi_arlen   : out std_logic_vector(C_AXI_LEN_WIDTH - 1 downto 0);
         m_axi_arsize  : out std_logic_vector(2 downto 0);
@@ -127,7 +126,7 @@ entity sram_boot_copy is
         m_axi_arprot  : out std_logic_vector(2 downto 0);
         m_axi_arvalid : out std_logic;
         m_axi_arready : in  std_logic;
-        m_axi_rid     : in  std_logic_vector(G_M_ID_WIDTH - 1 downto 0);
+        m_axi_rid     : in  std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         m_axi_rdata   : in  std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
         m_axi_rresp   : in  std_logic_vector(1 downto 0);
         m_axi_rlast   : in  std_logic;
@@ -234,8 +233,8 @@ begin
                     & phase_code(state);
 
     -- Fixed burst attributes
-    m_axi_awid    <= std_logic_vector(to_unsigned(G_M_ID, G_M_ID_WIDTH));
-    m_axi_arid    <= std_logic_vector(to_unsigned(G_M_ID, G_M_ID_WIDTH));
+    m_axi_awid    <= std_logic_vector(to_unsigned(G_M_ID, C_M_AXI_ID_WIDTH));
+    m_axi_arid    <= std_logic_vector(to_unsigned(G_M_ID, C_M_AXI_ID_WIDTH));
     m_axi_awlen   <= std_logic_vector(to_unsigned(BPB - 1, C_AXI_LEN_WIDTH));
     m_axi_arlen   <= std_logic_vector(to_unsigned(BPB - 1, C_AXI_LEN_WIDTH));
     m_axi_awsize  <= SIZE_BEAT;

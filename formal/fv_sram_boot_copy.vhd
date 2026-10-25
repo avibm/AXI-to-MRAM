@@ -52,7 +52,7 @@ entity fv_sram_boot_copy is
         -- AXI slave side (completely free)
         i_awready, i_wready, i_bvalid, i_arready, i_rvalid_s, i_rlast : in std_logic;
         i_bresp, i_rresp : in std_logic_vector(1 downto 0);
-        i_bid, i_rid     : in std_logic_vector(3 downto 0);
+        i_bid, i_rid     : in std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
         i_rdata_s        : in std_logic_vector(C_AXI_DATA_WIDTH - 1 downto 0);
         -- checked by the SAT pass: ok must be 1 in every cycle in which
         -- env_ok has been 1 so far; probe_* show that the checks are not
@@ -124,7 +124,7 @@ begin
             G_SRC_BASE => 64, G_DST_ADDR => 0, G_COPY_SIZE => G_BLOCKS * BPB * C_BEAT_BYTES,
             G_BLOCK_BYTES => BPB * C_BEAT_BYTES, G_FIFO_BLOCKS => 1, G_MAX_WR_OUTST => 2,
             G_MAX_RD_OUTST => 2, G_MAX_RETRIES => 1, G_WATCHDOG_LIMIT => 6,
-            G_POWERUP_CYCLES => 2, G_M_ID_WIDTH => 4, G_M_ID => 0)
+            G_POWERUP_CYCLES => 2, G_M_ID => 0)
         port map (
             aclk => aclk, aresetn => aresetn,
             core_req => req, core_resp => resp,

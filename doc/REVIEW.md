@@ -489,6 +489,17 @@ Verification:
   reachability probe: a good boot after the stuck state is reached within
   110 cycles.
 
+### Rev. 16 – boot-copy master ID width as a package constant
+
+The `G_M_ID_WIDTH` generic of `mram_top` and `sram_boot_copy` is replaced
+by the constant `C_M_AXI_ID_WIDTH` = 4 in `mram_pkg`, next to
+`C_AXI_ID_WIDTH`, at the user's request: the Libero flow reported the
+generic as undeclared where it sized the four `m_axi_*id` ports. (In the
+repository the generic was declared; the cause in the tool was not
+identified.) The ID width is a property of the interconnect configuration,
+so a constant is the natural place. Testbenches and the formal harness use
+the constant too. No functional change.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

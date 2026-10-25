@@ -55,7 +55,7 @@ architecture sim of tb_sram_soak is
     constant SRC    : natural := 16#6000000#;
     constant DATA   : natural := 16#0010_0000#;  -- general MRAM data area used by PCI
     constant BB     : natural := C_BEAT_BYTES;
-    constant MID_W  : natural := 4;
+    constant MID_W  : natural := C_M_AXI_ID_WIDTH;
     constant SZB    : std_logic_vector(2 downto 0) := SIZE_BEAT;
     constant T_END  : time    := 5 ms + G_COPY * 500 ns;
 
@@ -124,7 +124,7 @@ begin
     dut : entity work.mram_top
         generic map (
             G_BOOT_COPY_SIZE => G_COPY, G_BOOT_WATCHDOG => G_WATCHDOG,
-            G_POWERUP_CYCLES => 1500, G_M_ID_WIDTH => MID_W, G_M_ID => 3)
+            G_POWERUP_CYCLES => 1500, G_M_ID => 3)
         port map (
             aclk => aclk, aresetn => aresetn,
             s_axi_awid => awid, s_axi_awaddr => awaddr, s_axi_awlen => awlen, s_axi_awsize => SZB,

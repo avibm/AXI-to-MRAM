@@ -66,7 +66,7 @@ architecture sim of tb_mram_sram is
     constant T_CLK    : time    := 6.667 ns;
     constant SRC      : natural := 16#6000000#;
     constant BB       : natural := C_BEAT_BYTES;
-    constant MID_W    : natural := 4;
+    constant MID_W    : natural := C_M_AXI_ID_WIDTH;
     constant SZB      : std_logic_vector(2 downto 0) := SIZE_BEAT;
     constant T_END    : time := 5 ms + G_COPY * 500 ns;  -- longest boot or reload
     constant G_MAX_RETRIES_TB : natural := 3;             -- mram_top default G_BOOT_MAX_RETRIES
@@ -146,7 +146,6 @@ begin
             G_BOOT_COPY_SIZE => G_COPY,
             G_BOOT_WATCHDOG  => G_WATCHDOG,
             G_POWERUP_CYCLES => 1500,
-            G_M_ID_WIDTH     => MID_W,
             G_M_ID           => 5
         )
         port map (

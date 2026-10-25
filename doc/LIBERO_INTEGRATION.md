@@ -13,7 +13,7 @@ a simulation, not a measurement on this board.
 
 | File | Change |
 |------|--------|
-| `rtl/mram_pkg.vhd` | `C_AXI_ID_WIDTH` = 6 (was 5) |
+| `rtl/mram_pkg.vhd` | `C_AXI_ID_WIDTH` = 6 (was 5); new `C_M_AXI_ID_WIDTH` = 4 (INITIATOR2 ID width) |
 | `rtl/sram_boot_copy.vhd` | **new** |
 | `rtl/axi4_slave_wrapper.vhd` | `hold` input, `idle` output |
 | `rtl/mram_top.vhd` | new ports, generics, boot copy replaced |
@@ -98,7 +98,6 @@ the board differs.
 | `G_BOOT_FIFO_BLOCKS` | 2 | Copy FIFO depth in 64-byte blocks |
 | `G_BOOT_MAX_RETRIES` | 3 | Retries before `boot_fail` |
 | `G_BOOT_WATCHDOG` | 1,000,000 | Cycles without progress before the drain (6.7 ms); the drain gets as long again before "stuck" |
-| `G_M_ID_WIDTH` | 4 | INITIATOR2 ID width |
 | `G_M_ID` | 0 | AXI ID used by the boot copy |
 | `G_POWERUP_CYCLES` | 3,750,000 | MRAM tPU, 25 ms |
 | others | unchanged | MRAM backend, write guard (see README) |

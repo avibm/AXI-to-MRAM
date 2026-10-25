@@ -40,7 +40,7 @@ architecture sim of tb_dma is
     signal io : std_logic_vector(3 downto 0);
     signal boot_done : std_logic := '0';
     -- boot copy AXI master -> behavioural SRAM (axi_sram_model)
-    signal m_awid, m_arid, m_bid, m_rid : std_logic_vector(3 downto 0);
+    signal m_awid, m_arid, m_bid, m_rid : std_logic_vector(C_M_AXI_ID_WIDTH - 1 downto 0);
     signal m_awaddr, m_araddr : std_logic_vector(31 downto 0);
     signal m_awlen, m_arlen   : std_logic_vector(7 downto 0);
     signal m_awsize, m_arsize : std_logic_vector(2 downto 0);
@@ -101,7 +101,7 @@ begin
             m_axi_rvalid => m_rvalid, m_axi_rready => m_rready, boot_status => open,
             mram_cs_n => cs_n, mram_sclk => sclk, mram_io => io);
     sram_mdl : entity work.axi_sram_model
-        generic map (G_ID_WIDTH => 4, G_DATA_W => C_AXI_DATA_WIDTH, G_STALL_PCT => 20)
+        generic map (G_ID_WIDTH => C_M_AXI_ID_WIDTH, G_DATA_W => C_AXI_DATA_WIDTH, G_STALL_PCT => 20)
         port map (
             aclk => aclk, aresetn => aresetn,
             s_axi_awid => m_awid, s_axi_awaddr => m_awaddr, s_axi_awlen => m_awlen,

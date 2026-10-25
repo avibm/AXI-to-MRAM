@@ -27,7 +27,7 @@ Results of these runs at the time of writing are recorded in
 * **Data width:** `C_AXI_DATA_WIDTH` in `rtl/mram_pkg.vhd` = 64 (matches
   TARGET0 and INITIATOR2).
 * **ID widths:** `mram_top` `s_axi_*id` are 6 bits (`C_AXI_ID_WIDTH` = 6,
-  TARGET0 ID[5:0]); `m_axi_*id` are 4 bits (`G_M_ID_WIDTH` = 4, INITIATOR2
+  TARGET0 ID[5:0]); `m_axi_*id` are 4 bits (`C_M_AXI_ID_WIDTH` = 4 in `mram_pkg`, INITIATOR2
   ID[3:0]); `PF_SRAM_AHBL_AXI` "Width of ID" = 6. **(check in Libero)**
 * **File list:** `rtl/mram_boot_copy.vhd` and `rtl/mram_top_oct1.vhd` are
   deleted; `rtl/sram_boot_copy.vhd` is new. Remove the old files from the
