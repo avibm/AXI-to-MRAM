@@ -463,10 +463,31 @@ recovery, all older code.
   aborted command is harmless; an aborted write leaves that write
   incomplete, as with any reset.
 * A stall of the SRAM side longer than watchdog + drain limit (2 ×
-  `G_BOOT_WATCHDOG`, about 13 ms with the default) is declared "stuck"
-  permanently, as specified; only `aresetn` recovers, even if the fabric
-  answers later. An automatic retry once the fabric drains would be
-  possible; it is your call.
+  `G_BOOT_WATCHDOG`, about 13 ms with the default) was declared "stuck"
+  permanently. Changed in Rev. 15 on request: automatic retry.
+
+### Rev. 15 – automatic retry after "stuck"
+
+Requested 2026-10-25. In the stuck state `sram_boot_copy` keeps taking
+every response (BREADY/RREADY stay 1) and issues nothing new. If the
+fabric answers after all and everything in flight completes, it clears
+`boot_fail`, counts a retry and starts over through "waiting for the MRAM
+port" (the MRAM may have been handed back to the AXI side meanwhile). With
+no retries left it ends in the failed state. A fabric that never answers
+still needs `aresetn`. `boot_status` bit 13 stays set as a record.
+
+Verification:
+* `tb_mram_sram` T9 (stuck → B responses released → automatic retry →
+  boot, retries 1, bits 12 and 13), T9b (stuck four times → failed state
+  with 3 retries, MRAM port open; reload boots), T9c (B never returned →
+  stays stuck; `aresetn` recovers). All tests pass, also at 512 bits.
+* Mutation checks: no recovery from stuck → 9 errors; recovery not
+  counted as a retry → 4 errors.
+* Soak test: SRAM stalls now 0.5–3.5 × the watchdog, so they reach the
+  stuck state and recover; seed 6, 120 iterations: pass.
+* Formal: the unbounded proof holds with 1, 2 and 3 bursts per pass; new
+  reachability probe: a good boot after the stuck state is reached within
+  110 cycles.
 
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 

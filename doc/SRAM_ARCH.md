@@ -195,9 +195,11 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
   when every issued burst has received its B or its last R beat and every
   MRAM request has completed. This also closes REVIEW O7 for the new
   engine. If the drain itself does not finish within a timeout (the
-  fabric is stuck), the engine goes to `boot_fail` without starting new
-  traffic. It cannot legally withdraw a raised VALID, so recovery then
-  needs a reset.
+  fabric is stuck), the engine sets `boot_fail` and starts no new traffic.
+  It cannot legally withdraw a raised VALID, so it keeps waiting; if the
+  fabric answers later and the drain completes, it clears `boot_fail` and
+  retries (counted as a retry, requested 2026-10-25). A fabric that never
+  answers needs `aresetn`.
 * **Reload (`sram_reload`, implemented).** A rising edge on `sram_reload`
   (synchronized into `aclk` and edge-detected inside `mram_top`, so it may
   come straight from a PCI register bit) runs the copy again. The CPU

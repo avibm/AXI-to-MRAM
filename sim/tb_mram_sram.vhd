@@ -32,9 +32,11 @@
 --   T14 aresetn in the middle of a copy -> clean restart
 --   T15 slave protocol violations (R with no AR, B with no write, RLAST on
 --       the wrong beat, wrong RID) -> retry, error bit 14
---   T9  B never returned -> watchdog -> drain timeout -> stuck: boot_fail,
---       no new AXI traffic, reload ignored, MRAM AXI port open; aresetn
---       recovers (run last)
+--   T9  B withheld -> watchdog -> drain timeout -> stuck: boot_fail, no new
+--       AXI traffic, reload ignored, MRAM AXI port open; when the B responses
+--       come out, the copy leaves the stuck state by itself and retries
+--   T9b stuck repeatedly until no retry is left -> failed state; reload boots
+--   T9c B never returned -> stays stuck; aresetn recovers (run last)
 --   Throughout: AXI protocol checker on m_axi_* (0 errors), SRAM model
 --   errors 0, MRAM model protocol errors 0, mram_rd_slip 0.
 --
@@ -67,6 +69,7 @@ architecture sim of tb_mram_sram is
     constant MID_W    : natural := 4;
     constant SZB      : std_logic_vector(2 downto 0) := SIZE_BEAT;
     constant T_END    : time := 5 ms + G_COPY * 500 ns;  -- longest boot or reload
+    constant G_MAX_RETRIES_TB : natural := 3;             -- mram_top default G_BOOT_MAX_RETRIES
 
     signal aclk    : std_logic := '0';
     signal aresetn : std_logic := '0';
@@ -692,7 +695,7 @@ begin
         report "T15 done (slave protocol violations -> retry)";
 
         ------------------------------------------------------------------------
-        -- T9: B never returned -> stuck; aresetn recovers
+        -- T9: B withheld -> stuck; the fabric answers again -> automatic retry
         ------------------------------------------------------------------------
         stop_b <= '1';
         reload;
@@ -708,14 +711,56 @@ begin
         check(phase(boot_status) = 7 and s_naw = n, "T9: reload acted on in the stuck state");
         pci(P_READ, SRC + 2048);       -- MRAM side handed back
         check(pci_errs = 0, "T9: PCI read while stuck");
+        stop_b <= '0';                 -- the withheld B responses come out
+        wait until phase(boot_status) /= 7 for 1 ms;
+        check(boot_fail = '0', "T9: boot_fail not cleared when leaving the stuck state");
+        wait_end("T9");
+        check_ok("T9", 1, "0110000");
+        report "T9 done (stuck fabric answers again -> automatic retry)";
+
+        ------------------------------------------------------------------------
+        -- T9b: stuck again and again until no retry is left -> failed state;
+        -- then a reload boots
+        ------------------------------------------------------------------------
+        stop_b <= '1';
+        reload;
+        for k in 1 to G_MAX_RETRIES_TB + 1 loop
+            wait until phase(boot_status) = 7 for 5 ms;
+            check(phase(boot_status) = 7, "T9b: not stuck, round " & integer'image(k));
+            stop_b <= '0';
+            wait until phase(boot_status) /= 7 for 1 ms;
+            clk(50);                   -- the retry has taken the MRAM again
+            stop_b <= '1';
+        end loop;
+        clk(G_WATCHDOG);
+        check(phase(boot_status) = 6 and boot_fail = '1' and cpu_reset_n = '0',
+              "T9b: expected the failed state, phase " & integer'image(phase(boot_status)));
+        check(to_integer(unsigned(boot_status(7 downto 4))) = G_MAX_RETRIES_TB,
+              "T9b: retries " & integer'image(to_integer(unsigned(boot_status(7 downto 4)))));
+        pci(P_READ, SRC + 3072);       -- MRAM port open after the failure
+        stop_b <= '0';
+        reload;
+        wait_end("T9b");
+        check_ok("T9b", 0, "0000000");
+        report "T9b done (stuck repeatedly -> failed; reload boots)";
+
+        ------------------------------------------------------------------------
+        -- T9c: B never returned -> stuck for good; aresetn recovers
+        ------------------------------------------------------------------------
+        stop_b <= '1';
+        reload;
+        wait until phase(boot_status) = 7 for 5 ms;
+        check(phase(boot_status) = 7, "T9c: expected the stuck state");
+        clk(4 * G_WATCHDOG);
+        check(phase(boot_status) = 7 and boot_fail = '1', "T9c: left the stuck state without B");
         stop_b  <= '0';
         aresetn <= '0';
         clk(20);
         for a in 0 to G_COPY - 1 loop sram.write(a, x"00"); end loop;
         aresetn <= '1';
-        wait_end("T9b");
-        check_ok("T9b", 0, "0000000");
-        report "T9 done (stuck fabric, recovered by aresetn)";
+        wait_end("T9c");
+        check_ok("T9c", 0, "0000000");
+        report "T9c done (stuck for good, recovered by aresetn)";
         end if;
 
         ------------------------------------------------------------------------

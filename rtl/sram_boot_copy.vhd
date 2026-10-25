@@ -35,7 +35,7 @@
 -- Reload: a one-cycle pulse on reload, in the done or failed state, resets
 -- the CPU at once (cpu_reset_n = '0', boot_done = '0') and runs steps 2-5
 -- again without the power-up wait. Ignored while a copy is running and
--- after a stuck fabric (see below).
+-- while the fabric is stuck (see below).
 --
 -- Never abandon a handshake (doc/SRAM_ARCH.md, lesson 1). If nothing
 -- progresses for G_WATCHDOG_LIMIT cycles, the engine stops issuing new
@@ -43,8 +43,13 @@
 -- accepted, sends the remaining W beats of every accepted AW, and takes
 -- every B, R and MRAM response. A retry starts only once all of them are
 -- complete. If that drain does not finish within another G_WATCHDOG_LIMIT
--- cycles, the fabric is taken as stuck: boot_fail = '1', boot_status
--- reports it, and only aresetn recovers.
+-- cycles, the fabric is taken as stuck: boot_fail = '1' and boot_status
+-- reports it (phase 7, bit 13); the MRAM goes back to the AXI side once
+-- its part is quiet. If the fabric answers later and everything in flight
+-- completes, the engine leaves the stuck state by itself: boot_fail
+-- returns to '0' and the copy is retried (counted like any retry; with no
+-- retries left it ends in the failed state). Nothing is issued while
+-- stuck, so a fabric that never answers stays stuck until aresetn.
 --
 -- boot_status (aclk register, for a PCI status register or Identify):
 --   [2:0]  phase: 0 done, 1 power-up / held, 2 waiting for the MRAM port,
@@ -571,10 +576,28 @@ begin
                         end if;
 
                     when S_STUCK =>
-                        -- abort stays '1'; responses are still taken. Once the
-                        -- MRAM side is quiet, give it back to the AXI side so
-                        -- PCI can still inspect the MRAM.
-                        if own = '1' and req.valid = '0' and m_iss = m_rx then
+                        -- abort stays '1'; responses are still taken. If the
+                        -- fabric answers after all and everything in flight
+                        -- completes, retry like any other failed attempt
+                        -- (through S_WAIT_IDLE, since the MRAM may have been
+                        -- handed back meanwhile); with no retries left, fail.
+                        -- Until then, once the MRAM side is quiet, give it
+                        -- back to the AXI side so PCI can inspect the MRAM.
+                        if v_drained then
+                            if retries >= G_MAX_RETRIES then
+                                own       <= '0';
+                                hold_i    <= '0';
+                                state     <= S_FAIL;
+                            else
+                                retries <= retries + 1;
+                                if st_retries /= 15 then
+                                    st_retries <= st_retries + 1;
+                                end if;
+                                boot_fail <= '0';
+                                hold_i    <= '1';
+                                state     <= S_WAIT_IDLE;
+                            end if;
+                        elsif own = '1' and req.valid = '0' and m_iss = m_rx then
                             own    <= '0';
                             hold_i <= '0';
                         end if;

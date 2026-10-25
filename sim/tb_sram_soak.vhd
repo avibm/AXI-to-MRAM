@@ -13,8 +13,8 @@
 --   1  one corrupted byte in the SRAM at a random address  -> 1 retry, bit 8
 --   2  one BRESP SLVERR                                    -> 1 retry, bit 9
 --   3  one RRESP SLVERR                                    -> 1 retry, bit 10
---   4  all SRAM channels stalled for 0.5-1.9 x the watchdog limit
---      (shorter or longer than it)                         -> 0 or 1 retry, only bit 12
+--   4  all SRAM channels stalled for 0.5-3.5 x the watchdog limit -> 0 or 1
+--      retry, only bits 12 (watchdog) and 13 (stuck, then automatic retry)
 --   5  master image update: 64 random bytes written to the master copy
 --      through PCI with key_ok = 1, then reload           -> SRAM = new image
 --   6  aresetn at a random moment of the copy              -> clean boot
@@ -453,10 +453,10 @@ begin
                     wait until phase(boot_status) = 3 or phase(boot_status) = 4 for 2 ms;
                     clk(rnd(500));
                     stall_all <= '1';
-                    -- shorter or longer than the watchdog, but under watchdog +
-                    -- drain limit (2 x G_WATCHDOG): longer is "stuck" by design
-                    -- (only aresetn recovers; covered by tb_mram_sram T9)
-                    clk(G_WATCHDOG / 2 + rnd(14 * G_WATCHDOG / 10));
+                    -- shorter than the watchdog (no retry), between watchdog and
+                    -- watchdog + drain limit (drain -> retry), or longer (stuck,
+                    -- then automatic retry when the stall ends)
+                    clk(G_WATCHDOG / 2 + rnd(3 * G_WATCHDOG));
                     stall_all <= '0';
                 when 5 =>
                     -- update 64 bytes of the master image through PCI (key_ok), then reload
@@ -494,7 +494,7 @@ begin
                   & integer'image(phase(boot_status)));
             if stall_case then
                 check(to_integer(unsigned(boot_status(7 downto 4))) <= 1
-                      and (boot_status(14 downto 8) and "1101111") = "0000000",
+                      and (boot_status(14 downto 8) and "1001111") = "0000000",
                       "iteration " & integer'image(it) & " (stall): status "
                       & to_hstring(boot_status));
             else

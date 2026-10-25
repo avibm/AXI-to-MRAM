@@ -61,7 +61,7 @@ entity fv_sram_boot_copy is
         -- for unbounded checking (PDR): 1 = a property fails while the
         -- environment contract has held in every cycle so far
         bad              : out std_logic;
-        probe_done, probe_fail, probe_redone : out std_logic
+        probe_done, probe_fail, probe_redone, probe_unstuck : out std_logic
     );
 end entity fv_sram_boot_copy;
 
@@ -222,4 +222,5 @@ begin
     probe_done        <= boot_done;
     probe_fail        <= boot_fail;
     probe_redone      <= boot_done and refall;   -- boot_done again after a reload
+    probe_unstuck     <= boot_done and status(13);  -- a good boot after the stuck state
 end architecture formal;

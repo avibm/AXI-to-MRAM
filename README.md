@@ -76,8 +76,12 @@ Rules:
 * If nothing progresses for `G_BOOT_WATCHDOG` cycles, the copy stops issuing,
   completes every handshake already started (all W beats of accepted AWs,
   every B and R) and retries. If that drain does not finish either, the
-  fabric is taken as stuck (phase 7, `boot_fail` = 1); only `aresetn`
-  recovers. The MRAM side is handed back to AXI so PCI can still inspect it.
+  fabric is taken as stuck (phase 7, `boot_fail` = 1) and nothing new is
+  issued; the MRAM side is handed back to AXI so PCI can still inspect it.
+  If the fabric answers later and everything in flight completes, the copy
+  leaves the stuck state by itself, `boot_fail` returns to 0 and it retries
+  (counted as a retry; with none left it ends failed). A fabric that never
+  answers stays stuck until `aresetn`.
 
 Boot time (simulation, not measured on the board): a 16 KB copy takes
 1.75 ms after the power-up wait, at every SRAM stall rate from 0 % to 95 %,
