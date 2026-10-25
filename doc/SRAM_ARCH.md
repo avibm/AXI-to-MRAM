@@ -17,7 +17,7 @@ before or during Phase 2; they are collected in section 12.
 | 6 | Persistence | Nothing in SRAM must survive power loss. No hardware write-back to MRAM. |
 | 7 | PCI access | PCI may read and write SRAM through the interconnect at any time after boot. No hardware coherency; software owns shared buffers. |
 | 8 | NOEL-V caches | Unknown. Only affects the software rules in section 7. |
-| 9 | ECC | Use the ECC of `PF_SRAM_AHBL_AXI` (**OPEN**: check the option exists and how errors are reported). |
+| 9 | ECC | Use the ECC of `PF_SRAM_AHBL_AXI`. The IP has an ECC setting; it is currently **Disabled** in the configurator (**OPEN** OA2: enable it, and how errors are reported). |
 | 10 | Compatibility | Existing `mram_top` ports kept where still meaningful. The MRAM → MRAM boot copy (`mram_boot_copy.vhd`) is removed and replaced by the SRAM boot copy, with no legacy switch. The diagnostic top `mram_top_oct1.vhd` is removed (done). `boot_hold` is kept, with the same meaning: the copy waits after the power-up time while it is 1, and AXI access to the MRAM stays open. |
 | 11 | Branch | `mram_sram`, from `axi2mram`. |
 | A | Copy engine | Hardware copy inside `mram_top`, writing the SRAM through a **new AXI4 master port** connected as **INITIATOR2**. The CPU is released only after the copy is verified. |
@@ -228,7 +228,17 @@ boot_done = 1, cpu_reset_n = 1  --> NOEL-V starts at 0x0 (SRAM)
 |------|--------|---------------|
 | INITIATOR2 | New AXI4 initiator, 150 MHz (same clock as `aclk`, no CDC), data width = `C_AXI_DATA_WIDTH` (64) | How many initiators the configurator allows; its ID width for that port (sets `G_M_ID_WIDTH`); whether per-initiator target visibility can restrict INITIATOR2 to TARGET1 |
 | TARGET1 width | Same width as SRAM IP's AXI port | The configured width, and REVIEW Rev. 10: the 64-bit TARGET0 configuration once lost PCI writes. The SRAM path already works on the board, so I take its current settings as given. |
-| `PF_SRAM_AHBL_AXI` | AXI4 slave, 1 MB, ECC on | Bus width; burst types supported (INCR is all the copy engine uses); whether ECC is an option and how single/double errors are reported (ports, or SLVERR); how it handles narrow and partial-strobe writes with ECC |
+| `PF_SRAM_AHBL_AXI` | AXI4 slave, 1 MB, ECC on | Configured (screenshot of the configurator, version 1.2.116): LSRAM; depth 131072 words × 64 bits = 1 MB; native interface off; read port "Pipelined (Address pipeline and Data pipeline)"; **ECC Disabled**; fabric interface AXI; data width 64; reset Asynchronous; "High reliability" on; AXI address width 32; ID width 5; write and read interfaces on, write and read timeout count 80. Still to check in the IP handbook: what ECC options exist and how errors are reported; how narrow/partial-strobe writes are handled with ECC; what "High reliability" does; **what the timeout counts do** (see below) |
+
+**Timeout counts (OPEN, OA2).** I do not know what the IP does when the
+write or read timeout count (80) expires; the configurator does not say.
+If it ends a transaction early, or answers with an error, when a master
+stalls WVALID or RREADY for more than 80 cycles, that would break lesson 3
+(correct under any legal stall pattern) for the CPU through the
+interconnect CDC and for the PCI bridge. Check the IP handbook. The copy
+engine itself is not affected: it raises AWVALID only when the whole
+64-byte block is already in its FIFO, sends the W beats without gaps, and
+keeps BREADY and RREADY high.
 
 The copy engine uses only: INCR bursts of 64 bytes (AWLEN/ARLEN =
 64/beat bytes − 1), full-width beats, all WSTRB bits set, one AXI ID,
@@ -313,7 +323,7 @@ Phase 3 lists the Identify probes for them.
 | # | Item | Needed by |
 |---|------|-----------|
 | OA1 | Address map fixed (SRAM 0x0–0xFFFFF, MRAM 0x100000–0x7FFFFFF). Still to confirm: the interconnect passes the full address to TARGET0 (board test in section 3) | Before board test |
-| OA2 | `PF_SRAM_AHBL_AXI` configuration: AXI width, ID width, ECC option and error reporting, partial-write handling | Phase 2 (width), Phase 3 |
+| OA2 | `PF_SRAM_AHBL_AXI`: width 64, ID 5, address 32 confirmed from the configurator. Still open: enable ECC (currently Disabled) and how errors are reported; partial-write handling with ECC; meaning of the write/read timeout counts (80) and of "High reliability" | ECC decision before the board build; the rest Phase 3 |
 | OA3 | INITIATOR2: allowed by the configurator? ID width; target visibility; AxCACHE requirements | Phase 2 port widths |
 | OA4 | NOEL-V caches and their policy, cacheable regions | Firmware rules only |
 | OA5 | Is a CPU-only reset used? (SRAM is not reloaded by it) | Phase 2 if a reload input is wanted |
