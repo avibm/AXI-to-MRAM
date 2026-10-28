@@ -297,6 +297,10 @@ begin
     -- turns when both wait (see header). Each engine only sees ready while
     -- its own request is the one on core_req.
     ----------------------------------------------------------------------------
+    -- sel_rd = '1': the read engine's request is on core_req. In order:
+    -- no read waiting -> write; no write waiting -> read; a side that has
+    -- waited G_ARB_MAX_WAIT cycles goes next (read first if both have);
+    -- otherwise the side served last keeps going, so streams stay together.
     sel_rd   <= '0' when rd_core_req_o.valid = '0' else
                 '1' when wr_core_req_o.valid = '0' else
                 '1' when rd_wait >= G_ARB_MAX_WAIT else
@@ -315,11 +319,14 @@ begin
                 rd_wait <= 0;
                 wr_wait <= 0;
             else
+                -- remember which side the backend accepted last
                 if rd_ready = '1' then
                     last_rd <= '1';
                 elsif wr_ready = '1' then
                     last_rd <= '0';
                 end if;
+                -- waiting time of each side: cleared when it has no request
+                -- or is served, else counted up to G_ARB_MAX_WAIT (saturating)
                 if rd_core_req_o.valid = '0' or rd_ready = '1' then
                     rd_wait <= 0;
                 elsif rd_wait < G_ARB_MAX_WAIT then
@@ -334,13 +341,24 @@ begin
         end if;
     end process;
 
+    -- Lowest contiguous run of enabled bytes in wr_mask (see the declaration
+    -- of run_sum): mask + (mask and -mask) clears the lowest run and sets the
+    -- bit just above it; run_end is that bit, run_first the run's first bit.
     run_sum   <= unsigned('0' & wr_mask) + unsigned('0' & (wr_mask and std_logic_vector(
                                                          unsigned(not wr_mask) + 1)));
     run_first <= lowest_set(wr_mask);
     run_end   <= lowest_set(std_logic_vector(run_sum));
 
     ----------------------------------------------------------------------------
-    -- Write channel FSM
+    -- Write channel FSM. One AXI write burst at a time:
+    --   WR_IDLE        wait for AW (not while hold = '1')
+    --   WR_WDATA       take one W beat
+    --   WR_BEAT        send the beat's enabled byte runs to the backend
+    --   WR_WAIT_BVALID wait for the backend to finish them (no continuation)
+    --   WR_LAST        wait for all core writes of the burst, then B
+    --   WR_RESP        hold BVALID until BREADY
+    --   WR_ERR_DRAIN   rejected burst (FIXED/WRAP or too wide): take and
+    --                  discard its W beats, then answer SLVERR
     ----------------------------------------------------------------------------
     process (aclk)
         variable v_out : integer range 0 to 4;
@@ -364,9 +382,10 @@ begin
                 -- (every bvalid on core_resp belongs to this engine).
                 v_out := wr_outst;
                 if wr_core_req_o.valid = '1' and wr_ready = '1' then
-                    v_out := v_out + 1;
+                    v_out := v_out + 1;             -- a core write accepted
                 end if;
                 if core_resp.bvalid = '1' then
+                    -- a core write completed; its error flag is kept for B
                     v_out := v_out - 1;
                     wr_core_error <= wr_core_error or core_resp.error;
                 end if;
@@ -375,6 +394,7 @@ begin
                 case wr_state is
 
                     when WR_IDLE =>
+                        -- accept an AW unless the backend is being handed over
                         if s_axi_awvalid = '1' and hold = '0' then
                             s_axi_awready <= '1'; -- AW handshake completes next cycle
                             wr_id         <= s_axi_awid;
@@ -384,6 +404,8 @@ begin
                             wr_core_error <= '0';
                             wr_chain      <= '0';
                             if s_axi_awburst /= AXI_BURST_INCR or unsigned(s_axi_awsize) > LB then
+                                -- unsupported (FIXED/WRAP, or a beat wider than
+                                -- the bus): drain its W beats, answer SLVERR
                                 wr_error     <= '1';
                                 s_axi_wready <= '1';
                                 wr_state     <= WR_ERR_DRAIN;
@@ -396,10 +418,11 @@ begin
                     when WR_ERR_DRAIN =>
                         -- absorb the W beats of a burst this design rejects
                         if s_axi_wvalid = '1' and s_axi_wready = '1' and s_axi_wlast = '1' then
+                            -- last beat taken: send the SLVERR response
                             s_axi_bvalid <= '1';
                             wr_state     <= WR_RESP;
                         else
-                            s_axi_wready <= '1';
+                            s_axi_wready <= '1';    -- keep taking beats
                         end if;
 
                     when WR_WDATA =>
@@ -415,6 +438,7 @@ begin
 
                     when WR_BEAT =>
                         if wr_core_req_o.valid = '1' then
+                            -- a run is offered: hold it until the backend takes it
                             if wr_ready = '1' then
                                 wr_core_req_o.valid <= '0';
                                 if wr_cand = '1' then
@@ -425,6 +449,8 @@ begin
                                     wr_chain      <= '1';
                                     wr_state      <= WR_WDATA;
                                 else
+                                    -- more runs in this beat, or the last beat,
+                                    -- or no merging: wait for completion first
                                     wr_state <= WR_WAIT_BVALID;
                                 end if;
                             end if;
@@ -434,9 +460,9 @@ begin
                             wr_addr       <= next_beat_addr(wr_addr, wr_size);
                             wr_beats_left <= wr_beats_left - 1;
                             if wr_beats_left = 1 then
-                                wr_state <= WR_LAST;
+                                wr_state <= WR_LAST;   -- burst done: B after completion
                             else
-                                wr_state <= WR_WDATA;
+                                wr_state <= WR_WDATA;  -- next beat
                             end if;
                         else
                             -- issue the lowest contiguous run of enabled bytes
@@ -449,6 +475,9 @@ begin
                             wr_core_req_o.cont   <= wr_chain and wr_first_run;
                             wr_first_run         <= '0';
                             wr_chain             <= '0';
+                            -- wr_cand: this run is the beat's last and more beats
+                            -- follow, so the next beat may continue this write
+                            -- (write merging) instead of waiting for completion
                             if (wr_mask and std_logic_vector(run_sum(C_AXI_STRB_WIDTH - 1 downto 0)))
                                    = (wr_mask'range => '0') and wr_beats_left > 1
                                and G_MERGE_WRITES then
@@ -467,12 +496,15 @@ begin
                         end if;
 
                     when WR_LAST =>
+                        -- all core writes of the burst completed: B (with
+                        -- SLVERR if any of them reported an error)
                         if v_out = 0 then
                             s_axi_bvalid <= '1';
                             wr_state     <= WR_RESP;
                         end if;
 
                     when WR_RESP =>
+                        -- B handshake: then ready for the next AW
                         if s_axi_bvalid = '1' and s_axi_bready = '1' then
                             s_axi_bvalid <= '0';
                             wr_state     <= WR_IDLE;
@@ -483,6 +515,8 @@ begin
         end if;
     end process;
 
+    -- B fields: ID of the burst; SLVERR if the burst was rejected or any of
+    -- its core writes failed (e.g. blocked by the write guard)
     s_axi_bid   <= wr_id;
     s_axi_bresp <= AXI_RESP_SLVERR when (wr_error = '1' or wr_core_error = '1') else AXI_RESP_OKAY;
 
@@ -495,6 +529,9 @@ begin
     -- register in mram_top, so there is no path from a VALID to this READY.
     s_axi_arready <= not rd_fifo_full and aresetn and not hold;
 
+    -- idle: write FSM waiting for AW with no core write outstanding, and the
+    -- read side empty (no burst queued, no core read in flight or buffered,
+    -- no R beat waiting on the bus). All terms are registers.
     idle <= '1' when wr_state = WR_IDLE and wr_outst = 0 and wr_core_req_o.valid = '0'
                      and rd_fifo_count = 0 and is_avail = 0 and is_active = '0'
                      and rd_infl = 0 and rb_cnt = 0 and rd_core_req_o.valid = '0'
@@ -530,7 +567,8 @@ begin
                 v_infl  := rd_infl;
                 v_rbcnt := rb_cnt;
 
-                -- AR: push a new burst at the tail
+                -- AR: push a new burst at the tail (s_axi_arready guarantees a
+                -- free entry)
                 if v_push then
                     rd_fifo(rd_tail_ptr).id      <= s_axi_arid;
                     rd_fifo(rd_tail_ptr).addr    <= unsigned(s_axi_araddr);
@@ -539,6 +577,7 @@ begin
                     rd_fifo(rd_tail_ptr).beats_left <=
                         resize(unsigned(s_axi_arlen), C_AXI_LEN_WIDTH + 1) + 1;
                     if s_axi_arburst /= AXI_BURST_INCR or unsigned(s_axi_arsize) > LB then
+                        -- unsupported burst: no core reads, SLVERR on every beat
                         rd_fifo(rd_tail_ptr).error <= '1';
                     else
                         rd_fifo(rd_tail_ptr).error <= '0';
@@ -546,7 +585,8 @@ begin
                     rd_tail_ptr <= (rd_tail_ptr + 1) mod G_MAX_OUTSTANDING;
                 end if;
 
-                -- Core read data -> buffer
+                -- Core read data -> buffer (always room: reads are only issued
+                -- while in-flight + buffered < C_RBUF)
                 if core_resp.rvalid = '1' then
                     rbuf(rb_wr)     <= core_resp.rdata;
                     rbuf_err(rb_wr) <= core_resp.error;
@@ -559,12 +599,14 @@ begin
                 -- Issue engine
                 ----------------------------------------------------------------
                 if is_active = '0' then
+                    -- no burst being issued: start on the next queued one
                     if is_avail > 0 then
                         -- take the next burst; a rejected one issues nothing
                         v_take := true;
                         rd_fifo(is_ptr).started <= '1';
                         is_ptr <= (is_ptr + 1) mod G_MAX_OUTSTANDING;
                         if rd_fifo(is_ptr).error = '0' then
+                            -- a good burst: issue its beats
                             is_addr   <= rd_fifo(is_ptr).addr;
                             is_size   <= rd_fifo(is_ptr).size;
                             is_left   <= rd_fifo(is_ptr).beats_left;
@@ -572,13 +614,14 @@ begin
                         end if;
                     end if;
                 elsif rd_core_req_o.valid = '1' then
+                    -- a beat read is offered: hold it until accepted
                     if rd_ready = '1' then
                         rd_core_req_o.valid <= '0';
                         v_infl  := v_infl + 1;
                         is_addr <= next_beat_addr(is_addr, is_size);
                         is_left <= is_left - 1;
                         if is_left = 1 then
-                            is_active <= '0';
+                            is_active <= '0';       -- last beat of this burst issued
                         end if;
                     end if;
                 elsif rd_infl + rb_cnt < C_RBUF then
@@ -595,13 +638,17 @@ begin
                 -- R channel: load the next beat when the output is free
                 ----------------------------------------------------------------
                 if s_axi_rvalid = '1' and s_axi_rready = '1' then
-                    s_axi_rvalid <= '0';
+                    s_axi_rvalid <= '0';            -- beat taken (may be reloaded below)
                 end if;
+                -- load the next beat when the R register is free or being
+                -- emptied, the head burst has been taken by the issue engine,
+                -- and its data is there (or it is a rejected burst)
                 v_load := (s_axi_rvalid = '0' or s_axi_rready = '1') and rd_fifo_count > 0
                           and rd_fifo(rd_head_ptr).started = '1'
                           and (rd_fifo(rd_head_ptr).error = '1' or rb_cnt > 0);
                 if v_load then
                     if rd_fifo(rd_head_ptr).error = '1' then
+                        -- rejected burst: no data, SLVERR
                         s_axi_rdata <= (others => '0');
                         s_axi_rresp <= AXI_RESP_SLVERR;
                     else
@@ -613,6 +660,7 @@ begin
                     s_axi_rid    <= rd_fifo(rd_head_ptr).id;
                     s_axi_rvalid <= '1';
                     if rd_fifo(rd_head_ptr).beats_left = 1 then
+                        -- last beat of the burst: RLAST, retire the burst
                         s_axi_rlast <= '1';
                         rd_head_ptr <= (rd_head_ptr + 1) mod G_MAX_OUTSTANDING;
                         v_pop := true;
@@ -625,6 +673,8 @@ begin
                 rd_infl <= v_infl;
                 rb_cnt  <= v_rbcnt;
 
+                -- queue counters: bursts waiting for the issue engine
+                -- (is_avail) and bursts in the queue at all (rd_fifo_count)
                 if v_push and not v_take then
                     is_avail <= is_avail + 1;
                 elsif v_take and not v_push then

@@ -216,6 +216,19 @@ end entity mram_qspi_backend;
 
 architecture rtl of mram_qspi_backend is
 
+    -- S_IDLE        CS# high, waiting for a request or register command
+    -- S_WREN_*      the WREN transaction before an array write (CS# setup,
+    --               8 opcode bits, CS# high gap)
+    -- S_CS_SETUP .. S_DATA   the main (1-4-4) transaction: CS# setup, opcode,
+    --               4 address bytes, XIP mode byte, latency (reads), data
+    -- S_LINGER      SCLK stopped with CS# low, waiting for a contiguous request
+    -- S_CS_HOLD, S_DONE, S_CS_HIGH   end of a transaction: CS# hold, CS#
+    --               rise and completion, minimum CS# high time
+    -- S_REG_*       a register command (single-bit SPI)
+    -- Every phase uses the same pattern: on sclk_rise count the edge
+    -- (clks_left), on sclk_fall shift out the next bit/nibble or, when
+    -- clks_left = 0, set up the next phase. Outputs thus change on falling
+    -- edges and are stable at the rising edge where the device samples them.
     type state_t is (
         S_IDLE,
         S_WREN_SETUP, S_WREN_CMD, S_WREN_GAP,
@@ -262,7 +275,7 @@ architecture rtl of mram_qspi_backend is
     signal req_nbytes   : unsigned(6 downto 0);
     signal lane_offset  : unsigned(LB - 1 downto 0);
 
-    -- Shared 512-bit shift register. During single-bit phases (WREN
+    -- Shared W-bit (C_AXI_DATA_WIDTH) shift register. During single-bit phases (WREN
     -- opcode, main opcode) bit T is on IO0 and the register shifts by 1.
     -- During quad phases (address, write data) the top 4 bits are on IO3..0
     -- and the register shifts by 4. Read data shifts in at the bottom.
@@ -343,6 +356,12 @@ architecture rtl of mram_qspi_backend is
 
 begin
 
+    ----------------------------------------------------------------------------
+    -- SCLK generator: while sclk_run, SCLK toggles every G_SCLK_HALF_PERIOD
+    -- aclk cycles (SCLK = aclk / (2 * G_SCLK_HALF_PERIOD)); otherwise it is
+    -- held low with the divider cleared, so it always restarts with a full
+    -- low half period followed by a rising edge.
+    ----------------------------------------------------------------------------
     process (aclk)
     begin
         if rising_edge(aclk) then
@@ -351,6 +370,7 @@ begin
                 sclk_div_cnt <= 0;
             elsif sclk_run then
                 if sclk_div_cnt = G_SCLK_HALF_PERIOD - 1 then
+                    -- half period complete: toggle SCLK
                     sclk_div_cnt <= 0;
                     sclk_reg     <= not sclk_reg;
                 else
@@ -382,6 +402,8 @@ begin
     -- rd_sample_dly aclk cycles. Read data is shifted in by this strobe only.
     cap_now  <= '1' when sclk_rise and ((state = S_DATA and req_we = '0') or state = S_REG_RDATA)
                 else '0';
+    -- delay 0: sample on the SCLK rising edge itself; delay n: n aclk
+    -- cycles later, taken from the cap_pipe shift register
     cap_fire <= cap_now when unsigned(dly_q2) = 0
                 else cap_pipe(to_integer(unsigned(dly_q2)) - 1);
 
@@ -404,6 +426,8 @@ begin
                              (req_we = '0' and G_STREAM_READS and dq_cnt < C_DQ - 1))
                else '0';
 
+    -- In S_IDLE any request is accepted unless a register command is waiting
+    -- (it goes first); in a running transaction only a continuation (cont_ok).
     core_resp.ready  <= core_req.valid and not reg_cmd_valid when state = S_IDLE else cont_ok;
 
     wr_accept <= '1' when (state = S_IDLE and reg_cmd_valid = '0' and core_req.valid = '1'
@@ -413,18 +437,22 @@ begin
                            and core_req.we = '0') or (cont_ok = '1' and core_req.we = '0')
                  else '0';
 
-    -- Accepted write data not yet in the MRAM: from acceptance until CS#
-    -- rises at the end of the write.
     rd_slip <= rd_slip_i;
 
+    -- Accepted write data not yet in the MRAM: from acceptance until CS#
+    -- rises at the end of the write.
     wr_pending <= '1' when req_is_reg = '0' and req_we = '1'
                            and state /= S_IDLE and state /= S_CS_HIGH
                   else '0';
     core_resp.rvalid <= resp_rvalid;
     core_resp.bvalid <= resp_bvalid;
     core_resp.rdata  <= resp_rdata;
-    core_resp.error  <= '0';
+    core_resp.error  <= '0';  -- the backend reports no errors (no MRAM error status exists)
 
+    ----------------------------------------------------------------------------
+    -- Main process: request acceptance, the SPI transaction state machine,
+    -- read capture bookkeeping and read data alignment.
+    ----------------------------------------------------------------------------
     process (aclk)
         variable v_off  : natural range 0 to NB - 1;
         variable v_push : boolean;
@@ -433,6 +461,8 @@ begin
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
+                -- CS# high, SCLK stopped, all IO released. A transaction in
+                -- progress is cut off (CS# rises mid-command; see REVIEW Rev. 14).
                 state       <= S_IDLE;
                 mram_cs_n   <= '1';
                 sclk_run    <= false;
@@ -450,6 +480,7 @@ begin
                 al_s1       <= '0';
                 al_s2       <= '0';
             else
+                -- completion strobes are one cycle long by default
                 resp_rvalid <= '0';
                 resp_bvalid <= '0';
                 reg_done_i  <= '0';
@@ -467,13 +498,15 @@ begin
                 -- Accept a write continuation (see cont_ok); it is appended
                 -- on the current write's final falling edge in S_DATA.
                 if cont_ok = '1' then
+                    -- remember the appended chunk and prepare its write data
+                    -- (lane-aligned like tx_build in S_IDLE)
                     join_pending <= '1';
                     join_nbytes  <= core_req.nbytes;
                     v_off        := to_integer(unsigned(core_req.addr(LB - 1 downto 0)));
                     tx_build     <= std_logic_vector(shift_left(
                                         unsigned(byte_rev(core_req.wdata)), 8 * v_off));
                 end if;
-                cap_pipe <= cap_now & cap_pipe(0 to 6);
+                cap_pipe <= cap_now & cap_pipe(0 to 6);   -- delay line for cap_fire
 
                 -- Read chunk bookkeeping: push on acceptance, pop when the
                 -- chunk's last nibble has been captured.
@@ -484,10 +517,12 @@ begin
                 -- later transactions (see rd_slip).
                 v_resync := v_push and state = S_IDLE;
                 if v_resync then
+                    -- new transaction: this read becomes queue entry 0
                     dq_nb(0)  <= core_req.nbytes;
                     dq_off(0) <= unsigned(core_req.addr(LB - 1 downto 0));
                     dq_wr     <= 1 mod C_DQ;
                 elsif v_push then
+                    -- a streamed read appended to the running transaction
                     dq_nb(dq_wr)  <= core_req.nbytes;
                     dq_off(dq_wr) <= unsigned(core_req.addr(LB - 1 downto 0));
                     dq_wr         <= (dq_wr + 1) mod C_DQ;
@@ -495,11 +530,15 @@ begin
 
                 chunk_done <= '0';
                 if cap_fire = '1' then
+                    -- sample point of a read bit / nibble
                     if req_is_reg = '1' then
+                        -- register command: one bit per clock on IO1 (SO)
                         reg_rx <= reg_rx(30 downto 0) & mram_io_i(1);
                     else
+                        -- array read: one nibble per clock on IO3..0
                         shreg  <= shreg(T-4 downto 0) & mram_io_i;
                         if cap_cnt + 1 = 2 * to_integer(dq_nb(dq_rd)) then
+                            -- last nibble of the oldest read chunk: deliver it
                             cap_cnt    <= 0;
                             chunk_done <= '1';
                             done_nb    <= dq_nb(dq_rd);
@@ -511,12 +550,14 @@ begin
                         end if;
                     end if;
                 end if;
+                -- number of read chunks in flight
                 if v_push and not v_pop then
                     dq_cnt <= dq_cnt + 1;
                 elsif v_pop and not v_push then
                     dq_cnt <= dq_cnt - 1;
                 end if;
                 if v_resync then
+                    -- restart: exactly the new read is in flight
                     dq_rd   <= 0;
                     dq_cnt  <= 1;
                     cap_cnt <= 0;
@@ -559,6 +600,8 @@ begin
                         sclk_run  <= false;
                         io_oe     <= (others => '0');
                         if reg_cmd_valid = '1' then
+                            -- register command (priority over memory requests):
+                            -- load opcode and any address/data bits into shreg
                             -- opcode, then address / data bits, MSB first
                             req_is_reg  <= '1';
                             reg_wr_bits <= 0;
@@ -596,6 +639,7 @@ begin
                             mram_cs_n <= '0';
                             state     <= S_REG_SETUP;
                         elsif core_req.valid = '1' then
+                            -- memory read or write: latch the request
                             req_is_reg  <= '0';
                             req_we      <= core_req.we;
                             req_nbytes  <= core_req.nbytes;
@@ -614,9 +658,9 @@ begin
                             setup_cnt <= 0;
                             mram_cs_n <= '0';
                             if core_req.we = '1' and skip_q2 = '0' then
-                                state <= S_WREN_SETUP;
+                                state <= S_WREN_SETUP;  -- write: WREN transaction first
                             else
-                                state <= S_CS_SETUP;
+                                state <= S_CS_SETUP;    -- read, or write in WREN-once mode
                             end if;
                         end if;
 
@@ -625,6 +669,7 @@ begin
                     -- opcode only (0 address bytes, 0 data bytes per Table 32).
                     ------------------------------------------------------------
                     when S_WREN_SETUP =>
+                        -- CS# setup time before the first SCLK edge
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
                             -- first opcode bit set up before the first edge
                             io_drive    <= "11" & '0' & G_OPCODE_WREN(7);
@@ -642,17 +687,20 @@ begin
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
+                                -- all 8 bits clocked: end the WREN transaction
                                 sclk_run  <= false;   -- SCLK ends low on this edge
                                 mram_cs_n <= '1';
                                 io_oe     <= (others => '0');
                                 gap_cnt   <= 0;
                                 state     <= S_WREN_GAP;
                             else
+                                -- next opcode bit on IO0
                                 io_drive(0) <= shreg(T);
                                 shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 
+                    -- CS# high between WREN and the write (G_CS_GAP_CYCLES)
                     when S_WREN_GAP =>
                         if gap_cnt = G_CS_GAP_CYCLES - 1 then
                             mram_cs_n <= '0';
@@ -667,7 +715,9 @@ begin
                     -- on IO0, address and data on all four IOs.
                     ------------------------------------------------------------
                     when S_CS_SETUP =>
+                        -- CS# setup, then the first opcode bit on IO0
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
+                            -- D2h quad write or EBh quad read
                             if req_we = '1' then
                                 io_drive <= "11" & '0' & G_OPCODE_QUAD_WRITE(7);
                                 shreg(T downto T-7) <= G_OPCODE_QUAD_WRITE(6 downto 0) & '0';
@@ -695,11 +745,13 @@ begin
                                 clks_left <= 8; -- 32 addr bits / 4 bits per clock
                                 state     <= S_ADDR;
                             else
+                                -- next opcode bit on IO0
                                 io_drive(0) <= shreg(T);
                                 shreg       <= shreg(T-1 downto 0) & '0';
                             end if;
                         end if;
 
+                    -- 32-bit address, MSB nibble first, on IO3..0
                     when S_ADDR =>
                         if sclk_rise then
                             clks_left <= clks_left - 1;
@@ -711,36 +763,43 @@ begin
                                 clks_left <= 2;
                                 state     <= S_XIP;
                             else
+                                -- next address nibble
                                 io_drive <= shreg(T downto T-3);
                                 shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
                         end if;
 
+                    -- XIP mode byte (always Fxh: never enter XIP mode)
                     when S_XIP =>
                         if sclk_rise then
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
                                 if req_we = '1' then
+                                    -- write: first data nibble, 2 clocks per byte
                                     io_drive  <= tx_build(T downto T-3);
                                     shreg     <= tx_build(T-4 downto 0) & "0000";
                                     clks_left <= 2 * to_integer(req_nbytes);
                                     state     <= S_DATA;
                                 elsif G_DUMMY_CYCLES = 0 then
+                                    -- read without latency: data follows at once
                                     io_oe     <= (others => '0');
                                     clks_left <= 2 * to_integer(req_nbytes);
                                     state     <= S_DATA;
                                 else
+                                    -- read: latency (dummy) clocks first
                                     io_oe     <= (others => '0'); -- release for turnaround
                                     clks_left <= G_DUMMY_CYCLES;
                                     state     <= S_DUMMY;
                                 end if;
                             else
+                                -- second nibble of the mode byte
                                 io_drive <= shreg(T downto T-3);
                                 shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
                         end if;
 
+                    -- read latency clocks (CR2, G_DUMMY_CYCLES), IO released
                     when S_DUMMY =>
                         if sclk_rise then
                             clks_left <= clks_left - 1;
@@ -750,6 +809,7 @@ begin
                             state     <= S_DATA;
                         end if;
 
+                    -- data phase: write nibbles out, or read nibbles in (cap_fire)
                     when S_DATA =>
                         if sclk_rise then
                             clks_left <= clks_left - 1; -- read data: see cap_fire
@@ -773,11 +833,13 @@ begin
                                 linger_cnt <= 0;
                                 state      <= S_LINGER;
                             elsif clks_left = 0 then
+                                -- chunk done, no linger: end the transaction
                                 sclk_run  <= false;
                                 io_oe     <= (others => '0');
                                 setup_cnt <= 0;
                                 state     <= S_CS_HOLD;
                             elsif req_we = '1' then
+                                -- next write nibble
                                 io_drive <= shreg(T downto T-3);
                                 shreg    <= shreg(T-4 downto 0) & "0000";
                             end if;
@@ -802,11 +864,14 @@ begin
                         elsif cont_ok = '0' and (reg_cmd_valid = '1' or core_req.valid = '1'
                                   or (req_we = '1' and linger_cnt >= G_WR_LINGER_CYCLES - 1)
                                   or (req_we = '0' and linger_cnt >= G_RD_LINGER_CYCLES - 1)) then
+                            -- end the linger: something that cannot continue
+                            -- this transaction is waiting, or the linger time
+                            -- is over
                             io_oe     <= (others => '0');
                             setup_cnt <= 0;
                             state     <= S_CS_HOLD;
                         else
-                            linger_cnt <= linger_cnt + 1;
+                            linger_cnt <= linger_cnt + 1;   -- keep waiting
                         end if;
 
                     when S_CS_HOLD =>
@@ -818,6 +883,7 @@ begin
                         end if;
                         -- also wait for delayed read captures still in flight
                         if setup_cnt >= G_CS_SETUP_CYCLES - 1 and cap_pipe = x"00" then
+                            -- CS# hold time met and no capture pending: CS# up
                             mram_cs_n <= '1';
                             state     <= S_DONE;
                             setup_cnt <= 0;
@@ -825,6 +891,9 @@ begin
                             setup_cnt <= setup_cnt + 1;
                         end if;
 
+                    -- Transaction complete: report it (register command done,
+                    -- or a non-posted write's bvalid; posted writes answered at
+                    -- acceptance, reads per chunk).
                     when S_DONE =>
                         if req_is_reg = '1' then
                             reg_done_i <= '1';
@@ -847,6 +916,7 @@ begin
                     when S_CS_HIGH =>
                         if (req_we = '1' and high_cnt >= C_HIGH_WAIT_WR) or
                            (req_we = '0' and high_cnt >= C_HIGH_WAIT_RD) then
+                            -- CS# high long enough: ready for the next request
                             io_oe <= (others => '0');
                             state <= S_IDLE;
                         else
@@ -857,6 +927,7 @@ begin
                     -- Register commands: single-bit SPI (1-0-0 / 1-0-1).
                     ------------------------------------------------------------
                     when S_REG_SETUP =>
+                        -- CS# setup, then the first opcode bit on IO0
                         if setup_cnt = G_CS_SETUP_CYCLES - 1 then
                             io_drive  <= "11" & '0' & shreg(T);
                             shreg     <= shreg(T-1 downto 0) & '0';
@@ -873,6 +944,9 @@ begin
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
+                                -- opcode done; next: address/data out (WRSR,
+                                -- RDAR, WRAR), data in (RDSR, RDID), or end
+                                -- (WREN, WRDI)
                                 if reg_wr_bits /= 0 then
                                     io_drive(0) <= shreg(T);
                                     shreg       <= shreg(T-1 downto 0) & '0';
@@ -893,11 +967,14 @@ begin
                             end if;
                         end if;
 
+                    -- address and/or data bits out on IO0
                     when S_REG_WDATA =>
                         if sclk_rise then
                             clks_left <= clks_left - 1;
                         elsif sclk_fall then
                             if clks_left = 0 then
+                                -- next: latency then data in (RDAR), data in,
+                                -- or end of a write command (WRSR, WRAR)
                                 if reg_rd_bits /= 0 and reg_dummy then
                                     clks_left <= G_DUMMY_CYCLES;   -- RDAR latency
                                     state     <= S_REG_DUMMY;
@@ -915,6 +992,7 @@ begin
                             end if;
                         end if;
 
+                    -- RDAR latency clocks
                     when S_REG_DUMMY =>
                         if sclk_rise then
                             clks_left <= clks_left - 1;
@@ -924,10 +1002,12 @@ begin
                             state     <= S_REG_RDATA;
                         end if;
 
+                    -- result bits in on IO1 (captured by cap_fire)
                     when S_REG_RDATA =>
                         if sclk_rise then
                             clks_left <= clks_left - 1; -- data: see cap_fire
                         elsif sclk_fall and clks_left = 0 then
+                            -- all bits clocked: end the command
                             sclk_run  <= false;
                             setup_cnt <= 0;
                             state     <= S_CS_HOLD;

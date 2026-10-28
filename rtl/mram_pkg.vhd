@@ -31,7 +31,9 @@ package mram_pkg is
     constant C_AXI_DATA_WIDTH : integer := 64;                    -- 64, 128, 256 or 512
     constant C_AXI_STRB_WIDTH : integer := C_AXI_DATA_WIDTH / 8;
     constant C_BEAT_BYTES     : integer := C_AXI_DATA_WIDTH / 8;  -- bytes per data beat
-    -- log2(C_BEAT_BYTES): byte-lane address bits, and the largest AxSIZE
+    -- log2(C_BEAT_BYTES): byte-lane address bits, and the largest AxSIZE.
+    -- Written as a sum of boolean'pos terms (exactly one is 1) so that it is
+    -- a static constant without a log2 function; covers 8/16/32/64 bytes.
     constant C_LANE_BITS      : integer := 3 * boolean'pos(C_BEAT_BYTES = 8)
                                          + 4 * boolean'pos(C_BEAT_BYTES = 16)
                                          + 5 * boolean'pos(C_BEAT_BYTES = 32)

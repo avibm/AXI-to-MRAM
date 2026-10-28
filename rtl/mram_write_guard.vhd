@@ -32,20 +32,22 @@
 -- revision does not do.
 --
 -- Region check: only the request's start address is compared. That is
--- sufficient because every core request lies inside one 64-byte aligned
--- window (see mram_pkg) and G_PROTECT_BASE / G_PROTECT_SIZE are multiples
--- of 64, so a request is either entirely inside or entirely outside.
+-- sufficient because every core request lies inside one C_BEAT_BYTES-
+-- aligned window (see mram_pkg) and G_PROTECT_BASE / G_PROTECT_SIZE are
+-- multiples of C_BEAT_BYTES, so a request is either entirely inside or
+-- entirely outside.
 --
 -- Blocked writes are accepted at once and answered with bvalid + error on
 -- a later cycle. That answer is held back while the backend is itself
 -- delivering an rvalid/bvalid, so no backend completion is ever masked,
 -- and no new request is passed to the backend while it is pending.
 --
--- Placement: sits between axi4_slave_wrapper and mram_qspi_backend --
---   axi4_slave_wrapper.core_req  -> core_req_in
+-- Placement (see mram_top): between the ownership mux and the backend --
+--   mux output (axi4_slave_wrapper or sram_boot_copy) -> core_req_in
 --   core_req_out                 -> mram_qspi_backend.core_req
 --   mram_qspi_backend.core_resp  -> core_resp_in
---   core_resp_out                -> axi4_slave_wrapper.core_resp
+--   core_resp_out                -> both requesters, masked by ownership
+-- sram_boot_copy only reads, so the guard never blocks it.
 --
 -- Language: VHDL-2008
 --------------------------------------------------------------------------------
@@ -77,17 +79,23 @@ end entity mram_write_guard;
 
 architecture rtl of mram_write_guard is
 
-    signal is_protected_write : std_logic;
-    signal blocked            : std_logic;
+    signal is_protected_write : std_logic; -- request is a write into the protected range
+    signal blocked            : std_logic; -- ... and the range is locked (key_ok_i = '0')
 
-    signal key_ok_meta, key_ok_sync : std_logic := '0';
-    signal key_ok_i                 : std_logic;
+    signal key_ok_meta, key_ok_sync : std_logic := '0'; -- synchronizer stages 1 and 2
+    signal key_ok_i                 : std_logic;        -- key_ok as used here (aclk domain)
 
     signal deliver_error : std_logic := '0'; -- a blocked write awaits its error response
     signal error_slot    : std_logic;        -- the error response goes out this cycle
 
 begin
 
+    ----------------------------------------------------------------------------
+    -- key_ok into aclk. With G_SYNC_KEY_OK (default): two-flop synchronizer,
+    -- because key_ok may come from the PCI clock domain. key_ok_meta is the
+    -- only flop that may go metastable; key_ok_sync is what the logic uses.
+    -- Reset to '0' = locked, so the region is never open after a reset.
+    ----------------------------------------------------------------------------
     gen_sync : if G_SYNC_KEY_OK generate
         process (aclk)
         begin
@@ -104,17 +112,25 @@ begin
         key_ok_i <= key_ok_sync;
     end generate;
 
+    -- key_ok already synchronous to aclk: use it directly
     gen_nosync : if not G_SYNC_KEY_OK generate
         key_ok_i <= key_ok;
     end generate;
 
+    -- A write whose start address lies in [G_PROTECT_BASE, G_PROTECT_BASE +
+    -- G_PROTECT_SIZE). Reads are never protected. The start address is enough
+    -- (see the header: a request never straddles the region boundary).
     is_protected_write <= '1' when (core_req_in.we = '1' and
                                      unsigned(core_req_in.addr) >= G_PROTECT_BASE and
                                      unsigned(core_req_in.addr) < G_PROTECT_BASE + G_PROTECT_SIZE)
                            else '0';
 
+    -- Blocked = a protected write while the region is locked.
     blocked <= '1' when (is_protected_write = '1' and key_ok_i = '0') else '0';
 
+    -- The pending error response may go out only in a cycle in which the
+    -- backend is not itself completing a read or write; otherwise one of the
+    -- two completions would be lost on the shared response record.
     error_slot <= deliver_error and not core_resp_in.rvalid and not core_resp_in.bvalid;
 
     -- Never let a blocked write reach the real backend, and hold everything
@@ -124,20 +140,34 @@ begin
                                         (core_req_in.valid = '1' and blocked = '1'))
                     else core_req_in;
 
+    ----------------------------------------------------------------------------
+    -- Response to the requester (combinational). Normally the backend's
+    -- response is passed through unchanged.
+    ----------------------------------------------------------------------------
     process (core_req_in, blocked, deliver_error, error_slot, core_resp_in)
     begin
         core_resp_out <= core_resp_in;
         if deliver_error = '1' then
+            -- A blocked write's error is pending: accept nothing new (the
+            -- request is also held back from the backend, see core_req_out)
+            -- and send the error as soon as a free slot comes.
             core_resp_out.ready <= '0';
             if error_slot = '1' then
                 core_resp_out.bvalid <= '1'; -- blocked requests are always writes
                 core_resp_out.error  <= '1';
             end if;
         elsif core_req_in.valid = '1' and blocked = '1' then
+            -- A new blocked write: accept it here (it never reaches the
+            -- backend); its error response follows on a later cycle.
             core_resp_out.ready <= '1'; -- accept immediately, never stall the wrapper
         end if;
     end process;
 
+    ----------------------------------------------------------------------------
+    -- deliver_error: set when a blocked write is accepted, cleared in the
+    -- cycle its error response goes out (error_slot). At most one blocked
+    -- write is pending, because nothing new is accepted while it is set.
+    ----------------------------------------------------------------------------
     process (aclk)
     begin
         if rising_edge(aclk) then
@@ -145,9 +175,9 @@ begin
                 deliver_error <= '0';
             else
                 if error_slot = '1' then
-                    deliver_error <= '0';
+                    deliver_error <= '0';           -- error response sent this cycle
                 elsif core_req_in.valid = '1' and blocked = '1' then
-                    deliver_error <= '1';
+                    deliver_error <= '1';           -- blocked write accepted this cycle
                 end if;
             end if;
         end if;

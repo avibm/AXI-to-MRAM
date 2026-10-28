@@ -500,6 +500,22 @@ identified.) The ID width is a property of the interconnect configuration,
 so a constant is the natural place. Testbenches and the formal harness use
 the constant too. No functional change.
 
+### Rev. 17 – comments throughout the RTL
+
+Comments added to every process, state and non-obvious condition in all
+seven `rtl/` files; no code change. Two outdated comments corrected
+(`mram_write_guard`: request window is `C_BEAT_BYTES`, placement after the
+ownership mux; `mram_qspi_backend`: the shift register is
+`C_AXI_DATA_WIDTH` bits, not 512) and one misplaced comment moved
+(`wr_pending`).
+
+Proof that only comments changed: every file was compared with its
+previous version after removing comments and whitespace
+(`sim/check_comment_only.py`); all seven are identical. The check caught one
+slip during the edit (a statement dropped while inserting a comment in
+`mram_qspi_backend`), which was restored before the comparison passed.
+All testbenches and the unbounded formal proof pass on the commented files.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

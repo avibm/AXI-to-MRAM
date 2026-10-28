@@ -97,24 +97,29 @@ architecture rtl of mram_cmd_ctrl is
 
     -- bit 0 WREN, 1 WRDI, 2 RDSR, 3 WRSR, 4 RDID, 5 boot_hold, 6 RDAR, 7 WRAR
     type sync_t is array (0 to G_SYNC_STAGES - 1) of std_logic_vector(7 downto 0);
-    signal req_meta : sync_t := (others => (others => '0'));
-    signal req_s    : std_logic_vector(7 downto 0);
-    signal any_req  : std_logic;
+    signal req_meta : sync_t := (others => (others => '0')); -- synchronizer stages; (0) may go metastable
+    signal req_s    : std_logic_vector(7 downto 0);         -- synchronized requests and boot_hold
+    signal any_req  : std_logic;                            -- at least one command request (not boot_hold)
 
+    -- C_IDLE: wait for a request; C_ISSUE: offer it to the backend;
+    -- C_WAIT: wait for the backend to finish it; C_DONE: cmd_done = 1 until
+    -- every request is low again (four-phase handshake)
     type state_t is (C_IDLE, C_ISSUE, C_WAIT, C_DONE);
     signal state  : state_t := C_IDLE;
-    signal op     : reg_cmd_t := REG_CMD_RDSR;
-    signal done_a : std_logic := '0';
+    signal op     : reg_cmd_t := REG_CMD_RDSR;              -- command being executed
+    signal done_a : std_logic := '0';                       -- cmd_done (aclk register)
 
-    signal rdsr_q : std_logic_vector(7 downto 0)  := (others => '0');
-    signal rdid_q : std_logic_vector(31 downto 0) := (others => '0');
+    signal rdsr_q : std_logic_vector(7 downto 0)  := (others => '0'); -- last RDSR / RDAR result
+    signal rdid_q : std_logic_vector(31 downto 0) := (others => '0'); -- last RDID result
 
 begin
 
     assert G_SYNC_STAGES >= 2 report "G_SYNC_STAGES must be >= 2" severity failure;
 
     ----------------------------------------------------------------------------
-    -- PCI -> aclk synchronizers (no reset: they only ever carry levels)
+    -- PCI -> aclk synchronizers (no reset: they only ever carry levels).
+    -- All eight bits are shifted through G_SYNC_STAGES flops; each bit is an
+    -- independent level, so the bits need not arrive in the same cycle.
     ----------------------------------------------------------------------------
     process (aclk)
     begin
@@ -126,18 +131,24 @@ begin
             end loop;
         end if;
     end process;
-    req_s          <= req_meta(G_SYNC_STAGES - 1);
-    boot_hold_sync <= req_s(5);
+    req_s          <= req_meta(G_SYNC_STAGES - 1);          -- last stage = synchronized value
+    boot_hold_sync <= req_s(5);                               -- passed on to sram_boot_copy
+    -- any command request: all bits except boot_hold (bit 5)
     any_req        <= '1' when (req_s(7 downto 6) & req_s(4 downto 0)) /= "0000000" else '0';
 
     cmd_done <= done_a;
+
+    -- results are registers that only change in C_WAIT, i.e. while
+    -- cmd_done = 0, so the PCI side can read them once it sees cmd_done = 1
 
     cmd_rdsr_data <= rdsr_q;
     cmd_rdid_data <= rdid_q;
     reg_cmd_op    <= op;
 
     ----------------------------------------------------------------------------
-    -- Handshake FSM
+    -- Handshake FSM: one command per request, four-phase towards PCI
+    -- (request up -> cmd_done up -> request down -> cmd_done down), and a
+    -- valid/accept + done handshake towards mram_qspi_backend.
     ----------------------------------------------------------------------------
     process (aclk)
     begin
@@ -149,8 +160,12 @@ begin
             else
                 case state is
 
+                    -- Wait for a request. Nothing is sent to the MRAM before its
+                    -- power-up time (mem_ready); a request raised earlier waits.
                     when C_IDLE =>
                         if mem_ready = '1' and any_req = '1' then
+                            -- pick one command; fixed priority if several are
+                            -- raised at once (not supported, see header)
                             if req_s(0) = '1' then
                                 op <= REG_CMD_WREN;
                             elsif req_s(1) = '1' then
@@ -173,14 +188,19 @@ begin
                             state         <= C_ISSUE;
                         end if;
 
+                    -- Hold reg_cmd_valid until the backend accepts the command
+                    -- (it runs register commands between memory accesses).
                     when C_ISSUE =>
                         if reg_cmd_accept = '1' then
                             reg_cmd_valid <= '0';
                             state         <= C_WAIT;
                         end if;
 
+                    -- Wait until the command has run on the MRAM; keep its result.
                     when C_WAIT =>
                         if reg_cmd_done = '1' then
+                            -- RDSR and RDAR return one byte, RDID four; the
+                            -- other commands return nothing
                             if op = REG_CMD_RDSR or op = REG_CMD_RDAR then
                                 rdsr_q <= reg_cmd_rdata(7 downto 0);
                             elsif op = REG_CMD_RDID then
@@ -190,6 +210,7 @@ begin
                             state  <= C_DONE;
                         end if;
 
+                    -- cmd_done stays 1 until PCI has dropped every request.
                     when C_DONE =>
                         if any_req = '0' then
                             done_a <= '0';

@@ -3,8 +3,11 @@
 --
 -- Two AXI masters (RISC-V/NOEL-V and PCI) reach this design through the
 -- AXI interconnect, which arbitrates between them -- this block presents
--- a single AXI4 slave port and does no master-side arbitration of its
--- own. Both masters use identity addressing across the full 128MB range.
+-- a single AXI4 slave port (s_axi_*, interconnect TARGET0) and does no
+-- master-side arbitration of its own. Only AxADDR[26:0] is used, the MRAM
+-- offset; with the SRAM at AXI 0x0-0xFFFFF the MRAM is reachable from AXI
+-- 0x100000 up (doc/SRAM_ARCH.md, section 3). The boot copy is a third
+-- master on the interconnect (m_axi_*, INITIATOR2).
 --
 -- sram_boot_copy copies the firmware (G_BOOT_COPY_SIZE, 1MB) from the
 -- MRAM master copy at MRAM offset G_BOOT_SRC_BASE (0x6000000) into the
@@ -31,7 +34,7 @@
 -- this block: PCI accesses to it during the copy are not blocked here and
 -- race the copy (the host must wait for boot_done).
 --
--- MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID) for bring-up and
+-- MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID, RDAR, WRAR) for bring-up and
 -- debug are driven from PCI registers through mram_cmd_ctrl, which
 -- synchronizes the requests into aclk and runs the four-phase cmd_* /
 -- cmd_done handshake (see that file). cmd_done is an aclk register; the
@@ -50,20 +53,20 @@ use work.mram_pkg.all;
 
 entity mram_top is
     generic (
-        G_ID_WIDTH         : integer := C_AXI_ID_WIDTH;
+        G_ID_WIDTH         : integer := C_AXI_ID_WIDTH;  -- s_axi ID width (TARGET0 ID[5:0])
         -- Boot copy (defaults: 1MB image at MRAM 0x6000000 copied to SRAM AXI 0x0)
-        G_BOOT_SRC_BASE    : natural := 100663296;
-        G_BOOT_DST_ADDR    : natural := 0;
-        G_BOOT_COPY_SIZE   : natural := 1048576;
-        G_BOOT_FIFO_BLOCKS : natural := 2;
-        G_BOOT_MAX_RETRIES : natural := 3;
-        G_BOOT_WATCHDOG    : natural := 1_000_000;
+        G_BOOT_SRC_BASE    : natural := 100663296;  -- MRAM offset of the master firmware (0x6000000)
+        G_BOOT_DST_ADDR    : natural := 0;          -- AXI address of the SRAM
+        G_BOOT_COPY_SIZE   : natural := 1048576;    -- bytes copied (1MB)
+        G_BOOT_FIFO_BLOCKS : natural := 2;          -- copy FIFO depth in 64-byte blocks
+        G_BOOT_MAX_RETRIES : natural := 3;          -- retries before boot_fail
+        G_BOOT_WATCHDOG    : natural := 1_000_000;  -- aclk cycles without progress = hang (6.7ms)
         G_M_ID             : natural := 0;      -- AXI ID of the boot copy (C_M_AXI_ID_WIDTH bits)
         G_POWERUP_CYCLES   : natural := 3_750_000;  -- MRAM tPU 25ms at 150MHz
         -- Write guard (defaults: protect 0x6000000..0x7FFFFFF)
-        G_PROTECT_BASE     : natural := 100663296;
-        G_PROTECT_SIZE     : natural := 33554432;
-        G_SYNC_KEY_OK      : boolean := true;
+        G_PROTECT_BASE     : natural := 100663296;  -- protected region start (MRAM offset)
+        G_PROTECT_SIZE     : natural := 33554432;   -- protected region size (32MB)
+        G_SYNC_KEY_OK      : boolean := true;       -- synchronize key_ok into aclk
         -- QSPI backend
         G_DUMMY_CYCLES         : integer := 8;   -- = MRAM CR2 latency (default 8)
         G_SCLK_HALF_PERIOD     : integer := 2;   -- SCLK = aclk / (2*N); datasheet max 54MHz
@@ -205,19 +208,26 @@ end entity mram_top;
 
 architecture rtl of mram_top is
 
+    -- Core request path: boot copy / AXI wrapper -> mux -> write guard -> backend
     signal boot_req, axi_req, muxed_req, guarded_req : core_req_t;
     signal guard_resp                                  : core_resp_t; -- from mram_write_guard
     signal boot_resp, axi_resp                         : core_resp_t; -- masked by ownership
     signal backend_resp                                 : core_resp_t; -- raw, from mram_qspi_backend
+    -- Hand-over: boot_own = the boot copy drives the backend; boot_hold_axi =
+    -- the wrapper must accept no new bursts; axi_idle = the wrapper has
+    -- nothing accepted or in flight
     signal boot_own, boot_hold_axi, axi_idle           : std_logic;
 
-    signal boot_hold_sync, powerup_done               : std_logic;
+    signal boot_hold_sync, powerup_done               : std_logic; -- boot_hold in aclk; MRAM tPU elapsed
+    -- sram_reload synchronizer (q1, q2), edge detector (q3) and one-cycle pulse
     signal reload_q1, reload_q2, reload_q3, reload_pulse : std_logic := '0';
+    -- register commands: mram_cmd_ctrl <-> mram_qspi_backend
     signal reg_cmd_valid, reg_cmd_accept, reg_cmd_done : std_logic;
     signal reg_cmd_op                                  : reg_cmd_t;
     signal reg_cmd_wdata, reg_cmd_addr                 : std_logic_vector(7 downto 0);
     signal reg_cmd_rdata                               : std_logic_vector(31 downto 0);
 
+    -- MRAM IO[3:0] split into output value, output enable and input
     signal backend_io_o, backend_io_oe, backend_io_i : std_logic_vector(3 downto 0);
 
     -- sram_reload synchronizer stages (asynchronous input)
@@ -226,7 +236,13 @@ architecture rtl of mram_top is
 
 begin
 
-    -- sram_reload: two-flop synchronizer, then rising-edge detect
+    ----------------------------------------------------------------------------
+    -- sram_reload: two-flop synchronizer (reload_q1 may go metastable,
+    -- reload_q2 is the synchronized level), then rising-edge detect: one
+    -- reload_pulse per 0 -> 1 transition, whatever the level's length.
+    -- Reset to 0, so a level already 1 at reset gives a pulse right after
+    -- reset, which sram_boot_copy ignores (it is still in its power-up wait).
+    ----------------------------------------------------------------------------
     process (aclk)
     begin
         if rising_edge(aclk) then
@@ -244,6 +260,9 @@ begin
         end if;
     end process;
 
+    ----------------------------------------------------------------------------
+    -- Boot copy: MRAM master firmware -> SRAM, verify, release the CPU
+    ----------------------------------------------------------------------------
     u_boot_copy : entity work.sram_boot_copy
         generic map (
             G_SRC_BASE       => G_BOOT_SRC_BASE,
@@ -308,6 +327,9 @@ begin
             boot_status   => boot_status
         );
 
+    ----------------------------------------------------------------------------
+    -- PCI-driven MRAM register commands; also synchronizes boot_hold
+    ----------------------------------------------------------------------------
     u_cmd_ctrl : entity work.mram_cmd_ctrl
         port map (
             aclk           => aclk,
@@ -336,6 +358,10 @@ begin
             reg_cmd_rdata  => reg_cmd_rdata
         );
 
+    ----------------------------------------------------------------------------
+    -- AXI4 slave (TARGET0): bursts -> core requests. Never reset for a
+    -- hand-over: hold/idle instead, so no AXI handshake is ever dropped.
+    ----------------------------------------------------------------------------
     u_axi_wrapper : entity work.axi4_slave_wrapper
         generic map (
             G_ID_WIDTH     => G_ID_WIDTH,
@@ -385,6 +411,9 @@ begin
     -- side has a request in flight. Responses go only to the owner.
     muxed_req <= boot_req when boot_own = '1' else axi_req;
 
+    -- Response masking: ready, rvalid and bvalid reach only the side that
+    -- owns the backend. Data and error are shared; they only matter together
+    -- with a (masked) rvalid/bvalid.
     boot_resp.ready  <= guard_resp.ready  and boot_own;
     boot_resp.rvalid <= guard_resp.rvalid and boot_own;
     boot_resp.bvalid <= guard_resp.bvalid and boot_own;
@@ -396,6 +425,9 @@ begin
     axi_resp.rdata   <= guard_resp.rdata;
     axi_resp.error   <= guard_resp.error;
 
+    ----------------------------------------------------------------------------
+    -- Write guard: blocks writes to the protected master copy unless key_ok
+    ----------------------------------------------------------------------------
     u_write_guard : entity work.mram_write_guard
         generic map (
             G_PROTECT_BASE => G_PROTECT_BASE,
@@ -412,6 +444,9 @@ begin
             core_resp_in   => backend_resp
         );
 
+    ----------------------------------------------------------------------------
+    -- Quad-SPI engine for the MRAM (die 1); also runs the register commands
+    ----------------------------------------------------------------------------
     u_backend : entity work.mram_qspi_backend
         generic map (
             G_DUMMY_CYCLES         => G_DUMMY_CYCLES,
@@ -447,6 +482,8 @@ begin
             rd_slip       => mram_rd_slip
         );
 
+    -- Tri-state MRAM IO pins: driven while the backend enables the output,
+    -- released ('Z', board pull-ups) otherwise; always read back.
     gen_pins : for i in 0 to 3 generate
         mram_io(i)      <= backend_io_o(i) when backend_io_oe(i) = '1' else 'Z';
         backend_io_i(i) <= mram_io(i);
