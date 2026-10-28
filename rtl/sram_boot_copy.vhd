@@ -73,7 +73,7 @@ use work.mram_pkg.all;
 
 entity sram_boot_copy is
     generic (
-        G_SRC_BASE       : natural := 16#6000000#; -- MRAM offset of the master firmware copy
+        G_SRC_BASE       : natural := 16#7F00000#; -- MRAM offset of the master firmware copy (last 1MB)
         G_DST_ADDR       : natural := 0;           -- AXI address of the SRAM
         G_COPY_SIZE      : natural := 1048576;     -- bytes, multiple of G_BLOCK_BYTES
         G_BLOCK_BYTES    : natural := 64;          -- bytes per AXI burst, multiple of C_BEAT_BYTES

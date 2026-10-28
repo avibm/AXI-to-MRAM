@@ -15,7 +15,8 @@ they are collected in section 12.
 | 1 | Purpose | 1 MB on-chip SRAM is execution and working memory for NOEL-V. No cache in front of the MRAM. |
 | 2 | Type | On-chip, Microchip `PF_SRAM_AHBL_AXI`, already connected to the CoreAXI4Interconnect as the second target (TARGET1) and tested on the board (read and write). |
 | 3 | Address map | SRAM at AXI 0x0000_0000–0x000F_FFFF (the CPU reset vector is in it). MRAM continues at AXI 0x0010_0000–0x07FF_FFFF (configured and accepted by the interconnect). |
-| 4 | Boot copy | Copy MRAM 0x6000000 (master firmware) → SRAM 0x0. The old MRAM → MRAM 0x0 copy is no longer done. |
+| 4 | Boot copy | Copy MRAM 0x7F00000 (master firmware, the last 1 MB; was 0x6000000 until 2026-10-28) → SRAM 0x0. The old MRAM → MRAM 0x0 copy is no longer done. |
+| 4b | Protected region | The last 1 MB of the MRAM, 0x7F00000–0x7FFFFFF, holding the master firmware (was 0x6000000–0x7FFFFFF, 32 MB, until 2026-10-28). Everything below it is ordinary MRAM. |
 | 5 | Copy size | Always 1 MB. |
 | 6 | Persistence | Nothing in SRAM must survive power loss. No hardware write-back to MRAM. |
 | 7 | PCI access | PCI may read and write SRAM through the interconnect at any time after boot. No hardware coherency; software owns shared buffers. |
@@ -78,25 +79,26 @@ CoreAXI4Interconnect:
 |--------|-------------|------|--------|-------|
 | SRAM | 0x0000_0000 – 0x000F_FFFF | 1 MB | TARGET1 | CPU reset vector, code, data, stack, heap |
 | MRAM | 0x0010_0000 – 0x07FF_FFFF | 127 MB | TARGET0 | MRAM offsets 0x0–0xFFFFF are not reachable (shadowed by the SRAM) |
-| MRAM master firmware | 0x0600_0000 – 0x060F_FFFF used (region to 0x07FF_FFFF) | 1 MB used of 32 MB | TARGET0 | Write-protected by `mram_write_guard` unless `key_ok` |
+| MRAM master firmware | 0x07F0_0000 – 0x07FF_FFFF | 1 MB (the last 1 MB of the MRAM) | TARGET0 | Write-protected by `mram_write_guard` unless `key_ok` |
 
 This map is identity addressing **only if the interconnect passes the full
 AXI address to TARGET0** (not the address minus the 0x0010_0000 base).
-`mram_top` uses AxADDR[26:0], and its boot source (0x6000000) and
-protected region (0x6000000–0x7FFFFFF) are MRAM offsets.
+`mram_top` uses AxADDR[26:0], and its boot source (0x7F00000) and
+protected region (0x7F00000–0x7FFFFFF) are MRAM offsets.
 
 * **Full address passed (assumed, OPEN OA1):** AXI address = MRAM offset
   for everything from 0x0010_0000 up. No RTL change, and the master copy
-  stays at AXI 0x0600_0000 for the PCI host. The 1 MB of MRAM at offsets
+  is at AXI 0x07F0_0000 for the PCI host. The 1 MB of MRAM at offsets
   0x0–0xFFFFF is simply unused.
 * **Offset passed:** every MRAM offset would be 1 MB lower than its AXI
   address; the guard and boot source would be misplaced relative to what
-  the host expects, and the last 1 MB of MRAM would be unreachable. This
+  the host expects, and the last 1 MB of MRAM, which now holds the master
+  copy, would be unreachable from AXI, so PCI could not reprogram it. This
   would need a base-offset generic in `mram_top`; not planned unless the
   board test below shows it is needed.
 * **Board test for OA1:** with `key_ok` = 0, write one word from PCI to
-  AXI 0x0600_0010. SLVERR → full address passed (the guard blocked it).
-  OKAY → offset passed (the write went to MRAM 0x5F00010, general memory,
+  AXI 0x07F0_0010. SLVERR → full address passed (the guard blocked it).
+  OKAY → offset passed (the write went to MRAM 0x7E00010, general memory,
   not the master copy). Alternatively, probe `s_axi_awaddr` in Identify.
 * The SRAM is at base 0, so for TARGET1 full address and offset are the
   same.
@@ -107,7 +109,7 @@ protected region (0x6000000–0x7FFFFFF) are MRAM offsets.
     lands in volatile SRAM and must move to 0x0010_0000 or above.
   * PCI host software: MRAM addresses unchanged (≥ 0x0010_0000); the
     first 1 MB of the window now reaches SRAM.
-  * The firmware image at MRAM 0x6000000 must be ≤ 1 MB, and code + data
+  * The firmware image at MRAM 0x7F00000 must be ≤ 1 MB, and code + data
     + bss + stack + heap must fit in 1 MB.
 
 ## 4. Clocking and CDC
@@ -130,7 +132,7 @@ protected region (0x6000000–0x7FFFFFF) are MRAM offsets.
 
 1. Waits for the MRAM power-up time (25 ms, as now) and while
    `boot_hold` = 1.
-2. **Copy pass:** reads MRAM 0x6000000 … 0x60FFFFF through the core
+2. **Copy pass:** reads MRAM 0x7F00000 … 0x7FFFFFF through the core
    interface as one continuous stream of beat reads. Data goes into a
    small FIFO (`G_BOOT_FIFO_BLOCKS` = 2 × 64-byte blocks, in flip-flops).
    Simulation shows this depth keeps the MRAM stream unbroken even with
@@ -176,7 +178,7 @@ aresetn released
 power-up wait (25 ms) --boot_hold=1--> held: MRAM AXI port open, copy not started
    |
    v
-copy pass:   MRAM 0x6000000..+1MB  --> FIFO --> AXI write bursts --> SRAM 0x0..+1MB
+copy pass:   MRAM 0x7F00000..+1MB  --> FIFO --> AXI write bursts --> SRAM 0x0..+1MB
    |
    v
 verify pass: MRAM again --> FIFO ; SRAM read bursts --> compare

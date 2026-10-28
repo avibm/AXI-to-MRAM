@@ -3,7 +3,7 @@
 AXI4 slave front end for the Avalanche AS302G208 Quad-SPI MRAM on RT PolarFire
 (RTPF500TCG1509), shared by the NOEL-V CPU and a PCI master through the AXI
 interconnect. Includes a boot-copy sequencer, which copies the 1 MB firmware
-from a protected master copy at MRAM 0x6000000 into the on-chip SRAM at
+from a protected master copy in the last 1 MB of the MRAM (0x7F00000) into the on-chip SRAM at
 address 0 (the CPU's execution memory) and releases the CPU only after
 verifying it, and a write guard for the protected region.
 
@@ -13,7 +13,7 @@ verifying it, and a write guard for the protected region.
 | `rtl/axi4_slave_wrapper.vhd` | AXI4 slave: bursts → core requests (INCR, narrow and full-width beats, WSTRB); reads issued ahead for streaming |
 | `rtl/sram_boot_copy.vhd` | Copies the firmware MRAM → SRAM through its own AXI4 master port, verifies it, holds the CPU in reset until done; reload on request |
 | `rtl/mram_cmd_ctrl.vhd` | PCI-driven MRAM register commands (WREN, WRDI, RDSR, WRSR, RDID, RDAR, WRAR) with clock-domain crossing |
-| `rtl/mram_write_guard.vhd` | Blocks writes to the protected region unless `key_ok` |
+| `rtl/mram_write_guard.vhd` | Blocks writes to the protected region (the last 1 MB, 0x7F00000–0x7FFFFFF: the master firmware) unless `key_ok` |
 | `rtl/mram_qspi_backend.vhd` | Quad-SPI master (WREN / EBh read / D2h write, 1-4-4 SDR; contiguous reads and writes streamed) |
 | `rtl/mram_top.vhd` | Top level |
 | `sim/` | Behavioural QSPI MRAM model, AXI4 SRAM model, AXI master protocol checker, self-checking testbenches, GHDL run scripts |
@@ -59,7 +59,7 @@ rising edge of `sram_reload`:
 2. It takes the MRAM backend from the AXI side without resetting it: the
    wrapper stops accepting new AW/AR, finishes what it has accepted, and
    reports idle. MRAM accesses from PCI or the CPU stall during the copy.
-3. Copy pass: MRAM 0x6000000 + 1 MB → SRAM 0x0 as 64-byte INCR write bursts
+3. Copy pass: MRAM 0x7F00000 + 1 MB → SRAM 0x0 as 64-byte INCR write bursts
    on `m_axi_*`. The MRAM read is one continuous stream.
 4. Verify pass: MRAM read again, SRAM read back, every beat compared.
 5. Pass → `cpu_reset_n` = 1, `boot_done` = 1, MRAM back to the AXI side.

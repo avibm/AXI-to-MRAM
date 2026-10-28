@@ -33,7 +33,8 @@ Results of these runs at the time of writing are recorded in
   deleted; `rtl/sram_boot_copy.vhd` is new. Remove the old files from the
   Libero project and add the new one, compiled as VHDL-2008.
 * **Generics on the `mram_top` instance:** defaults are for the board:
-  `G_BOOT_SRC_BASE` = 0x6000000, `G_BOOT_DST_ADDR` = 0,
+  `G_BOOT_SRC_BASE` = 0x7F00000, `G_PROTECT_BASE` = 0x7F00000,
+  `G_PROTECT_SIZE` = 1 MB, `G_BOOT_DST_ADDR` = 0,
   `G_BOOT_COPY_SIZE` = 1 MB, `G_POWERUP_CYCLES` = 3,750,000 (25 ms). Make sure
   no testbench values (short power-up, small copy size) were set in
   SmartDesign.
@@ -53,6 +54,13 @@ Results of these runs at the time of writing are recorded in
 * **Address map:** SRAM 0x0000_0000–0x000F_FFFF (TARGET1), MRAM
   0x0010_0000–0x07FF_FFFF (TARGET0). Open item OA1: the interconnect must
   pass the full AXI address to TARGET0 (board test in `doc/SRAM_ARCH.md` §3).
+* **Master firmware location:** the image is now read from MRAM
+  0x7F00000 (AXI 0x07F0_0000), the last 1 MB, and only that 1 MB is
+  write-protected. Program the master firmware there (PCI, with `key_ok`)
+  before the first boot of the new bitstream; an image left at 0x6000000 is
+  no longer used or protected. If the board straps the MRAM's hardware
+  block protection (HBP0–2 / HTBSEL, REVIEW "Board checks"), make sure the
+  new location is still writable when it must be reprogrammed.
 * **SRAM IP:** ECC currently Disabled (open item OA2). Decide before the run,
   since changing it means another compile.
 
@@ -95,7 +103,7 @@ Paths to look at first:
 
 1. Start with `boot_hold` = 1: `boot_status` phase = 1, CPU in reset, MRAM
    reachable from PCI. Do the OA1 full-address test (SLVERR on a write to
-   0x0600_0010 with `key_ok` = 0).
+   0x07F0_0010 with `key_ok` = 0).
 2. Release `boot_hold`: expect `boot_status` = 0x0000 (phase 0, no retries,
    no errors) after about 0.14 s, `boot_done` = 1, the CPU running from SRAM.
 3. Read back SRAM from PCI and compare with the master image.

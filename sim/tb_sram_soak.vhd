@@ -52,7 +52,7 @@ end entity tb_sram_soak;
 architecture sim of tb_sram_soak is
 
     constant T_CLK  : time    := 6.667 ns;
-    constant SRC    : natural := 16#6000000#;
+    constant SRC    : natural := 16#7F00000#;
     constant DATA   : natural := 16#0010_0000#;  -- general MRAM data area used by PCI
     constant BB     : natural := C_BEAT_BYTES;
     constant MID_W  : natural := C_M_AXI_ID_WIDTH;

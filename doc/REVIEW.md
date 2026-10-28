@@ -516,6 +516,42 @@ slip during the edit (a statement dropped while inserting a comment in
 `mram_qspi_backend`), which was restored before the comparison passed.
 All testbenches and the unbounded formal proof pass on the commented files.
 
+### Rev. 18 – protected region and boot source: the last 1 MB
+
+Requested 2026-10-28, before release. The master firmware and the write
+guard move from 0x6000000 (guard 0x6000000–0x7FFFFFF, 32 MB) to the last
+1 MB of the MRAM, **0x7F00000–0x7FFFFFF** (AXI 0x07F0_0000–0x07FF_FFFF
+with the full-address pass-through). Everything below it, including the
+former region, is ordinary writable MRAM.
+
+Code change (only these default values; checked with
+`sim/check_comment_only.py` plus a token diff):
+* `mram_top`: `G_BOOT_SRC_BASE` 0x6000000 → 0x7F00000, `G_PROTECT_BASE`
+  0x6000000 → 0x7F00000, `G_PROTECT_SIZE` 32 MB → 1 MB.
+* `mram_write_guard`: the same defaults for `G_PROTECT_BASE`/`SIZE`.
+* `sram_boot_copy`: `G_SRC_BASE` default 0x7F00000.
+
+Verification:
+* All testbenches use the new image base. New `tb_mram_top` T8b, with the
+  key locked: the last 64 bytes below the region and an address in the
+  former region are written; the first, a middle and the last 64 bytes of
+  the region are blocked (SLVERR, unchanged). Mutation checks: the old
+  32 MB region → 130 errors; a region 64 bytes short → 65 errors.
+* `tb_mram_top`, `tb_dma`, `tb_mram_sram` (T0–T15, T9b/c), soak (seed 7,
+  60 iterations), the full 1 MB boot from 0x7F00000 (111.9 ms simulated)
+  and the unbounded formal proof (its harness uses its own addresses):
+  all pass.
+
+Consequences outside the RTL:
+* The master firmware must be programmed at MRAM 0x7F00000 before the
+  first boot of this bitstream; an image at 0x6000000 is no longer used.
+* Host software that reprograms the master copy must write AXI
+  0x07F0_0000 onwards (with `key_ok`).
+* The OA1 board test now writes AXI 0x07F0_0010 with `key_ok` = 0.
+* If the board straps the MRAM hardware block protection (HBP0–2 /
+  HTBSEL, see "Board checks"), the protected device range must allow
+  reprogramming the new location when needed.
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

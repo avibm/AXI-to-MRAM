@@ -59,8 +59,8 @@ use work.mram_pkg.all;
 
 entity mram_write_guard is
     generic (
-        G_PROTECT_BASE : natural := 100663296; -- 0x6000000: pristine master copy (top 32MB)
-        G_PROTECT_SIZE : natural := 33554432;  -- 32MB
+        G_PROTECT_BASE : natural := 16#7F00000#; -- pristine master copy (last 1MB of the MRAM)
+        G_PROTECT_SIZE : natural := 1048576;   -- 1MB
         G_SYNC_KEY_OK  : boolean := true       -- two-flop synchronize key_ok into aclk
     );
     port (

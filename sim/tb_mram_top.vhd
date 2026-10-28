@@ -12,7 +12,8 @@
 --
 -- Covered: boot copy MRAM -> SRAM + verify, an AXI read issued while boot_hold keeps
 -- the copy waiting (served during the hold), 64-byte / narrow / unaligned /
--- sparse-strobe writes, INCR bursts, write-guard blocking and unlocking,
+-- sparse-strobe writes, INCR bursts, write-guard blocking and unlocking
+-- (protected region = last 1MB, boundaries checked in T8b),
 -- FIXED-burst rejection, reads concurrent with writes, randomized
 -- BREADY/RREADY back-pressure, exactly one B / RLAST per transaction, and
 -- AXI addresses with upper (window base) bits set.
@@ -56,7 +57,7 @@ end entity tb_mram_top;
 architecture sim of tb_mram_top is
 
     constant T_CLK      : time    := 6.667 ns; -- 150MHz
-    constant SRC_BASE   : natural := 16#6000000#;
+    constant SRC_BASE   : natural := 16#7F00000#;
     constant BOOT_BYTES : natural := 512;
 
     -- Everything below follows the data width set in mram_pkg.
@@ -641,6 +642,16 @@ begin
         key_ok <= '0';
         for i in 1 to 4 loop wait until rising_edge(aclk); end loop;
         write_range(SRC_BASE + 16#140#, 64, 41, "10", false);
+
+        -- T8b: region boundaries, locked (key_ok = 0). The protected region is
+        -- the last 1MB, 0x7F00000-0x7FFFFFF; everything below it is writable,
+        -- including the former 32MB region 0x6000000-0x7EFFFFF. (Addresses
+        -- chosen so they do not alias the boot image in the MRAM model.)
+        write_range(16#7EFFFC0#, 64, 42, "00", true);   -- last 64 bytes below: written
+        write_range(16#6080000#, 64, 43, "00", true);   -- former region: now written
+        write_range(16#7F00000#, 64, 44, "10", false);  -- first 64 bytes: blocked
+        write_range(16#7FFFF80#, 64, 45, "10", false);  -- near the end: blocked
+        write_range(16#7FFFFC0#, 64, 46, "10", false);  -- last 64 bytes: blocked
 
         -- T11: FIXED burst rejected (all beats drained), next write still fine
         for b in 0 to 1 loop

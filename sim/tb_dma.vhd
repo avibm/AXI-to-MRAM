@@ -124,7 +124,7 @@ begin
         -- master copy, and the CPU line-read area 0x0-0xFFF (with the SRAM
         -- boot copy nothing is copied there any more); CPU writes go to 0x1000..
         for a in 0 to 16383 loop
-            mem.write(16#6000000# + a, pat(a));
+            mem.write(16#7F00000# + a, pat(a));
             if a < 4096 then mem.write(a, pat(a)); else mem.write(a, x"EE"); end if;
         end loop;
         wait;
@@ -146,7 +146,7 @@ begin
                 ad := to_integer(lfsr(8 downto 5)) * 32; sz := 3; ln := 3;    -- CPU line fill
                 n_cpu <= n_cpu + 1;
             else
-                ad := 16#6000000# + b * (G_LEN + 1) * 2 ** G_SZ; sz := G_SZ; ln := G_LEN;
+                ad := 16#7F00000# + b * (G_LEN + 1) * 2 ** G_SZ; sz := G_SZ; ln := G_LEN;
                 b := b + 1;
             end if;
             q_addr(i) <= ad; q_sz(i) <= sz; q_len(i) <= ln;
@@ -217,7 +217,7 @@ begin
                 n := 2 ** q_sz(i);
                 for k in 0 to n - 1 loop
                     a := q_addr(i) + beat * n + k;
-                    if rdata(8 * (a mod BB) + 7 downto 8 * (a mod BB)) /= pat(a mod 16#6000000#) then
+                    if rdata(8 * (a mod BB) + 7 downto 8 * (a mod BB)) /= pat(a mod 16#7F00000#) then
                         e := e + 1;
                         if e < 10 then report "DATA AR#" & integer'image(i) & " addr 0x"
                             & to_hstring(to_unsigned(a, 32)) severity error; end if;
@@ -228,7 +228,7 @@ begin
                     e := e + 1; report "RID wrong" severity error; end if;
                 if rresp /= "00" then e := e + 1; report "RRESP error" severity error; end if;
                 if beat = q_len(i) then
-                    if q_addr(i) >= 16#6000000# then dma := dma + 1; end if;
+                    if q_addr(i) >= 16#7F00000# then dma := dma + 1; end if;
                     beat := 0; i := i + 1; r_done_n <= i;
                 else
                     beat := beat + 1;

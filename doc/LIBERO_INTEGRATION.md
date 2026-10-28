@@ -92,7 +92,8 @@ the board differs.
 | Generic | Default | Meaning |
 |---------|---------|---------|
 | `G_ID_WIDTH` | 6 (`C_AXI_ID_WIDTH`) | TARGET0 ID width |
-| `G_BOOT_SRC_BASE` | 0x6000000 | MRAM offset of the master firmware |
+| `G_BOOT_SRC_BASE` | 0x7F00000 | MRAM offset of the master firmware (the last 1 MB) |
+| `G_PROTECT_BASE`, `G_PROTECT_SIZE` | 0x7F00000, 1 MB | Write-protected region (the master firmware) |
 | `G_BOOT_DST_ADDR` | 0 | AXI address of the SRAM |
 | `G_BOOT_COPY_SIZE` | 1048576 | Bytes copied |
 | `G_BOOT_FIFO_BLOCKS` | 2 | Copy FIFO depth in 64-byte blocks |
@@ -100,7 +101,7 @@ the board differs.
 | `G_BOOT_WATCHDOG` | 1,000,000 | Cycles without progress before the drain (6.7 ms); the drain gets as long again before "stuck" |
 | `G_M_ID` | 0 | AXI ID used by the boot copy |
 | `G_POWERUP_CYCLES` | 3,750,000 | MRAM tPU, 25 ms |
-| others | unchanged | MRAM backend, write guard (see README) |
+| others | unchanged | MRAM backend (see README) |
 
 The testbenches use much smaller values for `G_POWERUP_CYCLES`,
 `G_BOOT_COPY_SIZE` and `G_BOOT_WATCHDOG`; make sure none of them reached the

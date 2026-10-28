@@ -30,7 +30,7 @@
 -- modelled (WP#EN = 1 and IO2 low blocks WRSR).
 --
 -- Storage is folded to keep the model small: 4 x 1MB windows selected by
--- address bits 26:25 (so 0x0000000 and 0x6000000 are different windows),
+-- address bits 26:25 (so 0x0000000 and 0x7F00000 are different windows),
 -- offset = address bits 19:0. Tests must keep offsets below 1MB.
 --------------------------------------------------------------------------------
 

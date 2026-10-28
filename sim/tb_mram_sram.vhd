@@ -64,7 +64,7 @@ end entity tb_mram_sram;
 architecture sim of tb_mram_sram is
 
     constant T_CLK    : time    := 6.667 ns;
-    constant SRC      : natural := 16#6000000#;
+    constant SRC      : natural := 16#7F00000#;
     constant BB       : natural := C_BEAT_BYTES;
     constant MID_W    : natural := C_M_AXI_ID_WIDTH;
     constant SZB      : std_logic_vector(2 downto 0) := SIZE_BEAT;

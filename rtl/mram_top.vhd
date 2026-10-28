@@ -10,7 +10,7 @@
 -- master on the interconnect (m_axi_*, INITIATOR2).
 --
 -- sram_boot_copy copies the firmware (G_BOOT_COPY_SIZE, 1MB) from the
--- MRAM master copy at MRAM offset G_BOOT_SRC_BASE (0x6000000) into the
+-- MRAM master copy at MRAM offset G_BOOT_SRC_BASE (0x7F00000, the last 1MB) into the
 -- on-chip SRAM at AXI address G_BOOT_DST_ADDR (0x0, NOEL-V's reset vector)
 -- through its own AXI4 master port (m_axi_*, an extra initiator on the
 -- interconnect), verifies it, and only then releases cpu_reset_n. It runs
@@ -54,8 +54,8 @@ use work.mram_pkg.all;
 entity mram_top is
     generic (
         G_ID_WIDTH         : integer := C_AXI_ID_WIDTH;  -- s_axi ID width (TARGET0 ID[5:0])
-        -- Boot copy (defaults: 1MB image at MRAM 0x6000000 copied to SRAM AXI 0x0)
-        G_BOOT_SRC_BASE    : natural := 100663296;  -- MRAM offset of the master firmware (0x6000000)
+        -- Boot copy (defaults: 1MB image at MRAM 0x7F00000 copied to SRAM AXI 0x0)
+        G_BOOT_SRC_BASE    : natural := 16#7F00000#; -- MRAM offset of the master firmware (last 1MB)
         G_BOOT_DST_ADDR    : natural := 0;          -- AXI address of the SRAM
         G_BOOT_COPY_SIZE   : natural := 1048576;    -- bytes copied (1MB)
         G_BOOT_FIFO_BLOCKS : natural := 2;          -- copy FIFO depth in 64-byte blocks
@@ -63,9 +63,9 @@ entity mram_top is
         G_BOOT_WATCHDOG    : natural := 1_000_000;  -- aclk cycles without progress = hang (6.7ms)
         G_M_ID             : natural := 0;      -- AXI ID of the boot copy (C_M_AXI_ID_WIDTH bits)
         G_POWERUP_CYCLES   : natural := 3_750_000;  -- MRAM tPU 25ms at 150MHz
-        -- Write guard (defaults: protect 0x6000000..0x7FFFFFF)
-        G_PROTECT_BASE     : natural := 100663296;  -- protected region start (MRAM offset)
-        G_PROTECT_SIZE     : natural := 33554432;   -- protected region size (32MB)
+        -- Write guard (defaults: protect the master copy, 0x7F00000..0x7FFFFFF)
+        G_PROTECT_BASE     : natural := 16#7F00000#; -- protected region start (MRAM offset)
+        G_PROTECT_SIZE     : natural := 1048576;    -- protected region size (1MB)
         G_SYNC_KEY_OK      : boolean := true;       -- synchronize key_ok into aclk
         -- QSPI backend
         G_DUMMY_CYCLES         : integer := 8;   -- = MRAM CR2 latency (default 8)
