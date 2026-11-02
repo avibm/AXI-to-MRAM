@@ -653,6 +653,32 @@ begin
         write_range(16#7FFFF80#, 64, 45, "10", false);  -- near the end: blocked
         write_range(16#7FFFFC0#, 64, 46, "10", false);  -- last 64 bytes: blocked
 
+        -- T8c: blocked writes as a CPU or the PCI bridge issues them, key
+        -- locked: single 32-bit writes (AWSIZE = 2, half the strobes), an
+        -- 8-beat burst of 32-bit beats, a blocked write right after an
+        -- allowed posted write, and blocked writes back to back. Each must
+        -- get SLVERR and leave the MRAM unchanged, and the port must keep
+        -- working (no hang).
+        beats(0) := mk_beat(47); strbs(0) := (others => '0');
+        strbs(0)(3 downto 0) := "1111";
+        axi_write(16#7F00200#, 0, 2, "01", beats, strbs, "10", false);   -- lower word
+        strbs(0) := (others => '0'); strbs(0)(7 downto 4) := "1111";
+        axi_write(16#7F00204#, 0, 2, "01", beats, strbs, "10", false);   -- upper word
+        for b in 0 to 7 loop
+            beats(b) := mk_beat(48 + b); strbs(b) := (others => '0');
+            if b mod 2 = 0 then strbs(b)(3 downto 0) := "1111";
+            else strbs(b)(7 downto 4) := "1111"; end if;
+        end loop;
+        axi_write(16#7F00240#, 7, 2, "01", beats, strbs, "10", false);   -- 8 x 32-bit
+        write_range(16#7EFFF80#, 64, 56, "00", true);                    -- allowed, posted
+        beats(0) := mk_beat(57); strbs(0) := (others => '0');
+        strbs(0)(3 downto 0) := "1111";
+        axi_write(16#7F00300#, 0, 2, "01", beats, strbs, "10", false);   -- blocked right after
+        for i in 0 to 3 loop                                              -- back to back
+            write_range(16#7F00400# + 64 * i, 64, 58 + i, "10", false);
+        end loop;
+        write_range(16#7EFFF40#, 64, 62, "00", true);                    -- port still works
+
         -- T11: FIXED burst rejected (all beats drained), next write still fine
         for b in 0 to 1 loop
             beats(b) := mk_beat(50 + b); strbs(b) := (others => '1');
