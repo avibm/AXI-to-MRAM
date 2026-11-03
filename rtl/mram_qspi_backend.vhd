@@ -599,6 +599,24 @@ begin
                         mram_cs_n <= '1';
                         sclk_run  <= false;
                         io_oe     <= (others => '0');
+                        -- The wide request registers are loaded in every idle
+                        -- cycle, not only when a request is accepted: their
+                        -- load enable is then just "state = S_IDLE", which
+                        -- keeps the request-valid / write-guard compare path
+                        -- off the enables of ~100 flip-flops (timing). The
+                        -- requester holds its request stable until accepted,
+                        -- so the value captured in the accepting cycle is the
+                        -- same. Nothing reads these registers in S_IDLE.
+                        req_nbytes  <= core_req.nbytes;
+                        next_addr   <= resize(unsigned(core_req.addr), next_addr'length)
+                                       + core_req.nbytes;
+                        lane_offset <= unsigned(core_req.addr(LB - 1 downto 0));
+                        req_addr32  <= std_logic_vector(resize(unsigned(core_req.addr), 32));
+                        -- Byte-reverse so lane 0 is at the top, then shift
+                        -- the first byte (lane addr(LB-1:0)) up to bits T:T-7.
+                        v_off    := to_integer(unsigned(core_req.addr(LB - 1 downto 0)));
+                        tx_build <= std_logic_vector(shift_left(
+                                        unsigned(byte_rev(core_req.wdata)), 8 * v_off));
                         if reg_cmd_valid = '1' then
                             -- register command (priority over memory requests):
                             -- load opcode and any address/data bits into shreg
@@ -640,21 +658,10 @@ begin
                             state     <= S_REG_SETUP;
                         elsif core_req.valid = '1' then
                             -- memory read or write: latch the request
+                            -- (request fields already loaded above)
                             req_is_reg  <= '0';
                             req_we      <= core_req.we;
-                            req_nbytes  <= core_req.nbytes;
-                            next_addr   <= resize(unsigned(core_req.addr), next_addr'length)
-                                           + core_req.nbytes;
                             join_pending <= '0';
-                            lane_offset <= unsigned(core_req.addr(LB - 1 downto 0));
-                            req_addr32  <= std_logic_vector(resize(unsigned(core_req.addr), 32));
-
-                            -- Byte-reverse so lane 0 is at the top, then shift
-                            -- the first byte (lane addr(LB-1:0)) up to bits T:T-7.
-                            v_off    := to_integer(unsigned(core_req.addr(LB - 1 downto 0)));
-                            tx_build <= std_logic_vector(shift_left(
-                                            unsigned(byte_rev(core_req.wdata)), 8 * v_off));
-
                             setup_cnt <= 0;
                             mram_cs_n <= '0';
                             if core_req.we = '1' and skip_q2 = '0' then

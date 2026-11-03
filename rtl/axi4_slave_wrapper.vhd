@@ -265,6 +265,19 @@ architecture rtl of axi4_slave_wrapper is
     signal sel_rd        : std_logic;          -- the read engine's request is on core_req
     signal last_rd       : std_logic := '0';   -- the last request served was a read
     signal rd_wait, wr_wait : natural range 0 to G_ARB_MAX_WAIT := 0; -- cycles waiting
+    -- rd_wait >= G_ARB_MAX_WAIT / wr_wait >= G_ARB_MAX_WAIT, as registers
+    -- (computed from the counters' next values, so always equal to the
+    -- compare): keeps the 9-bit compares off the request-mux select (timing).
+    -- Reset value = the compare with the counter at 0.
+    function to_sl(b : boolean) return std_logic is
+    begin
+        if b then
+            return '1';
+        end if;
+        return '0';
+    end function;
+    constant C_MAX_AT_0 : std_logic := to_sl(G_ARB_MAX_WAIT = 0);
+    signal rd_max, wr_max : std_logic := C_MAX_AT_0;
 
     -- Issue engine
     signal is_ptr    : integer range 0 to G_MAX_OUTSTANDING - 1 := 0;
@@ -303,8 +316,8 @@ begin
     -- otherwise the side served last keeps going, so streams stay together.
     sel_rd   <= '0' when rd_core_req_o.valid = '0' else
                 '1' when wr_core_req_o.valid = '0' else
-                '1' when rd_wait >= G_ARB_MAX_WAIT else
-                '0' when wr_wait >= G_ARB_MAX_WAIT else
+                '1' when rd_max = '1' else
+                '0' when wr_max = '1' else
                 last_rd;
     core_req <= rd_core_req_o when sel_rd = '1' else wr_core_req_o;
     wr_ready <= core_resp.ready and wr_core_req_o.valid and not sel_rd;
@@ -312,12 +325,15 @@ begin
 
     -- Who was served last, and how long each side has been waiting.
     process (aclk)
+        variable v_rw, v_ww : natural range 0 to G_ARB_MAX_WAIT;  -- next rd_wait / wr_wait
     begin
         if rising_edge(aclk) then
             if aresetn = '0' then
                 last_rd <= '0';
                 rd_wait <= 0;
                 wr_wait <= 0;
+                rd_max  <= C_MAX_AT_0;
+                wr_max  <= C_MAX_AT_0;
             else
                 -- remember which side the backend accepted last
                 if rd_ready = '1' then
@@ -327,16 +343,23 @@ begin
                 end if;
                 -- waiting time of each side: cleared when it has no request
                 -- or is served, else counted up to G_ARB_MAX_WAIT (saturating)
+                v_rw := rd_wait;
                 if rd_core_req_o.valid = '0' or rd_ready = '1' then
-                    rd_wait <= 0;
+                    v_rw := 0;
                 elsif rd_wait < G_ARB_MAX_WAIT then
-                    rd_wait <= rd_wait + 1;
+                    v_rw := rd_wait + 1;
                 end if;
+                v_ww := wr_wait;
                 if wr_core_req_o.valid = '0' or wr_ready = '1' then
-                    wr_wait <= 0;
+                    v_ww := 0;
                 elsif wr_wait < G_ARB_MAX_WAIT then
-                    wr_wait <= wr_wait + 1;
+                    v_ww := wr_wait + 1;
                 end if;
+                rd_wait <= v_rw;
+                wr_wait <= v_ww;
+                -- registered compares, from the same next values
+                rd_max  <= to_sl(v_rw >= G_ARB_MAX_WAIT);
+                wr_max  <= to_sl(v_ww >= G_ARB_MAX_WAIT);
             end if;
         end if;
     end process;

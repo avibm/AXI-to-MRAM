@@ -552,6 +552,37 @@ Consequences outside the RTL:
   HTBSEL, see "Board checks"), the protected device range must allow
   reprogramming the new location when needed.
 
+### Rev. 19 – timing closure of the MRAM accept path; SRAM at 50 MHz
+
+Board build (SmartTime, corner `slow_lv_ht`): worst slack −0.020 ns on the
+combinational accept path (REVIEW O11 a), from the request register
+(retimed by Synplify into `u_write_guard`) through the guard's
+protected-region address compare to the load enable (`SLn`) of the
+backend's `tx_build` register; next, +0.104 ns from the arbiter's
+`rd_wait` counter through the request mux. The failing corner is high
+temperature, where the board was being tested.
+
+Changes (timing only):
+
+| # | File | Change |
+|---|------|--------|
+| T1 | `mram_write_guard` | A blocked write only forces `valid` to 0; the other request fields pass through unchanged (ignored while `valid` = 0). Before, the whole record was muxed to idle, putting the address compare on every address and data path. |
+| T2 | `mram_qspi_backend` | `tx_build`, `req_addr32`, `next_addr`, `lane_offset`, `req_nbytes` are loaded in every S_IDLE cycle instead of only on acceptance; their enable is now the state decode alone. The requester holds its request stable until accepted, so the captured value is the same; nothing reads them in S_IDLE. |
+| T3 | `axi4_slave_wrapper` | The arbiter's "waited `G_ARB_MAX_WAIT` cycles" compares are registers (`rd_max`, `wr_max`), computed from the counters' next values, so they always equal the old compares. |
+
+Verification: the old and new RTL were run through the same testbenches
+(`tb_mram_top`, `tb_dma`, `tb_mram_sram`, soak seed 4) and gave
+**identical** results, including simulated end times to the femtosecond
+and MRAM transaction counts: the change is cycle-exact for these
+stimuli. All testbenches also pass at 128 and 512 bits; GHDL lint and
+synthesis clean; the formal proof of `sram_boot_copy` still holds. The
+real slack can only be confirmed by the next SmartTime run.
+
+SRAM clock: the user moved TARGET1 / `PF_SRAM_AHBL_AXI` to 50 MHz with the
+interconnect's CDC, because that path had about −3 ns slack at 150 MHz
+(not in this RTL). The boot copy's master port stays on `aclk`; the CDC
+appears to it as latency and back-pressure (covered by the stall tests).
+
 ### Board checks (from the datasheet – cannot be fixed in RTL)
 
 * **Recover a die left in XIP mode.** Before testing the new bitstream,

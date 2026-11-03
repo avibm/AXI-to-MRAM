@@ -115,8 +115,15 @@ protected region (0x7F00000–0x7FFFFFF) are MRAM offsets.
 ## 4. Clocking and CDC
 
 * `sram_boot_copy`, its `m_axi_*` port and INITIATOR2 all run on `aclk`
-  (150 MHz). TARGET1 is at 150 MHz. **No new clock domain crossing in
-  this RTL.**
+  (150 MHz). **No new clock domain crossing in this RTL.**
+* **TARGET1 (the SRAM) runs at 50 MHz** since 2026-11-03, with the clock
+  domain crossing inside the interconnect (its T1 CDC option): the SRAM
+  path had about −3 ns slack at 150 MHz. The boot copy's AXI traffic is
+  unchanged; the CDC only adds latency and back-pressure, which the copy
+  engine handles like any other stall (tested up to 95 % random stalls).
+  Boot time is not affected: one 64-byte burst at 50 MHz takes ≈ 0.2 µs
+  plus the CDC latency, against ≈ 3.4 µs for the MRAM to deliver those 64
+  bytes (*estimate*).
 * The CPU's 50 MHz port is crossed inside the interconnect, as now.
 * `cpu_reset_n` is an `aclk` register, as now. It goes into the CPU's
   50 MHz domain; the CPU-side reset synchronizer that exists today must
@@ -287,7 +294,7 @@ them off in SmartDesign if INITIATOR2 has them (Phase 3).
 | Boot total after reset, no retry | **≈ 0.14 s** | 25 ms power-up + 112 ms; vs ≈ 9 s for the old 32 MB MRAM → MRAM copy |
 | Reload (no power-up wait) | ≈ 0.11 s | same copy + verify |
 | Boot worst case, 3 retries | ≈ 0.47 s | 4 × 112 ms + 25 ms (estimate) |
-| CPU ↔ SRAM peak | ≤ 400 MB/s | 64 bits × 50 MHz at the CPU port; real value depends on interconnect CDC latency, SRAM IP latency and NOEL-V. **Measure.** |
+| CPU ↔ SRAM peak | ≤ 400 MB/s | 64 bits × 50 MHz at the CPU port and at the SRAM (TARGET1 at 50 MHz); real value depends on interconnect CDC latency, SRAM IP latency and NOEL-V. **Measure.** |
 | PCI ↔ SRAM | limited by PCI | 32 × 33 MHz = 133 MB/s bus maximum; ≈ 70 MB/s seen from the bridge (REVIEW Rev. 6). The SRAM will not be the bottleneck, but the bridge still needs back-pressure for MRAM-bound writes. |
 | CPU / PCI ↔ MRAM | unchanged | ≈ 18 MB/s streamed; 4–5 µs per 64-byte read |
 

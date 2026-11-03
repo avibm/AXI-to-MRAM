@@ -136,9 +136,16 @@ begin
     -- Never let a blocked write reach the real backend, and hold everything
     -- back while a blocked write's error response is still pending. Reads
     -- and unlocked or out-of-range writes otherwise pass straight through.
-    core_req_out <= CORE_REQ_IDLE when (deliver_error = '1' or
-                                        (core_req_in.valid = '1' and blocked = '1'))
-                    else core_req_in;
+    -- Only valid is gated: the other fields pass through unchanged (they
+    -- are ignored while valid = '0'), so the address compare behind
+    -- 'blocked' drives one signal instead of the whole request record --
+    -- it is on the critical accept path (timing, slow_lv_ht corner).
+    core_req_out.valid  <= core_req_in.valid and not deliver_error and not blocked;
+    core_req_out.addr   <= core_req_in.addr;
+    core_req_out.we     <= core_req_in.we;
+    core_req_out.nbytes <= core_req_in.nbytes;
+    core_req_out.wdata  <= core_req_in.wdata;
+    core_req_out.cont   <= core_req_in.cont;
 
     ----------------------------------------------------------------------------
     -- Response to the requester (combinational). Normally the backend's

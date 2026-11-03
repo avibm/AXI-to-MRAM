@@ -117,7 +117,7 @@ What the design needs; the configurator names are yours to map.
 | Initiators | 3: INITIATOR0 PCI bridge, INITIATOR1 NOEL-V, INITIATOR2 boot copy (new) |
 | INITIATOR2 | AXI4, 64-bit data, ID 4 bits, clocked by `aclk` (no CDC needed), may reach TARGET1 (SRAM). It needs no access to TARGET0 |
 | TARGET0 (MRAM) | 0x0010_0000–0x07FF_FFFF, 64-bit, ID 6 bits, `aclk`. The full AXI address must reach `mram_top` (not the address minus the base), open item OA1 |
-| TARGET1 (SRAM) | 0x0000_0000–0x000F_FFFF, 64-bit, ID 6 bits, `aclk` |
+| TARGET1 (SRAM) | 0x0000_0000–0x000F_FFFF, 64-bit, ID 6 bits. Clocked at **50 MHz with the interconnect's T1 CDC** (changed from `aclk` 2026-11-03: about −3 ns slack at 150 MHz). The SRAM IP must be clocked by that same 50 MHz clock |
 | `PF_SRAM_AHBL_AXI` | LSRAM, 131072 × 64 bit, AXI, 64-bit, ID width 6, address 32. Open: ECC (currently Disabled), meaning of the write/read timeout counts (80) and of "High reliability" (open item OA2) |
 
 If the configurator offers per-initiator target visibility, restrict
@@ -167,7 +167,7 @@ Paths to look at first in SmartTime (all in `aclk`):
 | Reload | ≈ 0.11 s | same, without the power-up wait |
 | Worst case, 3 retries | ≈ 0.47 s | 4 × 112 ms + 25 ms |
 | MRAM access stall during a copy (PCI, CPU) | up to ≈ 0.11 s | the copy owns the MRAM |
-| CPU ↔ SRAM | ≤ 400 MB/s peak | 64 bit × 50 MHz at the CPU port; measure |
+| CPU ↔ SRAM | ≤ 400 MB/s peak | 64 bit × 50 MHz at the CPU port and the SRAM; measure |
 | PCI ↔ SRAM | limited by PCI (≈ 70 MB/s seen at the bridge, REVIEW Rev. 6) | |
 | PCI/CPU ↔ MRAM | unchanged, ≈ 18 MB/s streamed | |
 
